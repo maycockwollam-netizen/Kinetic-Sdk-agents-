@@ -10,14 +10,16 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (65 tests: 53 Stage 1 + 12 LiteLLMClient)
+- Run tests: `python -m pytest -q` (85 tests: 53 Stage 1 + 12 LiteLLMClient +
+  5 modes/classifier + 20 classifier+routing/escalation)
 - No build step beyond pip install.
 
 ## Stage status
 - Stage 1 (Core): DONE — `tool`, `event`, `llm`, `conversation`, `agent` loop.
-- Stage 2 (Context & Memory): TODO — `context/manager.py` is an interface
-  stub (`NoopContextManager`); needs token-aware truncation/summarisation.
-  `secret/` module not yet created.
+- Stage 2 (Context & Memory): PARTIAL — `agent/classifier.py` real impl +
+  FLASH/MAX routing + escalation DONE (see "Classifier & routing" below).
+  `context/manager.py` still an interface stub (`NoopContextManager`); needs
+  token-aware truncation/summarisation. `secret/` module not yet created.
 - Stage 3 (Quality & Ops): TODO.
 - Stage 4 (Extensions): TODO.
 
@@ -42,10 +44,13 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 - MockLLM replays a scripted list of `LLMResponse`/callables for deterministic
   agent tests (no network). Helper lives in `tests/_helpers.py`.
 
-## Module map (Stage 1)
-- `kinetic_sdk/agent/agent.py` — `Agent.run()` tool-calling loop, emits events.
+## Module map (Stage 1 + Stage 2 classifier)
+- `kinetic_sdk/agent/agent.py` — `Agent.run()` tool-calling loop, emits events;
+  classifies once before the first turn, routes FLASH/MAX, escalates mid-run.
 - `kinetic_sdk/agent/modes.py` — `AgentMode` enum + `escalates_to`.
-- `kinetic_sdk/agent/classifier.py` — `TaskClassifier` ABC + `DefaultClassifier` (stub).
+- `kinetic_sdk/agent/classifier.py` — `TaskComplexity` enum, `Classification`
+  dataclass, `TaskClassifier` ABC, `DefaultClassifier` (stub, always MAX),
+  `LiteLLMClassifier` (real, model-backed, alias `kinetic-classifier-v1`).
 - `kinetic_sdk/conversation/state.py` — `ConversationState` (Anthropic message shape).
 - `kinetic_sdk/event/bus.py` — `EventBus` (sync + async dispatch, wildcard `*`).
 - `kinetic_sdk/llm/client.py` — `LLMClient` ABC, `LiteLLMClient` (litellm-backed,
@@ -54,12 +59,40 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 - `kinetic_sdk/tool/base.py` — `Tool` ABC + `ToolResult` dataclass.
 - `kinetic_sdk/context/manager.py` — `ContextManager` ABC + `NoopContextManager` stub.
 
+## Classifier & routing (Stage 2 — DONE)
+- `LiteLLMClassifier` drives `openai/openhands/glm-5.2` via
+  `api_base=https://llm-proxy.app.all-hands.dev`, reading `api_key` from the
+  `OPENHANDS_API_KEY` env var (NEVER hardcoded). The real model/api_base are
+  private constants (`_MODEL`/`_API_BASE`); only the alias
+  `kinetic-classifier-v1` ever surfaces in logs, events, `Classification`.
+  rationale, or `LiteLLMClassifier.model`. Prompt asks for ONE word
+  (SIMPLE/COMPLEX), `max_tokens=10`. Any failure (exception / unparseable
+  reply) falls back to `TaskComplexity.COMPLEX` (safe side -> MAX).
+- `Agent.run` classifies exactly ONCE before the first turn (never re-invoked
+  on escalation). Result sets `self.mode` + `max_iterations`
+  (`MODE_MAX_ITERATIONS`: FLASH=5, MAX=50) + `enable_extended_reasoning`
+  (False/True). Emits `agent.classified`.
+- Mid-run escalation FLASH->MAX when (a) the first turn's tool call(s) error,
+  or (b) `FLASH_ESCALATION_THRESHOLD` (3) iterations pass with no final answer.
+  Escalation emits `agent.escalated` once, raises the cap to the MAX default,
+  keeps conversation state. MAX->FLASH is NOT allowed. An explicit user
+  `max_iterations` override is respected for the initial mode; escalation still
+  raises the cap to the MAX default (unless the override is pinned).
+- `max_iterations` constructor default changed from `25` to `None` (routing
+  picks per mode). Existing tests that passed an explicit value are unaffected.
+
 ## Next task (LLM backend switched to LiteLLM — DONE)
 Build `agent/classifier.py` real implementation + wire `AgentMode` routing into
 `Agent.run` (currently `mode` defaults to MAX, classifier not invoked). The
 classifier should use a `LiteLLMClient` pointed at the OpenHands proxy
 (`openai/openhands/glm-5.2` with `api_base=https://llm-proxy.app.all-hands.dev`)
 behind alias `kinetic-classifier-v1` — never leak the real model name.
+
+## Next next task (Stage 2 remainder)
+- `context/manager.py`: real token-aware truncation/summarisation (currently
+  `NoopContextManager`). The classifier already accepts a `summary` kwarg that
+  a future context manager can feed in.
+- `secret/` module for credential handling.
 
 ## LLM backend notes
 - `llm/client.py` now ships `LiteLLMClient(LLMClient)` instead of the old

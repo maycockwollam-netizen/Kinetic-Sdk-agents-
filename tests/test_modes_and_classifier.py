@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from kinetic_sdk.agent.classifier import Classification, DefaultClassifier
+from kinetic_sdk.agent.classifier import (
+    Classification,
+    DefaultClassifier,
+    LiteLLMClassifier,
+)
 from kinetic_sdk.agent.modes import AgentMode
 
 
@@ -26,8 +30,10 @@ def test_default_classifier_routes_to_max():
     result = clf.classify("any task")
     assert isinstance(result, Classification)
     assert result.mode is AgentMode.MAX
+    assert result.complexity.value == "complex"
     assert result.confidence == 1.0
 
 
 def test_classifier_alias_is_internal_and_stable():
     assert DefaultClassifier.alias == "kinetic-classifier-v1"
+    assert LiteLLMClassifier.alias == "kinetic-classifier-v1"

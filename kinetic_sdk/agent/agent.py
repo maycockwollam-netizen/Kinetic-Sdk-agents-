@@ -24,6 +24,7 @@ import json
 import logging
 from typing import Any, Iterable
 
+from kinetic_sdk.agent.classifier import TaskClassifier, DefaultClassifier
 from kinetic_sdk.agent.modes import AgentMode
 from kinetic_sdk.conversation.state import ConversationState
 from kinetic_sdk.event.bus import EventBus, Event
@@ -46,15 +47,33 @@ class Agent:
               ``agent.run_started``, ``agent.turn_started``,
               ``agent.llm_response``, ``agent.tool_call_started``,
               ``agent.tool_call_finished``, ``agent.run_finished``,
-              ``agent.escalated``, ``agent.error``.
+              ``agent.escalated``, ``agent.classified``, ``agent.error``.
+        classifier: Optional :class:`TaskClassifier`. When provided (or when
+            the default is used) :meth:`run` classifies the task exactly once
+            before the first turn and routes to FLASH or MAX. Pass ``None`` to
+            fall back to :class:`DefaultClassifier` (always MAX).
         max_iterations: Safety cap on LLM turns per :meth:`run` to prevent
-            infinite tool-calling loops. The default is conservative.
+            infinite tool-calling loops. When ``None`` (the default) the cap is
+            chosen by the routed mode: FLASH -> 5, MAX -> 50. An explicit value
+            overrides the mode default for the *initial* mode; an escalation
+            FLASH -> MAX mid-task still raises the cap to the MAX default.
 
     Attributes:
-        mode: Current :class:`AgentMode`. Defaults to :attr:`AgentMode.MAX`
-            in Stage 1 (routing lands in Stage 2). Escalation FLASH -> MAX is
-            allowed via :meth:`escalate`; the reverse is not.
+        mode: Current :class:`AgentMode`. Set once by the classifier at the
+            start of :meth:`run` (MAX when no classifier / on fallback). Only
+            FLASH -> MAX escalation is allowed within a single task via
+            :meth:`escalate`; the reverse is not.
+        enable_extended_reasoning: Mode-driven flag. ``False`` in FLASH, ``True``
+            in MAX. A placeholder switch for the future planner/verifier
+            pipeline; the loop itself does not branch on it yet.
     """
+
+    #: Per-mode iteration caps used when ``max_iterations`` is left to routing.
+    MODE_MAX_ITERATIONS: dict[AgentMode, int] = {AgentMode.FLASH: 5, AgentMode.MAX: 50}
+
+    #: When in FLASH, escalate to MAX after this many iterations without a
+    #: final answer (must stay below the FLASH cap of 5).
+    FLASH_ESCALATION_THRESHOLD: int = 3
 
     def __init__(
         self,
@@ -62,7 +81,8 @@ class Agent:
         tools: Iterable[Tool] | None = None,
         state: ConversationState | None = None,
         event_bus: EventBus | None = None,
-        max_iterations: int = 25,
+        classifier: TaskClassifier | None = None,
+        max_iterations: int | None = None,
     ) -> None:
         self.llm = llm
         # NOTE: use ``is not None`` rather than truthiness because
@@ -70,8 +90,13 @@ class Agent:
         # still a perfectly valid state object the caller passed in).
         self.state = state if state is not None else ConversationState()
         self.event_bus = event_bus if event_bus is not None else EventBus()
-        self.max_iterations = max_iterations
+        self.classifier: TaskClassifier = classifier if classifier is not None else DefaultClassifier()
+        # User override of the iteration cap. ``None`` => let routing pick per
+        # mode. Stored separately so an escalation can re-derive the MAX cap.
+        self._max_iterations_override: int | None = max_iterations
+        self.max_iterations: int = max_iterations if max_iterations is not None else self.MODE_MAX_ITERATIONS[AgentMode.MAX]
         self.mode: AgentMode = AgentMode.MAX
+        self.enable_extended_reasoning: bool = True
 
         tool_list = list(tools or [])
         self._tools: dict[str, Tool] = {}
@@ -98,6 +123,20 @@ class Agent:
     def run(self, user_message: str | None = None) -> str:
         """Run the agent loop until the model stops calling tools.
 
+        Before the first turn the task is classified exactly once (see
+        :attr:`classifier`); the result sets :attr:`mode` (FLASH for SIMPLE,
+        MAX for COMPLEX, fallback MAX on any classifier failure) and the
+        iteration cap for this run. The classifier is never re-invoked later in
+        the same run, even after an escalation.
+
+        Mid-run escalation FLASH -> MAX is triggered when:
+        * the first turn's tool call(s) report an error, or
+        * :attr:`FLASH_ESCALATION_THRESHOLD` iterations pass in FLASH without a
+          final answer.
+        Escalation keeps the conversation state, raises the cap to the MAX
+        default, and emits ``agent.escalated`` exactly once. MAX -> FLASH is
+        never performed.
+
         Args:
             user_message: Optional user turn to append before running. Pass
                 ``None`` to continue an existing conversation (e.g. after a
@@ -111,27 +150,16 @@ class Agent:
         if user_message is not None:
             self.state.add_user_message(user_message)
 
-        self._emit("agent.run_started", {"mode": self.mode.value, "tools": list(self._tools)})
+        self._classify_and_route(user_message)
+
+        self._emit(
+            "agent.run_started",
+            {"mode": self.mode.value, "tools": list(self._tools), "max_iterations": self.max_iterations},
+        )
 
         final_text = ""
         try:
-            for iteration in range(self.max_iterations):
-                self._emit("agent.turn_started", {"iteration": iteration})
-                response = self._call_llm()
-                self.state.add_assistant(self._assistant_content(response))
-                self._emit("agent.llm_response", {"tool_calls": len(response.tool_calls), "stop_reason": response.stop_reason})
-
-                if not response.tool_calls:
-                    final_text = response.content
-                    break
-
-                self._execute_tool_calls(response.tool_calls)
-            else:
-                logger.warning("Agent hit max_iterations=%d", self.max_iterations)
-                self._emit(
-                    "agent.error",
-                    {"reason": "max_iterations", "iterations": self.max_iterations},
-                )
+            final_text = self._run_loop()
         except Exception as exc:
             self._emit("agent.error", {"reason": "exception", "error": str(exc)})
             raise
@@ -142,17 +170,102 @@ class Agent:
     def escalate(self) -> bool:
         """Escalate from FLASH to MAX mid-task. Returns True if it escalated.
 
-        Downgrading is intentionally not supported within one task.
+        On a successful escalation the iteration cap is raised to the MAX
+        default (unless the caller pinned ``max_iterations`` explicitly), and
+        :attr:`enable_extended_reasoning` is turned on. Downgrading is
+        intentionally not supported within one task.
         """
         target = AgentMode.escalates_to(self.mode)
         if target is None:
             return False
         previous = self.mode
         self.mode = target
+        self.enable_extended_reasoning = target is AgentMode.MAX
+        if self._max_iterations_override is None:
+            self.max_iterations = self.MODE_MAX_ITERATIONS[target]
         self._emit("agent.escalated", {"from": previous.value, "to": target.value})
         return True
 
     # --- internals ----------------------------------------------------
+
+    def _classify_and_route(self, user_message: str | None) -> None:
+        """Classify the task once and apply the mode-specific config."""
+        task = user_message if user_message is not None else self._first_user_message() or ""
+        try:
+            classification = self.classifier.classify(task)
+        except Exception as exc:  # noqa: BLE001 - safe-side fallback
+            logger.warning(
+                "Classifier %s raised (routing to MAX): %s",
+                self.classifier.alias,
+                type(exc).__name__,
+            )
+            classification = None
+        if classification is None:
+            self._apply_mode(AgentMode.MAX, rationale="classifier_exception")
+            return
+        self._apply_mode(classification.mode, rationale=classification.rationale)
+        self._emit(
+            "agent.classified",
+            {
+                "complexity": classification.complexity.value,
+                "mode": classification.mode.value,
+                "confidence": classification.confidence,
+                "rationale": classification.rationale,
+            },
+        )
+
+    def _apply_mode(self, mode: AgentMode, rationale: str = "") -> None:
+        """Set :attr:`mode` and derive the iteration cap + reasoning flag."""
+        self.mode = mode
+        self.enable_extended_reasoning = mode is AgentMode.MAX
+        if self._max_iterations_override is not None:
+            self.max_iterations = self._max_iterations_override
+        else:
+            self.max_iterations = self.MODE_MAX_ITERATIONS[mode]
+
+    def _run_loop(self) -> str:
+        """The tool-calling loop, with mid-run FLASH -> MAX escalation."""
+        final_text = ""
+        iteration = 0
+        escalated = False
+        while iteration < self.max_iterations:
+            self._emit("agent.turn_started", {"iteration": iteration, "mode": self.mode.value})
+            response = self._call_llm()
+            self.state.add_assistant(self._assistant_content(response))
+            self._emit(
+                "agent.llm_response",
+                {"tool_calls": len(response.tool_calls), "stop_reason": response.stop_reason},
+            )
+
+            if not response.tool_calls:
+                final_text = response.content
+                break
+
+            any_error = self._execute_tool_calls(response.tool_calls)
+
+            if not escalated and self.mode is AgentMode.FLASH:
+                should_escalate = False
+                if iteration == 0 and any_error:
+                    should_escalate = True
+                elif (iteration + 1) >= self.FLASH_ESCALATION_THRESHOLD:
+                    should_escalate = True
+                if should_escalate:
+                    escalated = self.escalate()
+            iteration += 1
+        else:
+            logger.warning("Agent hit max_iterations=%d", self.max_iterations)
+            self._emit(
+                "agent.error",
+                {"reason": "max_iterations", "iterations": self.max_iterations},
+            )
+        return final_text
+
+    def _first_user_message(self) -> str | None:
+        """Return the most recent user text message, if any (for re-runs)."""
+        for msg in reversed(self.state.messages):
+            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                return msg["content"]
+        return None
 
     def _call_llm(self) -> LLMResponse:
         """Ask the LLM for the next turn using the current history + tools."""
@@ -180,11 +293,17 @@ class Agent:
             )
         return blocks if blocks else response.content
 
-    def _execute_tool_calls(self, calls: list[ToolCall]) -> None:
-        """Execute each tool call in order and append results to the state."""
+    def _execute_tool_calls(self, calls: list[ToolCall]) -> bool:
+        """Execute each tool call in order and append results to the state.
+
+        Returns ``True`` if at least one tool call resulted in an error (used
+        by the escalation logic to detect a failing first turn).
+        """
+        any_error = False
         for call in calls:
             self._emit("agent.tool_call_started", {"name": call.name, "id": call.id})
             result = self._execute_one(call)
+            any_error = any_error or result.is_error
             self._emit(
                 "agent.tool_call_finished",
                 {
@@ -199,6 +318,7 @@ class Agent:
                 self._format_tool_output(result),
                 is_error=result.is_error,
             )
+        return any_error
 
     def _execute_one(self, call: ToolCall) -> ToolResult:
         """Dispatch a single tool call, mapping failures to ToolResult errors."""
