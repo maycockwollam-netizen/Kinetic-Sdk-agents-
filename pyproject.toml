@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kinetic-agent-sdk"
+version = "0.1.0"
+description = "A modular agent SDK for the KINETIC coding agent."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "KINETIC" }]
+dependencies = []
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[tool.setuptools.packages.find]
+include = ["kinetic_sdk*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
