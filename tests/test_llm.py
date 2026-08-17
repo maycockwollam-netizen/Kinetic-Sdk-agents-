@@ -1,11 +1,12 @@
 """Unit tests for the LLM client interface + MockLLM used elsewhere.
 
-We do NOT test the Anthropic backend's network calls here; that requires the
-optional ``anthropic`` package and live credentials. Instead we validate the
+We do NOT test the LiteLLM backend's network calls here; that requires the
+optional ``litellm`` package and live credentials. Instead we validate the
 public surface (types, no-op behaviour of the abstract methods) and the
 behaviour of the :class:`MockLLM` helper used by the agent tests. The
-``AnthropicClient`` parsing logic is integration-tested separately when
-needed.
+:class:`LiteLLMClient` parsing/translation logic is unit-tested in
+``tests/test_litellm_client.py`` (mocking ``litellm.completion``); the
+network path is integration-tested separately when needed.
 """
 
 from __future__ import annotations

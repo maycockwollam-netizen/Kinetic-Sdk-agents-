@@ -13,7 +13,7 @@ authors = [{ name = "KINETIC" }]
 dependencies = []
 
 [project.optional-dependencies]
-anthropic = ["anthropic>=0.40"]
+llm = ["litellm>=1.50"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [tool.setuptools.packages.find]

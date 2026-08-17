@@ -1,20 +1,29 @@
-"""Provider-agnostic LLM client interface with an Anthropic implementation.
+"""Provider-agnostic LLM client interface with a LiteLLM implementation.
 
-The agent loop talks to :class:`LLMClient` only. Stage 1 ships an Anthropic
-implementation (:class:`AnthropicClient`) plus a synchronous stub interface
-(:class:`LLMClient`) so the agent can be tested without network access.
+The agent loop talks to :class:`LLMClient` only. The default implementation,
+:class:`LiteLLMClient`, is backed by the `litellm` library so a single class
+can reach multiple providers (Anthropic Claude, OpenAI-compatible endpoints,
+...) just by varying the ``model`` string and optional ``api_base``. This lets
+the agent (Claude) and the future task classifier (a cheap OpenAI-compatible
+endpoint) share one client class with different config.
 
 Design notes:
 * ``LLMClient.chat`` takes a list of messages and a list of tool definitions
   and returns an :class:`LLMResponse` describing the model's turn: text and
   any tool calls it wants the agent to run.
+* The conversation history is kept in Anthropic's message format (``role`` +
+  ``content`` where ``content`` is a list of typed blocks such as
+  ``tool_use`` / ``tool_result``) because that is the most expressive of the
+  common provider formats and is what :class:`ConversationState` stores.
+  :class:`LiteLLMClient` translates that shape to/from the OpenAI message
+  format that ``litellm.completion`` expects, so the agent loop and the
+  conversation state are unchanged by the backend switch.
 * Streaming is exposed via ``chat_stream`` which yields incremental
-  :class:`StreamEvent` deltas. The non-streaming ``chat`` is built on top of
-  ``chat_stream`` for the Anthropic backend so there is one code path to
-  maintain. A non-streaming provider can implement ``chat`` directly and
-  leave ``chat_stream`` raising ``NotImplementedError``.
-* ``anthropic`` is an optional dependency: import this module without it
-  installed only fails when you actually instantiate :class:`AnthropicClient`.
+  :class:`StreamEvent` deltas. ``chat`` and ``chat_stream`` are independent
+  code paths; a provider that does not stream can leave ``chat_stream``
+  raising ``NotImplementedError``.
+* ``litellm`` is an optional dependency: importing this module without it
+  installed only fails when you actually instantiate :class:`LiteLLMClient`.
 """
 
 from __future__ import annotations
@@ -130,39 +139,239 @@ class LLMClient(ABC):
         raise NotImplementedError(f"{type(self).__name__} does not support streaming")
 
 
-class AnthropicClient(LLMClient):
-    """LLM client backed by the Anthropic Messages API.
+class LiteLLMClient(LLMClient):
+    """LLM client backed by the `litellm` library.
 
-    Requires the optional ``anthropic`` package. Streaming and
-    non-streaming share one code path: ``chat`` aggregates ``chat_stream``.
+    A single class reaches multiple providers: pass a LiteLLM-style ``model``
+    string such as ``"anthropic/claude-sonnet-4-5"`` (Anthropic Claude) or
+    ``"openai/openhands/glm-5.2"`` with a custom ``api_base`` pointing at an
+    OpenAI-compatible endpoint. ``api_key`` and ``api_base`` are forwarded to
+    ``litellm.completion`` on every call, so two instances of this class with
+    different config act as two independent clients (the main agent model and
+    the classifier model, for example).
 
-    The Anthropic SDK is imported lazily so importing this module (and the
-    rest of the SDK) does not force the dependency on environments that use
-    a different provider.
+    The conversation history is stored in Anthropic's message format (typed
+    content blocks including ``tool_use`` / ``tool_result``) by
+    :class:`ConversationState`. Before calling litellm we translate that to
+    the OpenAI message format, and translate the OpenAI response back into the
+    :class:`LLMResponse` shape the agent loop expects. This keeps the agent
+    loop and conversation state provider-neutral.
+
+    The `litellm` package is imported lazily so importing this module (and the
+    rest of the SDK) does not force the dependency on environments that use a
+    different provider implementation.
     """
 
     def __init__(
         self,
         model: str,
         api_key: str | None = None,
+        api_base: str | None = None,
         max_tokens: int = 4096,
-        client: Any | None = None,
     ) -> None:
         self.model = model
+        self.api_key = api_key
+        self.api_base = api_base
         self.max_tokens = max_tokens
-        # Allow injecting a mock/real client for testing.
-        self._client = client or self._build_client(api_key)
+        # Import lazily so the rest of the SDK stays zero-dependency. We keep a
+        # reference to the module to call ``completion`` on it (and so tests can
+        # monkeypatch ``litellm.completion`` on the real module object).
+        self._litellm = self._import_litellm()
 
     @staticmethod
-    def _build_client(api_key: str | None) -> Any:
+    def _import_litellm() -> Any:
         try:
-            import anthropic  # type: ignore
+            import litellm  # type: ignore
         except ImportError as exc:  # pragma: no cover - env dependent
             raise ImportError(
-                "AnthropicClient requires the 'anthropic' package. "
-                "Install it with: pip install kinetic-agent-sdk[anthropic]"
+                "LiteLLMClient requires the 'litellm' package. "
+                "Install it with: pip install kinetic-agent-sdk[llm]"
             ) from exc
-        return anthropic.Anthropic(api_key=api_key)
+        return litellm
+
+    # --- message / tool schema translation ----------------------------
+
+    @staticmethod
+    def _translate_messages(
+        messages: list[Message], system: str | None
+    ) -> list[dict[str, Any]]:
+        """Translate Anthropic-format messages to the OpenAI message format.
+
+        Anthropic stores assistant tool calls as ``tool_use`` content blocks
+        and tool results as ``user`` turns containing ``tool_result`` blocks.
+        OpenAI expresses the same conversation with ``assistant.tool_calls``
+        and separate ``tool``-role messages keyed by ``tool_call_id``. litellm
+        speaks the OpenAI shape, so we normalise here.
+        """
+        out: list[dict[str, Any]] = []
+        if system:
+            out.append({"role": "system", "content": system})
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role == "assistant":
+                out.append(LiteLLMClient._translate_assistant(content))
+            elif role == "user" and isinstance(content, list):
+                tool_results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+                if tool_results:
+                    # A user turn of tool_result blocks becomes one or more
+                    # OpenAI ``tool`` messages, one per result.
+                    for b in tool_results:
+                        out.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": b.get("tool_use_id", ""),
+                                "content": b.get("content", ""),
+                            }
+                        )
+                    # Any non-tool_result blocks in the same turn (rare) are
+                    # appended as a follow-up user message.
+                    extras = [b for b in content if not (isinstance(b, dict) and b.get("type") == "tool_result")]
+                    if extras:
+                        out.append({"role": "user", "content": LiteLLMClient._flatten_text(extras)})
+                else:
+                    out.append({"role": "user", "content": LiteLLMClient._flatten_text(content)})
+            else:
+                # Plain text turn (user/assistant string content) or any other
+                # role: pass through with stringified content.
+                out.append({"role": role, "content": content if isinstance(content, str) else LiteLLMClient._flatten_text(content) if isinstance(content, list) else content})
+        return out
+
+    @staticmethod
+    def _translate_assistant(content: Any) -> dict[str, Any]:
+        """Translate an assistant turn (string or typed blocks) to OpenAI shape."""
+        if isinstance(content, str):
+            return {"role": "assistant", "content": content}
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        for block in content or []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text_parts.append(block.get("text", ""))
+            elif btype == "tool_use":
+                import json
+
+                tool_calls.append(
+                    {
+                        "id": block.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name", ""),
+                            "arguments": json.dumps(block.get("input", {})),
+                        },
+                    }
+                )
+        msg: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts) or None}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        return msg
+
+    @staticmethod
+    def _flatten_text(blocks: list[Any]) -> str:
+        """Concatenate ``text`` blocks into a single string."""
+        parts = []
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text", ""))
+            elif isinstance(b, str):
+                parts.append(b)
+        return "".join(parts)
+
+    @staticmethod
+    def _translate_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        """Translate Anthropic tool schemas to the OpenAI function format.
+
+        Anthropic shape: ``{name, description, input_schema}``. OpenAI shape:
+        ``{type: "function", function: {name, description, parameters}}``.
+        """
+        if not tools:
+            return None
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.get("name", ""),
+                    "description": t.get("description", ""),
+                    "parameters": t.get("input_schema", {}),
+                },
+            }
+            for t in tools
+        ]
+
+    # --- response parsing ---------------------------------------------
+
+    @staticmethod
+    def _parse_response(raw: Any) -> LLMResponse:
+        """Parse a non-streaming litellm/OpenAI response into :class:`LLMResponse`."""
+        import json
+
+        choice = None
+        try:
+            choice = raw.choices[0]
+        except (AttributeError, IndexError):
+            choice = None
+        message = getattr(choice, "message", None) if choice is not None else None
+        content = ""
+        tool_calls: list[ToolCall] = []
+        if message is not None:
+            text = getattr(message, "content", None)
+            if text:
+                content = text if isinstance(text, str) else str(text)
+            raw_calls = getattr(message, "tool_calls", None) or []
+            for rc in raw_calls:
+                fn = getattr(rc, "function", None)
+                if fn is None:
+                    continue
+                name = getattr(fn, "name", "")
+                raw_args = getattr(fn, "arguments", "{}")
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                except json.JSONDecodeError:
+                    args = {"_raw": raw_args}
+                tool_calls.append(ToolCall(id=getattr(rc, "id", ""), name=name, arguments=args))
+        finish = getattr(choice, "finish_reason", None) if choice is not None else None
+        stop_reason = LiteLLMClient._map_stop_reason(finish)
+        usage = LiteLLMClient._parse_usage(raw)
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            stop_reason=stop_reason,
+            usage=usage,
+            raw=raw,
+        )
+
+    @staticmethod
+    def _map_stop_reason(finish: str | None) -> str | None:
+        """Map OpenAI ``finish_reason`` to the Anthropic-style stop reason."""
+        if finish is None:
+            return None
+        mapping = {
+            "stop": "end_turn",
+            "length": "max_tokens",
+            "tool_calls": "tool_use",
+            "function_call": "tool_use",
+            "content_filter": "end_turn",
+        }
+        return mapping.get(finish, finish)
+
+    @staticmethod
+    def _parse_usage(raw: Any) -> dict[str, int]:
+        """Normalise token usage to ``{input_tokens, output_tokens}``."""
+        usage = getattr(raw, "usage", None)
+        if usage is None:
+            return {}
+        inp = getattr(usage, "prompt_tokens", None)
+        out = getattr(usage, "completion_tokens", None)
+        result: dict[str, int] = {}
+        if inp is not None:
+            result["input_tokens"] = inp
+        if out is not None:
+            result["output_tokens"] = out
+        return result
+
+    # --- public API ---------------------------------------------------
 
     def chat(
         self,
@@ -171,20 +380,10 @@ class AnthropicClient(LLMClient):
         system: str | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
-        """Non-streaming chat; built by aggregating :meth:`chat_stream`."""
-        final: LLMResponse | None = None
-        text_parts: list[str] = []
-        tool_calls: list[ToolCall] = []
-        for ev in self.chat_stream(messages, tools, system, **kwargs):
-            if ev.type == "text" and isinstance(ev.delta, str):
-                text_parts.append(ev.delta)
-            elif ev.type == "tool_call" and isinstance(ev.delta, ToolCall):
-                tool_calls.append(ev.delta)
-            elif ev.type == "done" and isinstance(ev.delta, LLMResponse):
-                final = ev.delta
-        if final is None:  # pragma: no cover - defensive
-            final = LLMResponse(content="".join(text_parts), tool_calls=tool_calls)
-        return final
+        """Non-streaming chat turn via ``litellm.completion``."""
+        request = self._build_request(messages, tools, system, **kwargs)
+        raw = self._litellm.completion(**request)
+        return self._parse_response(raw)
 
     def chat_stream(
         self,
@@ -193,90 +392,56 @@ class AnthropicClient(LLMClient):
         system: str | None = None,
         **kwargs: Any,
     ) -> Iterator[StreamEvent]:
-        """Stream the Anthropic Messages API as :class:`StreamEvent` deltas.
+        """Stream the response as :class:`StreamEvent` deltas.
 
-        Uses the synchronous streaming endpoint. Partial text is emitted as
-        ``text`` events; tool-use blocks are parsed and emitted as a single
-        ``tool_call`` event once their arguments JSON is complete. The final
-        aggregated :class:`LLMResponse` is emitted in a ``done`` event.
+        Yields ``text`` events for each incremental text chunk, then a single
+        ``done`` event carrying the aggregated :class:`LLMResponse`. Tool calls
+        are emitted in the final ``done`` event (streaming partial tool
+        arguments is a later stage). Falls back to ``NotImplementedError`` if
+        the provider does not stream.
         """
-        request: dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": kwargs.pop("max_tokens", self.max_tokens),
-            "messages": messages,
-        }
-        if system is not None:
-            request["system"] = system
-        if tools:
-            request["tools"] = tools
-        request.update(kwargs)
-
+        request = self._build_request(messages, tools, system, **kwargs)
+        request["stream"] = True
+        stream = self._litellm.completion(**request)
         text_buf: list[str] = []
         tool_calls: list[ToolCall] = []
-        # active tool_use blocks keyed by index -> accumulating json string.
-        tool_bufs: dict[int, dict[str, str]] = {}
         stop_reason: str | None = None
         usage: dict[str, int] = {}
+        for chunk in stream:
+            choice = None
+            try:
+                choice = chunk.choices[0]
+            except (AttributeError, IndexError):
+                choice = None
+            if choice is None:
+                continue
+            delta = getattr(choice, "delta", None)
+            text = getattr(delta, "content", None)
+            if text:
+                text_buf.append(text)
+                yield StreamEvent(type="text", delta=text)
+            # Some providers surface completed tool calls on the delta.
+            raw_calls = getattr(delta, "tool_calls", None) or []
+            for rc in raw_calls:
+                fn = getattr(rc, "function", None)
+                if fn is None:
+                    continue
+                import json
 
-        with self._client.messages.stream(**request) as stream:
-            for event in stream:
-                etype = getattr(event, "type", None)
-                if etype == "content_block_start":
-                    block = getattr(event, "content_block", None)
-                    if getattr(block, "type", None) == "tool_use":
-                        idx = getattr(event, "index", 0)
-                        tool_bufs[idx] = {
-                            "id": getattr(block, "id", ""),
-                            "name": getattr(block, "name", ""),
-                            "input": "",
-                        }
-                elif etype == "content_block_delta":
-                    delta = getattr(event, "delta", None)
-                    dtype = getattr(delta, "type", None)
-                    idx = getattr(event, "index", 0)
-                    if dtype == "text_delta":
-                        chunk = getattr(delta, "text", "")
-                        text_buf.append(chunk)
-                        yield StreamEvent(type="text", delta=chunk)
-                    elif dtype == "input_json_delta":
-                        chunk = getattr(delta, "partial_json", "")
-                        if idx in tool_bufs:
-                            tool_bufs[idx]["input"] += chunk
-                elif etype == "content_block_stop":
-                    idx = getattr(event, "index", 0)
-                    if idx in tool_bufs:
-                        tb = tool_bufs.pop(idx)
-                        import json
-
-                        try:
-                            args = json.loads(tb["input"] or "{}")
-                        except json.JSONDecodeError:
-                            args = {"_raw": tb["input"]}
-                        call = ToolCall(id=tb["id"], name=tb["name"], arguments=args)
-                        tool_calls.append(call)
-                        yield StreamEvent(type="tool_call", delta=call)
-                elif etype == "message_delta":
-                    msg = getattr(event, "delta", None)
-                    stop_reason = getattr(msg, "stop_reason", stop_reason)
-                    u = getattr(event, "usage", None)
-                    if u is not None:
-                        usage.update(
-                            {
-                                "input_tokens": getattr(u, "input_tokens", usage.get("input_tokens", 0)),
-                                "output_tokens": getattr(u, "output_tokens", usage.get("output_tokens", 0)),
-                            }
-                        )
-                elif etype == "message_start":
-                    msg = getattr(event, "message", None)
-                    u = getattr(msg, "usage", None)
-                    if u is not None:
-                        usage.update(
-                            {
-                                "input_tokens": getattr(u, "input_tokens", 0),
-                                "output_tokens": getattr(u, "output_tokens", 0),
-                            }
-                        )
-
+                raw_args = getattr(fn, "arguments", "{}")
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) and raw_args else (raw_args or {})
+                except json.JSONDecodeError:
+                    args = {"_raw": raw_args}
+                call = ToolCall(id=getattr(rc, "id", ""), name=getattr(fn, "name", ""), arguments=args)
+                if not any(t.id == call.id and t.name == call.name for t in tool_calls):
+                    tool_calls.append(call)
+            fr = getattr(choice, "finish_reason", None)
+            if fr:
+                stop_reason = self._map_stop_reason(fr)
+            u = getattr(chunk, "usage", None)
+            if u is not None:
+                usage.update(self._parse_usage(chunk))
         final = LLMResponse(
             content="".join(text_buf),
             tool_calls=tool_calls,
@@ -285,6 +450,31 @@ class AnthropicClient(LLMClient):
             raw=None,
         )
         yield StreamEvent(type="done", delta=final)
+
+    # --- internals ----------------------------------------------------
+
+    def _build_request(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None,
+        system: str | None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build the kwargs dict passed to ``litellm.completion``."""
+        request: dict[str, Any] = {
+            "model": self.model,
+            "messages": self._translate_messages(messages, system),
+            "max_tokens": kwargs.pop("max_tokens", self.max_tokens),
+        }
+        translated_tools = self._translate_tools(tools)
+        if translated_tools is not None:
+            request["tools"] = translated_tools
+        if self.api_key is not None:
+            request["api_key"] = self.api_key
+        if self.api_base is not None:
+            request["api_base"] = self.api_base
+        request.update(kwargs)
+        return request
 
 
 class AsyncLLMClient(ABC):

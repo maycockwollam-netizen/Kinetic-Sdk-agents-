@@ -14,7 +14,7 @@ strategies can be swapped without touching the agent loop.
   `TaskClassifier` interface (stub).
 - `kinetic_sdk/conversation/` — `ConversationState` in-memory history.
 - `kinetic_sdk/event/` — `EventBus` publish/subscribe.
-- `kinetic_sdk/llm/` — `LLMClient` interface + `AnthropicClient` (optional).
+- `kinetic_sdk/llm/` — `LLMClient` interface + `LiteLLMClient` (optional, multi-provider).
 - `kinetic_sdk/tool/` — abstract `Tool` / `ToolResult`.
 - `kinetic_sdk/context/` — `ContextManager` interface (Stage 2 stub).
 
@@ -22,8 +22,8 @@ strategies can be swapped without touching the agent loop.
 
 ```bash
 pip install -e ".[dev]"
-# For the Anthropic backend:
-pip install -e ".[anthropic]"
+# For the LLM backend (Anthropic Claude, OpenAI-compatible endpoints, ...):
+pip install -e ".[llm]"
 ```
 
 ## Run tests
@@ -34,11 +34,16 @@ pytest -q
 
 ## Minimal example
 
+`LiteLLMClient` uses `litellm` under the hood, so one class reaches many
+providers via the LiteLLM model string. The conversation history stays in
+Anthropic message format (typed content blocks); the client translates
+to/from the OpenAI shape that `litellm.completion` expects.
+
 ```python
 from kinetic_sdk.agent import Agent
 from kinetic_sdk.conversation import ConversationState
 from kinetic_sdk.event import EventBus
-from kinetic_sdk.llm.client import AnthropicClient
+from kinetic_sdk.llm.client import LiteLLMClient
 from kinetic_sdk.tool.base import Tool, ToolResult
 
 
@@ -55,7 +60,16 @@ class EchoTool(Tool):
         return ToolResult(output=message)
 
 
-llm = AnthropicClient(model="claude-3-5-sonnet-latest", api_key="sk-...")
+# Anthropic Claude via the "anthropic/" provider prefix:
+llm = LiteLLMClient(model="anthropic/claude-sonnet-4-5", api_key="sk-ant-...")
+
+# Or an OpenAI-compatible endpoint (e.g. the OpenHands proxy) via api_base:
+# llm = LiteLLMClient(
+#     model="openai/openhands/glm-5.2",
+#     api_key="...",
+#     api_base="https://llm-proxy.app.all-hands.dev",
+# )
+
 agent = Agent(llm=llm, tools=[EchoTool()])
 print(agent.run("Echo back: hello"))
 ```
