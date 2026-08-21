@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
@@ -32,6 +33,7 @@ from kinetic_sdk.context.manager import ContextManager, SimpleTruncateContextMan
 from kinetic_sdk.conversation.state import ConversationState
 from kinetic_sdk.event.bus import EventBus, Event
 from kinetic_sdk.llm.client import LLMClient, LLMResponse, ToolCall
+from kinetic_sdk.observability.logger import ObservabilityLogger
 from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
 from kinetic_sdk.security.policy import AllowListPolicy, PermissionPolicy
 from kinetic_sdk.security.redact import redact_secrets
@@ -81,6 +83,10 @@ class Agent:
             :class:`PermissivePolicy` only for local dev/test.
         audit_logger: Sink recording every tool call, denial and result.
             ``None`` (default) uses :class:`InMemoryAuditLogger`.
+        observability_logger: Optional structured event logger. ``None``
+            (default) keeps observability off entirely — no subscription, no
+            overhead. When provided it is attached to the event bus at
+            construction time so it also captures ``agent.run_started``.
 
     Attributes:
         mode: Current :class:`AgentMode`. Set once by the classifier at the
@@ -115,6 +121,7 @@ class Agent:
         model_context_limit: int | None = None,
         permission_policy: PermissionPolicy | None = None,
         audit_logger: AuditLogger | None = None,
+        observability_logger: ObservabilityLogger | None = None,
     ) -> None:
         self.llm = llm
         # NOTE: use ``is not None`` rather than truthiness because
@@ -135,6 +142,13 @@ class Agent:
         self.audit_logger: AuditLogger = (
             audit_logger if audit_logger is not None else InMemoryAuditLogger()
         )
+        self.observability_logger = observability_logger
+        if observability_logger is not None:
+            # Attach at construction (not in run()) so run_started is caught.
+            observability_logger.attach(self.event_bus)
+        #: UUID of the in-flight (or most recent) :meth:`run`; ``None`` before
+        #: the first run. Every event emitted during a run carries it.
+        self._run_id: str | None = None
         # User override of the iteration cap. ``None`` => let routing pick per
         # mode. Stored separately so an escalation can re-derive the MAX cap.
         self._max_iterations_override: int | None = max_iterations
@@ -194,6 +208,7 @@ class Agent:
         if user_message is not None:
             self.state.add_user_message(user_message)
 
+        self._run_id = str(uuid.uuid4())
         self._classify_and_route(user_message)
 
         self._emit(
@@ -454,8 +469,20 @@ class Agent:
         s = str(value)
         return s if len(s) <= limit else s[:limit] + "..."
 
+    @property
+    def run_id(self) -> str | None:
+        """UUID of the current/last :meth:`run`, or ``None`` before any run."""
+        return self._run_id
+
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
-        """Publish a lifecycle event if a bus is attached."""
+        """Publish a lifecycle event if a bus is attached.
+
+        When a run is in flight its ``run_id`` is added to the payload so
+        observability subscribers can group events per run. Existing payload
+        fields are left untouched.
+        """
         if self.event_bus is None:
             return
+        if self._run_id is not None:
+            payload = {**payload, "run_id": self._run_id}
         self.event_bus.publish(Event(type=event_type, payload=payload, source="agent"))
