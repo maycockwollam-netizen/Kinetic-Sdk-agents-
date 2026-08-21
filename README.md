@@ -11,11 +11,10 @@ rewriting the agent loop.
 - **Stage 1 — Core: done.** Includes the `Agent` loop, `Tool` / `ToolResult`,
   `ConversationState`, `EventBus`, the `LLMClient` interface, and the optional
   LiteLLM-backed client.
-- **Stage 2 — Context & Memory: partial.** FLASH/MAX task routing, the
-  model-backed `LiteLLMClassifier`, truncation-based context compaction, and
-  secret management are implemented. LLM-summarized context compaction is still
-  planned; `SummarizingContextManager` currently falls back to simple
-  truncation.
+- **Stage 2 — Context & Memory: done for the current scope.** FLASH/MAX task
+  routing, the model-backed `LiteLLMClassifier`, truncation-based context
+  compaction, LLM-summarized context compaction with safe truncation fallback,
+  and secret management are implemented.
 - **Stage 3 — Quality & Ops: partial.** Permission policies, audit logging,
   secret redaction, structured observability logging, and per-run trace
   summaries are implemented. Richer confirmation UX, policy sets, metrics, and
@@ -135,7 +134,6 @@ before being persisted or published.
 
 ## Roadmap
 
-- Implement real LLM-summarized compaction in `SummarizingContextManager`.
 - Add a confirmation UX for permission decisions that require manual approval.
 - Add richer policy presets for filesystem, terminal, git, and network tools.
 - Add metrics aggregation and external tracing exporters such as OpenTelemetry

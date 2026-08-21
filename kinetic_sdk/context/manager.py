@@ -13,18 +13,18 @@ preserved first:
 The only compaction technique shipped complete for now is simple truncation:
 the dropped middle span is replaced by a single placeholder message
 (e.g. ``"[12 tin nhắn trước đó đã được rút gọn]"``). LLM-based summarisation
-is exposed via :class:`SummarizingContextManager` as an extension point but
-is intentionally not implemented yet (falls back to truncation).
+is implemented by :class:`SummarizingContextManager` when a summarizer is
+provided, with safe fallback to truncation on any summarizer failure.
 """
 
 from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Protocol
 
 from kinetic_sdk.conversation.state import ConversationState
-from kinetic_sdk.llm.client import Message
+from kinetic_sdk.llm.client import LLMClient, Message
 
 
 def estimate_tokens(text: str, chars_per_token: int = 4) -> int:
@@ -59,6 +59,54 @@ def _message_has_tool_result(msg: Message) -> bool:
         isinstance(block, dict) and block.get("type") == "tool_result"
         for block in content
     )
+
+
+class ContextSummarizer(Protocol):
+    """Summarizes an elided conversation span for context compaction.
+
+    Implementations are intentionally tiny and injectable so tests can use a
+    deterministic fake while SDK users can pass an LLM-backed summarizer. They
+    should return a concise human-readable summary. Empty strings are treated as
+    failure by :class:`SummarizingContextManager` and trigger truncation fallback.
+    """
+
+    def summarize(self, messages: list[Message]) -> str:
+        """Return a short summary of *messages*."""
+        ...
+
+
+class LLMContextSummarizer:
+    """LLM-backed summarizer for elided conversation spans.
+
+    The caller injects an :class:`~kinetic_sdk.llm.client.LLMClient`, keeping
+    this module provider-neutral and avoiding any hard dependency on ``litellm``.
+    The public ``alias`` mirrors the classifier pattern: logs/config can refer
+    to the summarizer by a stable SDK alias instead of leaking a concrete model
+    name.
+    """
+
+    alias = "kinetic-context-summarizer-v1"
+
+    def __init__(self, client: LLMClient, max_tokens: int = 160) -> None:
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
+        self.client = client
+        self.max_tokens = max_tokens
+
+    def summarize(self, messages: list[Message]) -> str:
+        """Ask the injected LLM for a 1-2 sentence Vietnamese summary."""
+        instructions = (
+            "Tóm tắt phần hội thoại đã bị rút gọn trong 1-2 câu tiếng Việt. "
+            "Giữ lại mục tiêu, quyết định quan trọng, lỗi/tool result đáng chú ý, "
+            "và thông tin mà agent cần để tiếp tục. Không thêm thông tin mới."
+        )
+        body = json.dumps(messages, ensure_ascii=False, default=str)
+        response = self.client.chat(
+            messages=[{"role": "user", "content": f"Đoạn hội thoại cần tóm tắt:\n{body}"}],
+            system=instructions,
+            max_tokens=self.max_tokens,
+        )
+        return (response.content or "").strip()
 
 
 class ContextManager(ABC):
@@ -179,13 +227,19 @@ class SimpleTruncateContextManager(ContextManager):
             return self._copy(state, list(messages))
 
         kept = [dict(m) for m in messages[:head_end]]
-        placeholder: Message = {
+        kept.append(self._elided_message(messages[head_end:tail_start], removed))
+        kept.extend(dict(m) for m in messages[tail_start:])
+        return self._copy(state, kept)
+
+    def _elided_message(self, elided: list[Message], removed: int) -> Message:
+        """The single message replacing the dropped middle span.
+
+        Subclasses override this to carry richer content (e.g. a summary).
+        """
+        return {
             "role": "user",
             "content": self.PLACEHOLDER_TEMPLATE.format(n=removed),
         }
-        kept.append(placeholder)
-        kept.extend(dict(m) for m in messages[tail_start:])
-        return self._copy(state, kept)
 
     # --- internals --------------------------------------------------------
 
@@ -222,11 +276,52 @@ class SimpleTruncateContextManager(ContextManager):
 
 
 class SummarizingContextManager(SimpleTruncateContextManager):
-    """Extension point: LLM-summarised compaction. NOT IMPLEMENTED yet.
+    """Summarization-based compaction with safe truncation fallback.
 
-    The plan is to replace the dropped middle span with a 1-2 sentence
-    summary produced by a cheap model (behind an alias, like the classifier)
-    instead of the plain placeholder, so the agent retains a sketch of the
-    elided context. Until that lands, this class behaves exactly like
-    :class:`SimpleTruncateContextManager`.
+    When a :class:`ContextSummarizer` is provided, the dropped middle span is
+    replaced by a concise summary instead of a plain placeholder. If no
+    summarizer is configured, or if summarization raises/returns an empty
+    string, this manager falls back to :class:`SimpleTruncateContextManager` so
+    compaction remains deterministic and never blocks the agent loop.
     """
+
+    SUMMARY_TEMPLATE = "[{n} tin nhắn trước đó đã được tóm tắt: {summary}]"
+
+    def __init__(
+        self,
+        keep_last_tool_results: int = 5,
+        safety_threshold: float = 0.8,
+        chars_per_token: int = 4,
+        summarizer: ContextSummarizer | None = None,
+        max_summary_chars: int = 1_000,
+    ) -> None:
+        super().__init__(
+            keep_last_tool_results=keep_last_tool_results,
+            safety_threshold=safety_threshold,
+            chars_per_token=chars_per_token,
+        )
+        if max_summary_chars < 1:
+            raise ValueError("max_summary_chars must be >= 1")
+        self.summarizer = summarizer
+        self.max_summary_chars = max_summary_chars
+
+    def _elided_message(self, elided: list[Message], removed: int) -> Message:
+        summary = self._summarize(elided)
+        if not summary:
+            return super()._elided_message(elided, removed)
+        return {
+            "role": "user",
+            "content": self.SUMMARY_TEMPLATE.format(n=removed, summary=summary),
+        }
+
+    def _summarize(self, messages: list[Message]) -> str:
+        try:
+            summary = self.summarizer.summarize([dict(m) for m in messages]) if self.summarizer else ""
+        except Exception:  # noqa: BLE001 - compaction must safely degrade
+            return ""
+        if not isinstance(summary, str):
+            return ""
+        summary = " ".join(summary.split())
+        if len(summary) > self.max_summary_chars:
+            summary = summary[: self.max_summary_chars].rstrip() + "…"
+        return summary

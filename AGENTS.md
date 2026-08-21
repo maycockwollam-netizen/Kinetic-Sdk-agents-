@@ -51,6 +51,11 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   in the `Agent` — see `agent/agent.py`.
 - MockLLM replays a scripted list of `LLMResponse`/callables for deterministic
   agent tests (no network). Helper lives in `tests/_helpers.py`.
+- The session `GITHUB_TOKEN` (a `ghu_` OAuth token) is READ-ONLY for git
+  contents: `git push` and Git Data API writes (blobs/trees/commits) return
+  403 "Resource not accessible by integration" even though the repo
+  permissions endpoint reports admin. Read ops (PR list/view/diff) work.
+  Plan to hand the user a patch or ask for a write-capable credential.
 
 ## Module map (Stage 1 + Stage 2 classifier)
 - `kinetic_sdk/agent/agent.py` — `Agent.run()` tool-calling loop, emits events;
