@@ -10,18 +10,19 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (122 tests: 85 Stage 1+classifier +
-  17 context manager + 20 security). NOTE: the litellm tests need the `[llm]`
-  extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or 11 tests error.
+- Run tests: `python -m pytest -q` (145 tests: 85 Stage 1+classifier +
+  17 context manager + 20 security + 23 secret). NOTE: the litellm tests need
+  the `[llm]` extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or
+  11 tests error.
 - No build step beyond pip install.
 
 ## Stage status
 - Stage 1 (Core): DONE — `tool`, `event`, `llm`, `conversation`, `agent` loop.
 - Stage 2 (Context & Memory): PARTIAL — classifier + FLASH/MAX routing DONE;
   `context/manager.py` real truncation-based compaction DONE and wired into
-  the agent loop (see "Context manager" below). Remaining: LLM-summarised
-  compaction (`SummarizingContextManager` is a placeholder subclass) and the
-  `secret/` module (not yet created).
+  the agent loop (see "Context manager" below); `secret/` module DONE (see
+  "Secret management" below). Remaining: LLM-summarised compaction
+  (`SummarizingContextManager` is a placeholder subclass).
 - Stage 3 (Quality & Ops): PARTIAL — `security/` module DONE (permission
   policy + audit log + secret redaction, wired into the agent loop). See
   "Security" below. Remaining Stage 3: real confirmation UX, richer policies.
@@ -120,8 +121,32 @@ behind alias `kinetic-classifier-v1` — never leak the real model name.
   LLM summary of the elided span (cheap model behind an alias, like the
   classifier). The classifier already accepts a `summary` kwarg that the
   summary can feed into.
-- `secret/` module for credential handling (distinct from
-  `security/redact.py`, which only scrubs secrets out of logs/events).
+
+## Secret management (Stage 2 — DONE)
+- `secret/value.py` — `SecretValue`: wraps a secret string; `repr()`/`str()`
+  ALWAYS return `"<SecretValue: [REDACTED]>"` (safe inside containers /
+  `vars(obj)` dumps), `reveal()` returns the plaintext (call ONLY where the
+  secret is consumed, e.g. building the HTTP request), `__eq__` compares
+  against other `SecretValue` (never equal to a bare str), `__hash__` raises
+  `TypeError` by design (value-derived hash would be brute-forceable).
+- `secret/provider.py` — `SecretProvider` ABC (`get(key) -> str | None`),
+  `EnvSecretProvider` (default, reads `os.environ`), `DictSecretProvider`
+  (inject a dict; tests / SDK users with their own secret manager).
+- `secret/registry.py` — `SecretRegistry(providers)` tries providers in
+  order, first hit wins; `resolve(key, required=True) -> SecretValue | None`
+  raises `SecretNotFoundError` (message names the missing key) when required
+  and absent. Default registry = env only.
+- Wiring: `LiteLLMClient(api_key=...)` and `LiteLLMClassifier(api_key=...)`
+  accept `str | SecretValue | None` — plain strings are auto-wrapped
+  (backward compatible, old callers unchanged). The key is stored ONLY as
+  `SecretValue` on the instance and `.reveal()`ed inside `_build_request` at
+  the moment the litellm request is built. `LiteLLMClassifier` also accepts
+  `secrets: SecretRegistry` to resolve `OPENHANDS_API_KEY` from custom
+  providers (default: env).
+- Distinct from `security/redact.py`: `secret/` manages the credential
+  lifecycle in memory; `redact.py` only scrubs secrets out of log text.
+- NOT done (later versions): cloud secret managers (Vault/AWS SM), rotation/
+  expiry.
 
 ## Security (Stage 3, part 1 — DONE)
 - `security/policy.py` — `PermissionPolicy` ABC (`check(tool_name, tool_input)

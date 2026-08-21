@@ -32,6 +32,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterator, Literal
 
+from kinetic_sdk.secret.value import SecretValue
+
 #: Role of a message in the conversation.
 Role = Literal["system", "user", "assistant", "tool"]
 
@@ -160,23 +162,41 @@ class LiteLLMClient(LLMClient):
     The `litellm` package is imported lazily so importing this module (and the
     rest of the SDK) does not force the dependency on environments that use a
     different provider implementation.
+
+    ``api_key`` is stored as a :class:`~kinetic_sdk.secret.value.SecretValue`
+    (plain strings are wrapped automatically, so existing callers keep
+    working). The plaintext is only revealed inside ``_build_request`` when
+    the actual API call is constructed - it never appears in ``repr()`` of
+    the client or its ``__dict__``.
     """
 
     def __init__(
         self,
         model: str,
-        api_key: str | None = None,
+        api_key: str | SecretValue | None = None,
         api_base: str | None = None,
         max_tokens: int = 4096,
     ) -> None:
         self.model = model
-        self.api_key = api_key
+        self.api_key = self._wrap_secret(api_key)
         self.api_base = api_base
         self.max_tokens = max_tokens
         # Import lazily so the rest of the SDK stays zero-dependency. We keep a
         # reference to the module to call ``completion`` on it (and so tests can
         # monkeypatch ``litellm.completion`` on the real module object).
         self._litellm = self._import_litellm()
+
+    @staticmethod
+    def _wrap_secret(api_key: str | SecretValue | None) -> SecretValue | None:
+        """Normalise *api_key* to a :class:`SecretValue` (or ``None``).
+
+        Plain strings are wrapped for backward compatibility - callers that
+        still pass ``api_key="sk-..."`` work unchanged, but the key is never
+        held as a bare string on the instance.
+        """
+        if api_key is None or isinstance(api_key, SecretValue):
+            return api_key
+        return SecretValue(api_key)
 
     @staticmethod
     def _import_litellm() -> Any:
@@ -470,7 +490,8 @@ class LiteLLMClient(LLMClient):
         if translated_tools is not None:
             request["tools"] = translated_tools
         if self.api_key is not None:
-            request["api_key"] = self.api_key
+            # Reveal only here, at the point the real request is built.
+            request["api_key"] = self.api_key.reveal()
         if self.api_base is not None:
             request["api_base"] = self.api_base
         request.update(kwargs)

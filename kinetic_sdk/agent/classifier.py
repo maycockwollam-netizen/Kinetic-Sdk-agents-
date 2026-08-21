@@ -21,13 +21,14 @@ Two implementations ship:
 from __future__ import annotations
 
 import logging
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 from kinetic_sdk.agent.modes import AgentMode
+from kinetic_sdk.secret.registry import SecretRegistry
+from kinetic_sdk.secret.value import SecretValue
 
 logger = logging.getLogger(__name__)
 
@@ -144,8 +145,9 @@ class LiteLLMClassifier(TaskClassifier):
     def __init__(
         self,
         client: Any | None = None,
-        api_key: str | None = None,
+        api_key: str | SecretValue | None = None,
         summary: str | None = None,
+        secrets: SecretRegistry | None = None,
     ) -> None:
         """Create the classifier.
 
@@ -153,15 +155,27 @@ class LiteLLMClassifier(TaskClassifier):
             client: Optional pre-built :class:`LiteLLMClient` (used by tests to
                 inject a mock). When omitted a real :class:`LiteLLMClient` is
                 built lazily from :attr:`_MODEL` / :attr:`_API_BASE` and the
-                ``api_key`` (read from ``OPENHANDS_API_KEY`` if not given).
-            api_key: API key for the classifier endpoint. Falls back to the
-                ``OPENHANDS_API_KEY`` env var when ``None``. Never stored in a
-                way that surfaces in logs.
+                ``api_key`` (resolved from ``secrets`` if not given).
+            api_key: API key for the classifier endpoint, as a plain string
+                (wrapped automatically, backward compatible) or a
+                :class:`SecretValue`. When ``None`` the key is resolved from
+                the ``secrets`` registry (default: the ``OPENHANDS_API_KEY``
+                environment variable). Never stored in a way that surfaces in
+                logs.
             summary: Optional short summary of the existing conversation history
                 forwarded to the classifier for context. ``None`` disables it.
+            secrets: Optional :class:`SecretRegistry` used to resolve the API
+                key when ``api_key`` is not given. Defaults to a registry that
+                reads environment variables.
         """
         self._summary = summary
-        self._api_key = api_key if api_key is not None else os.environ.get(self._API_KEY_ENV)
+        if api_key is None:
+            registry = secrets if secrets is not None else SecretRegistry()
+            self._api_key = registry.resolve(self._API_KEY_ENV, required=False)
+        elif isinstance(api_key, SecretValue):
+            self._api_key = api_key
+        else:
+            self._api_key = SecretValue(api_key)
         if client is not None:
             self._client = client
         else:
