@@ -10,8 +10,9 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (145 tests: 85 Stage 1+classifier +
-  17 context manager + 20 security + 23 secret). NOTE: the litellm tests need
+- Run tests: `python -m pytest -q` (157 tests: 85 Stage 1+classifier +
+  17 context manager + 20 security + 23 secret + 12 observability). NOTE: the
+  litellm tests need
   the `[llm]` extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or
   11 tests error.
 - No build step beyond pip install.
@@ -25,7 +26,9 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   (`SummarizingContextManager` is a placeholder subclass).
 - Stage 3 (Quality & Ops): PARTIAL — `security/` module DONE (permission
   policy + audit log + secret redaction, wired into the agent loop). See
-  "Security" below. Remaining Stage 3: real confirmation UX, richer policies.
+  "Security" below. `observability/` module DONE (structured logging + run
+  tracing, see "Observability" below). Remaining Stage 3: real confirmation
+  UX, richer policies, metrics/aggregation, external tracing (OTel/Jaeger).
 - Stage 4 (Extensions): TODO.
 
 ## Key design rules
@@ -178,6 +181,33 @@ behind alias `kinetic-classifier-v1` — never leak the real model name.
   explicitly (see `tests/test_agent.py`, `tests/test_classifier_and_routing.py`).
   New tests that exercise the loop should do the same, or test the denial
   path on purpose like `tests/test_security.py`.
+
+## Observability (Stage 3, part 2 — DONE)
+- `observability/logger.py` — `ObservabilityLogger` ABC with `attach(bus)` /
+  `detach(bus)` (subscribes `handle` to the bus wildcard `"*"`, so ALL event
+  types are captured without enumeration) and `build_entry(event)` producing
+  `{timestamp (ISO, tz-aware), event_type, run_id, payload}`. Payloads are
+  scrubbed by reusing `security/redact.redact_value` — never reimplement
+  redaction here. `ConsoleObservabilityLogger` prints
+  `[timestamp] [event_type] payload-json` per line (stream resolved at emit
+  time so pytest `capsys` works). `InMemoryObservabilityLogger` keeps
+  `.entries` and offers `get_events(event_type=None)` filtering — the test
+  workhorse.
+- `observability/trace.py` — `RunTrace(run_id, events)` dataclass;
+  `RunTrace.collect(entries, run_id)` filters a logger's entries for one run.
+  `duration()` = run_started -> run_finished (0.0 if a boundary is missing),
+  `tool_calls()` from `agent.tool_call_finished`, `mode_transitions()` from
+  `agent.classified` + `agent.escalated`, `to_summary()` = run_id, duration,
+  tool_call_count/failed, final_mode, escalated/permission_denied/
+  context_compacted flags.
+- Wiring: `Agent.__init__` gained `observability_logger` (None default =
+  observability fully OFF, no subscription/overhead); when given it is
+  attached in `__init__` (not `run()`) so `agent.run_started` is captured.
+  `Agent.run()` stamps `self._run_id = uuid4()` before classification, and
+  `_emit` injects `run_id` into every event payload (new field only — old
+  payload shape untouched). `agent.run_id` property exposes the current/last
+  run id.
+- NOT done (later): OpenTelemetry/Jaeger export, metrics/aggregation.
 
 ## LLM backend notes
 - `llm/client.py` now ships `LiteLLMClient(LLMClient)` instead of the old
