@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from kinetic_sdk.agent.classifier import TaskClassifier, DefaultClassifier
@@ -31,9 +32,17 @@ from kinetic_sdk.context.manager import ContextManager, SimpleTruncateContextMan
 from kinetic_sdk.conversation.state import ConversationState
 from kinetic_sdk.event.bus import EventBus, Event
 from kinetic_sdk.llm.client import LLMClient, LLMResponse, ToolCall
+from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
+from kinetic_sdk.security.policy import AllowListPolicy, PermissionPolicy
+from kinetic_sdk.security.redact import redact_secrets
 from kinetic_sdk.tool.base import Tool, ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    """Current UTC time (audit entries always use tz-aware ISO timestamps)."""
+    return datetime.now(timezone.utc)
 
 
 class Agent:
@@ -66,6 +75,12 @@ class Agent:
             :class:`NoopContextManager` to disable compaction entirely.
         model_context_limit: The model's context window in tokens, used as
             the reference for the manager's safety threshold.
+        permission_policy: Gate checked before every tool execution. ``None``
+            (default) uses an empty :class:`AllowListPolicy` — deny-by-default,
+            so SDK users must explicitly declare which tools may run. Pass
+            :class:`PermissivePolicy` only for local dev/test.
+        audit_logger: Sink recording every tool call, denial and result.
+            ``None`` (default) uses :class:`InMemoryAuditLogger`.
 
     Attributes:
         mode: Current :class:`AgentMode`. Set once by the classifier at the
@@ -98,6 +113,8 @@ class Agent:
         max_iterations: int | None = None,
         context_manager: ContextManager | None = None,
         model_context_limit: int | None = None,
+        permission_policy: PermissionPolicy | None = None,
+        audit_logger: AuditLogger | None = None,
     ) -> None:
         self.llm = llm
         # NOTE: use ``is not None`` rather than truthiness because
@@ -111,6 +128,12 @@ class Agent:
         )
         self.model_context_limit: int = (
             model_context_limit if model_context_limit is not None else self.DEFAULT_MODEL_CONTEXT_LIMIT
+        )
+        self.permission_policy: PermissionPolicy = (
+            permission_policy if permission_policy is not None else AllowListPolicy()
+        )
+        self.audit_logger: AuditLogger = (
+            audit_logger if audit_logger is not None else InMemoryAuditLogger()
         )
         # User override of the iteration cap. ``None`` => let routing pick per
         # mode. Stored separately so an escalation can re-derive the MAX cap.
@@ -357,7 +380,7 @@ class Agent:
                     "name": call.name,
                     "id": call.id,
                     "is_error": result.is_error,
-                    "output_preview": self._preview(result.output),
+                    "output_preview": redact_secrets(self._preview(result.output)),
                 },
             )
             self.state.add_tool_result(
@@ -368,16 +391,51 @@ class Agent:
         return any_error
 
     def _execute_one(self, call: ToolCall) -> ToolResult:
-        """Dispatch a single tool call, mapping failures to ToolResult errors."""
+        """Dispatch a single tool call, gated by the permission policy.
+
+        Every call is policy-checked and audit-logged first. Denied calls
+        (explicitly rejected, or flagged ``requires_confirmation`` which the
+        automated loop cannot satisfy yet) never execute; the model receives
+        an error :class:`ToolResult` explaining the denial so it can try
+        another approach, and ``security.permission_denied`` is emitted.
+        """
+        decision = self.permission_policy.check(call.name, call.arguments)
+        self.audit_logger.log_tool_call(call.name, call.arguments, decision, _utcnow())
+        if not decision.allowed:
+            return self._deny_call(call, decision.reason)
+        if decision.requires_confirmation:
+            return self._deny_call(
+                call,
+                "requires manual confirmation, not yet supported in automated "
+                f"mode ({decision.reason})",
+            )
+
         tool = self._tools.get(call.name)
         if tool is None:
             logger.error("Unknown tool requested: %s", call.name)
             return ToolResult(error=f"Unknown tool: {call.name}")
         try:
-            return tool.execute(**call.arguments)
+            result = tool.execute(**call.arguments)
         except Exception as exc:  # noqa: BLE001 - surface as tool error
             logger.exception("Tool %s raised", call.name)
-            return ToolResult(error=f"{type(exc).__name__}: {exc}")
+            result = ToolResult(error=f"{type(exc).__name__}: {exc}")
+        self.audit_logger.log_tool_result(call.name, result, _utcnow())
+        return result
+
+    def _deny_call(self, call: ToolCall, reason: str) -> ToolResult:
+        """Audit-log + emit a denial and build the error result for the model."""
+        logger.warning("Permission denied for tool %s: %s", call.name, reason)
+        self.audit_logger.log_permission_denied(call.name, call.arguments, reason, _utcnow())
+        self._emit(
+            "security.permission_denied",
+            {
+                "name": call.name,
+                "id": call.id,
+                "reason": reason,
+                "input_preview": redact_secrets(self._preview(call.arguments)),
+            },
+        )
+        return ToolResult(error=f"Permission denied for tool {call.name!r}: {reason}")
 
     @staticmethod
     def _format_tool_output(result: ToolResult) -> str:

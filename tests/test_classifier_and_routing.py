@@ -20,6 +20,7 @@ from kinetic_sdk.agent.classifier import (
 )
 from kinetic_sdk.agent.modes import AgentMode
 from kinetic_sdk.event.bus import EventBus, Event
+from kinetic_sdk.security.policy import PermissivePolicy
 from kinetic_sdk.llm.client import LLMResponse
 from tests._helpers import EchoTool, FailingTool, MockLLM, text_response, tool_response
 
@@ -200,7 +201,7 @@ def test_flash_caps_tool_iterations():
     events: list[Event] = []
     bus = EventBus()
     bus.subscribe("agent.error", events.append)
-    agent = Agent(llm=llm, tools=[EchoTool()], classifier=clf, event_bus=bus)
+    agent = Agent(llm=llm, tools=[EchoTool()], permission_policy=PermissivePolicy(), classifier=clf, event_bus=bus)
     agent.run("loop forever")
     assert any(e.payload.get("reason") == "max_iterations" for e in events)
     assert agent.mode is AgentMode.MAX
@@ -220,7 +221,7 @@ def test_escalation_on_first_tool_error():
     events: list[Event] = []
     bus = EventBus()
     bus.subscribe("agent.escalated", events.append)
-    agent = Agent(llm=llm, tools=[FailingTool()], classifier=clf, event_bus=bus)
+    agent = Agent(llm=llm, tools=[FailingTool()], permission_policy=PermissivePolicy(), classifier=clf, event_bus=bus)
     result = agent.run("trigger failure")
     assert result == "recovered in MAX"
     assert agent.mode is AgentMode.MAX
@@ -246,7 +247,7 @@ def test_escalation_on_threshold_without_tool_error():
     events: list[Event] = []
     bus = EventBus()
     bus.subscribe("agent.escalated", events.append)
-    agent = Agent(llm=llm, tools=[EchoTool()], classifier=clf, event_bus=bus)
+    agent = Agent(llm=llm, tools=[EchoTool()], permission_policy=PermissivePolicy(), classifier=clf, event_bus=bus)
     result = agent.run("go")
     assert result == "done after escalation"
     assert agent.mode is AgentMode.MAX
@@ -259,7 +260,7 @@ def test_no_escalation_when_already_max():
     events: list[Event] = []
     bus = EventBus()
     bus.subscribe("agent.escalated", events.append)
-    agent = Agent(llm=llm, tools=[FailingTool()], classifier=clf, event_bus=bus)
+    agent = Agent(llm=llm, tools=[FailingTool()], permission_policy=PermissivePolicy(), classifier=clf, event_bus=bus)
     agent.run("go")
     assert agent.mode is AgentMode.MAX
     assert events == []
@@ -273,7 +274,7 @@ def test_classifier_called_exactly_once_even_with_escalation():
             text_response("ok"),
         ]
     )
-    agent = Agent(llm=llm, tools=[FailingTool()], classifier=clf)
+    agent = Agent(llm=llm, tools=[FailingTool()], permission_policy=PermissivePolicy(), classifier=clf)
     agent.run("go")
     assert clf.call_count == 1
 
@@ -296,7 +297,7 @@ def test_user_override_of_max_iterations_respected_initially():
     events: list[Event] = []
     bus = EventBus()
     bus.subscribe("agent.error", events.append)
-    agent = Agent(llm=llm, tools=[EchoTool()], classifier=clf, event_bus=bus, max_iterations=2)
+    agent = Agent(llm=llm, tools=[EchoTool()], permission_policy=PermissivePolicy(), classifier=clf, event_bus=bus, max_iterations=2)
     agent.run("go")
     # Override pins the cap at 2 even though FLASH default is 5; the threshold
     # escalation (3) is never reached because the cap is 2 -> max_iterations

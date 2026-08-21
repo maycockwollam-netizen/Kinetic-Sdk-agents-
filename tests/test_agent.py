@@ -14,13 +14,14 @@ from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.agent.modes import AgentMode
 from kinetic_sdk.conversation.state import ConversationState
 from kinetic_sdk.event.bus import EventBus, Event
+from kinetic_sdk.security.policy import PermissivePolicy
 from kinetic_sdk.tool.base import Tool
 from tests._helpers import EchoTool, FailingTool, MockLLM, text_response, tool_response
 
 
 def test_agent_returns_final_text_without_tool_calls():
     llm = MockLLM([text_response("The answer is 42.")])
-    agent = Agent(llm=llm, tools=[EchoTool()])
+    agent = Agent(llm=llm, tools=[EchoTool()], permission_policy=PermissivePolicy())
     result = agent.run("What is the answer?")
     assert result == "The answer is 42."
     # One LLM call, no tool executions.
@@ -36,7 +37,7 @@ def test_agent_runs_tool_then_finishes():
             text_response("echoed: hello"),
         ]
     )
-    agent = Agent(llm=llm, tools=[EchoTool()])
+    agent = Agent(llm=llm, tools=[EchoTool()], permission_policy=PermissivePolicy())
     result = agent.run("echo hello")
     assert result == "echoed: hello"
     assert len(llm.calls) == 2
@@ -56,7 +57,7 @@ def test_agent_handles_unknown_tool_gracefully():
             text_response("recovered"),
         ]
     )
-    agent = Agent(llm=llm, tools=[EchoTool()])
+    agent = Agent(llm=llm, tools=[EchoTool()], permission_policy=PermissivePolicy())
     result = agent.run("call missing tool")
     assert result == "recovered"
     # The unknown-tool error should have been recorded as a tool_result error.
@@ -75,7 +76,7 @@ def test_agent_handles_tool_exception():
             text_response("handled failure"),
         ]
     )
-    agent = Agent(llm=llm, tools=[FailingTool()])
+    agent = Agent(llm=llm, tools=[FailingTool()], permission_policy=PermissivePolicy())
     result = agent.run("trigger failure")
     assert result == "handled failure"
     tool_results = [
@@ -89,7 +90,7 @@ def test_agent_max_iterations_safety():
     # The model keeps requesting the same tool forever; the loop must stop.
     loop = tool_response("c", "echo", {"message": "x"})
     llm = MockLLM([loop] * 100)
-    agent = Agent(llm=llm, tools=[EchoTool()], max_iterations=3)
+    agent = Agent(llm=llm, tools=[EchoTool()], permission_policy=PermissivePolicy(), max_iterations=3)
     events: list[Event] = []
     agent.event_bus.subscribe("agent.error", events.append)
     agent.run("loop forever")
@@ -114,7 +115,7 @@ def test_agent_emits_lifecycle_events():
         "agent.run_finished",
     ):
         bus.subscribe(t, events.append)
-    agent = Agent(llm=llm, tools=[EchoTool()], event_bus=bus)
+    agent = Agent(llm=llm, tools=[EchoTool()], permission_policy=PermissivePolicy(), event_bus=bus)
     agent.run("hi")
 
     types_seen = [e.type for e in events]
@@ -162,7 +163,7 @@ def test_agent_assistant_history_has_tool_use_blocks():
             text_response("final"),
         ]
     )
-    agent = Agent(llm=llm, tools=[EchoTool()])
+    agent = Agent(llm=llm, tools=[EchoTool()], permission_policy=PermissivePolicy())
     agent.run("go")
     # Find the assistant message containing the tool_use block.
     assistant_msgs = [m for m in agent.state.messages if m["role"] == "assistant"]
@@ -188,7 +189,7 @@ def test_agent_escalate_flash_to_max():
 
 def test_tool_schemas_passed_to_llm():
     llm = MockLLM([text_response("ok")])
-    agent = Agent(llm=llm, tools=[EchoTool()])
+    agent = Agent(llm=llm, tools=[EchoTool()], permission_policy=PermissivePolicy())
     agent.run("hi")
     tools = llm.calls[0]["tools"]
     assert tools is not None
