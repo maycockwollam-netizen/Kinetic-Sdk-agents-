@@ -10,16 +10,18 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (85 tests: 53 Stage 1 + 12 LiteLLMClient +
-  5 modes/classifier + 20 classifier+routing/escalation)
+- Run tests: `python -m pytest -q` (102 tests: 85 Stage 1+classifier +
+  17 context manager). NOTE: the litellm tests need the `[llm]` extra —
+  install BOTH extras (`pip install -e ".[dev,llm]"`) or 11 tests error.
 - No build step beyond pip install.
 
 ## Stage status
 - Stage 1 (Core): DONE — `tool`, `event`, `llm`, `conversation`, `agent` loop.
-- Stage 2 (Context & Memory): PARTIAL — `agent/classifier.py` real impl +
-  FLASH/MAX routing + escalation DONE (see "Classifier & routing" below).
-  `context/manager.py` still an interface stub (`NoopContextManager`); needs
-  token-aware truncation/summarisation. `secret/` module not yet created.
+- Stage 2 (Context & Memory): PARTIAL — classifier + FLASH/MAX routing DONE;
+  `context/manager.py` real truncation-based compaction DONE and wired into
+  the agent loop (see "Context manager" below). Remaining: LLM-summarised
+  compaction (`SummarizingContextManager` is a placeholder subclass) and the
+  `secret/` module (not yet created).
 - Stage 3 (Quality & Ops): TODO.
 - Stage 4 (Extensions): TODO.
 
@@ -57,7 +59,10 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   Anthropic<->OpenAI translation), `LLMResponse`, `ToolCall`, `StreamEvent`,
   `AsyncLLMClient` ABC.
 - `kinetic_sdk/tool/base.py` — `Tool` ABC + `ToolResult` dataclass.
-- `kinetic_sdk/context/manager.py` — `ContextManager` ABC + `NoopContextManager` stub.
+- `kinetic_sdk/context/manager.py` — `ContextManager` ABC
+  (`should_compact`/`compact`), `SimpleTruncateContextManager` (default),
+  `NoopContextManager`, `SummarizingContextManager` (placeholder subclass),
+  `estimate_tokens` heuristic.
 
 ## Classifier & routing (Stage 2 — DONE)
 - `LiteLLMClassifier` drives `openai/openhands/glm-5.2` via
@@ -88,10 +93,31 @@ classifier should use a `LiteLLMClient` pointed at the OpenHands proxy
 (`openai/openhands/glm-5.2` with `api_base=https://llm-proxy.app.all-hands.dev`)
 behind alias `kinetic-classifier-v1` — never leak the real model name.
 
+## Context manager (Stage 2 — DONE)
+- `ContextManager` ABC: `should_compact(state, model_context_limit) -> bool`
+  + `compact(state) -> ConversationState` (immutable-style: NEVER mutates the
+  passed state, returns a new one). Old in-place `manage()` is gone.
+- `estimate_tokens(text)` = `len(text)//4` heuristic (underestimates
+  Vietnamese/code — documented; `tiktoken` stays an optional future extra).
+- `SimpleTruncateContextManager(keep_last_tool_results=5, safety_threshold=0.8)`:
+  compacts when estimate >= 80% of limit. Keeps first user message + tail
+  anchored one message before the Nth-most-recent tool_result; the elided
+  middle becomes ONE placeholder `"[N tin nhắn trước đó đã được rút gọn]"`.
+  Conversations of <=2 messages (or fully protected) are returned unchanged.
+- `Agent.__init__` gained `context_manager` (None -> SimpleTruncate default;
+  pass `NoopContextManager` to disable) and `model_context_limit`
+  (None -> `Agent.DEFAULT_MODEL_CONTEXT_LIMIT` = 128_000). In `_run_loop`,
+  `_maybe_compact_context()` runs before EVERY LLM call; on compaction it
+  swaps `agent.state` and emits `context.compacted` with
+  messages_before/after/removed + estimated_tokens_after.
+- `SummarizingContextManager` exists as a subclass placeholder (falls back to
+  truncation) — real LLM summarisation still TODO.
+
 ## Next next task (Stage 2 remainder)
-- `context/manager.py`: real token-aware truncation/summarisation (currently
-  `NoopContextManager`). The classifier already accepts a `summary` kwarg that
-  a future context manager can feed in.
+- `SummarizingContextManager`: replace the placeholder with a 1-2 sentence
+  LLM summary of the elided span (cheap model behind an alias, like the
+  classifier). The classifier already accepts a `summary` kwarg that the
+  summary can feed into.
 - `secret/` module for credential handling.
 
 ## LLM backend notes

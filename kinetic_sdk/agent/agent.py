@@ -9,9 +9,10 @@ loop:
    and append the results back to the conversation, then loop.
 4. If the model produced a final text answer, return it.
 
-Stage 1 implements the loop only. FLASH/MAX routing (``classifier.py``) and
-context truncation (``context/manager.py``) are stubbed but not wired into the
-loop yet - see those modules for the planned integration points. The loop is
+Stage 1 implements the loop; Stage 2 wires in FLASH/MAX routing
+(``classifier.py``) and context-window compaction (``context/manager.py``):
+before each LLM call the configured :class:`ContextManager` may replace the
+history with a reduced copy, emitting ``context.compacted``. The loop is
 synchronous and deterministic, which keeps tests simple.
 
 The loop emits events on an optional :class:`EventBus` so observers can react
@@ -26,6 +27,7 @@ from typing import Any, Iterable
 
 from kinetic_sdk.agent.classifier import TaskClassifier, DefaultClassifier
 from kinetic_sdk.agent.modes import AgentMode
+from kinetic_sdk.context.manager import ContextManager, SimpleTruncateContextManager
 from kinetic_sdk.conversation.state import ConversationState
 from kinetic_sdk.event.bus import EventBus, Event
 from kinetic_sdk.llm.client import LLMClient, LLMResponse, ToolCall
@@ -47,7 +49,8 @@ class Agent:
               ``agent.run_started``, ``agent.turn_started``,
               ``agent.llm_response``, ``agent.tool_call_started``,
               ``agent.tool_call_finished``, ``agent.run_finished``,
-              ``agent.escalated``, ``agent.classified``, ``agent.error``.
+              ``agent.escalated``, ``agent.classified``, ``agent.error``,
+              ``context.compacted``.
         classifier: Optional :class:`TaskClassifier`. When provided (or when
             the default is used) :meth:`run` classifies the task exactly once
             before the first turn and routes to FLASH or MAX. Pass ``None`` to
@@ -57,6 +60,12 @@ class Agent:
             chosen by the routed mode: FLASH -> 5, MAX -> 50. An explicit value
             overrides the mode default for the *initial* mode; an escalation
             FLASH -> MAX mid-task still raises the cap to the MAX default.
+        context_manager: Strategy that keeps the history inside the model's
+            context window. ``None`` (default) uses
+            :class:`SimpleTruncateContextManager`; pass
+            :class:`NoopContextManager` to disable compaction entirely.
+        model_context_limit: The model's context window in tokens, used as
+            the reference for the manager's safety threshold.
 
     Attributes:
         mode: Current :class:`AgentMode`. Set once by the classifier at the
@@ -75,6 +84,10 @@ class Agent:
     #: final answer (must stay below the FLASH cap of 5).
     FLASH_ESCALATION_THRESHOLD: int = 3
 
+    #: Default context-window size (tokens) assumed when the caller does not
+    #: declare the model's real limit. Deliberately conservative.
+    DEFAULT_MODEL_CONTEXT_LIMIT: int = 128_000
+
     def __init__(
         self,
         llm: LLMClient,
@@ -83,6 +96,8 @@ class Agent:
         event_bus: EventBus | None = None,
         classifier: TaskClassifier | None = None,
         max_iterations: int | None = None,
+        context_manager: ContextManager | None = None,
+        model_context_limit: int | None = None,
     ) -> None:
         self.llm = llm
         # NOTE: use ``is not None`` rather than truthiness because
@@ -91,6 +106,12 @@ class Agent:
         self.state = state if state is not None else ConversationState()
         self.event_bus = event_bus if event_bus is not None else EventBus()
         self.classifier: TaskClassifier = classifier if classifier is not None else DefaultClassifier()
+        self.context_manager: ContextManager = (
+            context_manager if context_manager is not None else SimpleTruncateContextManager()
+        )
+        self.model_context_limit: int = (
+            model_context_limit if model_context_limit is not None else self.DEFAULT_MODEL_CONTEXT_LIMIT
+        )
         # User override of the iteration cap. ``None`` => let routing pick per
         # mode. Stored separately so an escalation can re-derive the MAX cap.
         self._max_iterations_override: int | None = max_iterations
@@ -230,6 +251,7 @@ class Agent:
         escalated = False
         while iteration < self.max_iterations:
             self._emit("agent.turn_started", {"iteration": iteration, "mode": self.mode.value})
+            self._maybe_compact_context()
             response = self._call_llm()
             self.state.add_assistant(self._assistant_content(response))
             self._emit(
@@ -266,6 +288,31 @@ class Agent:
             if msg.get("role") == "user" and isinstance(msg.get("content"), str):
                 return msg["content"]
         return None
+
+    def _maybe_compact_context(self) -> None:
+        """Compact the history before an LLM call when over the threshold.
+
+        Emits ``context.compacted`` with the before/after message counts so
+        observability can trace when and how much was elided. The manager
+        returns a new state (immutable-style); the agent swaps its reference.
+        """
+        manager = self.context_manager
+        if manager is None or not manager.should_compact(self.state, self.model_context_limit):
+            return
+        before = len(self.state.messages)
+        self.state = manager.compact(self.state)
+        after = len(self.state.messages)
+        logger.info("Context compacted: %d -> %d messages", before, after)
+        self._emit(
+            "context.compacted",
+            {
+                "manager": type(manager).__name__,
+                "messages_before": before,
+                "messages_after": after,
+                "messages_removed": before - after,
+                "estimated_tokens_after": manager.estimate_state_tokens(self.state),
+            },
+        )
 
     def _call_llm(self) -> LLMResponse:
         """Ask the LLM for the next turn using the current history + tools."""
