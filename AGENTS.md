@@ -10,9 +10,9 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (102 tests: 85 Stage 1+classifier +
-  17 context manager). NOTE: the litellm tests need the `[llm]` extra —
-  install BOTH extras (`pip install -e ".[dev,llm]"`) or 11 tests error.
+- Run tests: `python -m pytest -q` (122 tests: 85 Stage 1+classifier +
+  17 context manager + 20 security). NOTE: the litellm tests need the `[llm]`
+  extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or 11 tests error.
 - No build step beyond pip install.
 
 ## Stage status
@@ -22,7 +22,9 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   the agent loop (see "Context manager" below). Remaining: LLM-summarised
   compaction (`SummarizingContextManager` is a placeholder subclass) and the
   `secret/` module (not yet created).
-- Stage 3 (Quality & Ops): TODO.
+- Stage 3 (Quality & Ops): PARTIAL — `security/` module DONE (permission
+  policy + audit log + secret redaction, wired into the agent loop). See
+  "Security" below. Remaining Stage 3: real confirmation UX, richer policies.
 - Stage 4 (Extensions): TODO.
 
 ## Key design rules
@@ -118,7 +120,39 @@ behind alias `kinetic-classifier-v1` — never leak the real model name.
   LLM summary of the elided span (cheap model behind an alias, like the
   classifier). The classifier already accepts a `summary` kwarg that the
   summary can feed into.
-- `secret/` module for credential handling.
+- `secret/` module for credential handling (distinct from
+  `security/redact.py`, which only scrubs secrets out of logs/events).
+
+## Security (Stage 3, part 1 — DONE)
+- `security/policy.py` — `PermissionPolicy` ABC (`check(tool_name, tool_input)
+  -> PermissionDecision`), `PermissionDecision(allowed, reason,
+  requires_confirmation)`, `AllowListPolicy` (deny-by-default; per-tool
+  `require_confirmation_patterns` are regex-with-substring-fallback matched
+  against the JSON-serialised input), `PermissivePolicy` (dev/test only,
+  docstring warns "KHÔNG dùng trong production").
+- `security/redact.py` — `redact_secrets(text)` + `redact_value(value)`
+  (recursive). Scrubs GitHub tokens (`ghp_`/`ghu_`/`gho_`/`ghs_`/`ghr_`/
+  `github_pat_`), `sk-*` keys, AWS `AKIA*`, plus a keyword heuristic
+  (`api_key|password|passwd|secret|token|key` followed by a 20+ char token).
+  Placeholder is `[REDACTED]`.
+- `security/audit.py` — `AuditLogger` base (`log_tool_call`/`log_tool_result`/
+  `log_permission_denied`; entries get uuid `id`, ISO timestamp, event type,
+  redacted fields), `InMemoryAuditLogger` (`.entries` list) and
+  `JSONLAuditLogger(path)` (one JSON object per line, flush per write,
+  context-manager support).
+- `Agent.__init__` gained `permission_policy` (None -> EMPTY `AllowListPolicy`,
+  i.e. deny-by-default — SDK users must opt tools in) and `audit_logger`
+  (None -> `InMemoryAuditLogger`). `_execute_one` checks the policy and logs
+  BEFORE executing; denial returns an error `ToolResult` to the model and
+  emits `security.permission_denied`. `requires_confirmation=True` is denied
+  in automated mode ("requires manual confirmation, not yet supported...") —
+  extension point for a real confirmation UX later. `agent.tool_call_finished`'s
+  `output_preview` is redacted before hitting the event bus.
+- GOTCHA: because the default policy denies everything, old agent-loop tests
+  that execute real tools now pass `permission_policy=PermissivePolicy()`
+  explicitly (see `tests/test_agent.py`, `tests/test_classifier_and_routing.py`).
+  New tests that exercise the loop should do the same, or test the denial
+  path on purpose like `tests/test_security.py`.
 
 ## LLM backend notes
 - `llm/client.py` now ships `LiteLLMClient(LLMClient)` instead of the old
