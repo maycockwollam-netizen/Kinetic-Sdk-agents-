@@ -1,36 +1,77 @@
-# Kinetic-Sdk-agents-
-
 # kinetic-agent-sdk
 
-A modular agent SDK for the KINETIC coding agent. Stage 1 provides the core
-tool-calling loop; later stages add context management, security, observability
-and multi-agent orchestration. The SDK is written in Python with full type
-hints and a clean interface/implementation separation so providers and
-strategies can be swapped without touching the agent loop.
+A modular agent SDK for the KINETIC coding agent. The SDK provides a
+provider-neutral, synchronous tool-calling loop with full Python type hints and
+clean interface/implementation separation so providers, tools, context
+strategies, security policies, and observability sinks can be swapped without
+rewriting the agent loop.
 
-## Stage 1 — Core (current)
+## Current status
 
-- `kinetic_sdk/agent/` — `Agent` tool-calling loop, `AgentMode` (FLASH/MAX),
-  `TaskClassifier` interface (stub).
-- `kinetic_sdk/conversation/` — `ConversationState` in-memory history.
-- `kinetic_sdk/event/` — `EventBus` publish/subscribe.
-- `kinetic_sdk/llm/` — `LLMClient` interface + `LiteLLMClient` (optional, multi-provider).
-- `kinetic_sdk/tool/` — abstract `Tool` / `ToolResult`.
-- `kinetic_sdk/context/` — `ContextManager` interface (Stage 2 stub).
+- **Stage 1 — Core: done.** Includes the `Agent` loop, `Tool` / `ToolResult`,
+  `ConversationState`, `EventBus`, the `LLMClient` interface, and the optional
+  LiteLLM-backed client.
+- **Stage 2 — Context & Memory: done for the current scope.** FLASH/MAX task
+  routing, the model-backed `LiteLLMClassifier`, truncation-based context
+  compaction, LLM-summarized context compaction with safe truncation fallback,
+  and secret management are implemented.
+- **Stage 3 — Quality & Ops: partial.** Permission policies, audit logging,
+  secret redaction, structured observability logging, and per-run trace
+  summaries are implemented. Richer confirmation UX, policy sets, metrics, and
+  external tracing exporters are still future work.
+- **Stage 4 — Extensions: planned.** Multi-agent orchestration, plugins, MCP,
+  skills, workspace helpers, git integrations, and profiles are not implemented
+  yet.
+
+## Module map
+
+- `kinetic_sdk/agent/` — `Agent` tool-calling loop, `AgentMode` FLASH/MAX
+  routing, task classification, mid-run FLASH -> MAX escalation.
+- `kinetic_sdk/conversation/` — in-memory conversation history using an
+  Anthropic-style typed message shape.
+- `kinetic_sdk/context/` — context-window management with a zero-dependency
+  token estimate and truncation-based compaction.
+- `kinetic_sdk/event/` — synchronous/async event bus with wildcard subscribers.
+- `kinetic_sdk/llm/` — provider-neutral `LLMClient` interface plus optional
+  `LiteLLMClient` for Anthropic/OpenAI-compatible providers.
+- `kinetic_sdk/observability/` — structured event loggers and `RunTrace`
+  helpers for summarizing one agent run.
+- `kinetic_sdk/secret/` — secret value wrapper, providers, and registry for
+  safe credential resolution.
+- `kinetic_sdk/security/` — permission policies, audit loggers, and recursive
+  secret redaction.
+- `kinetic_sdk/tool/` — abstract tool interface and `ToolResult` dataclass.
 
 ## Install (editable)
 
+Install the core development dependencies:
+
 ```bash
 pip install -e ".[dev]"
-# For the LLM backend (Anthropic Claude, OpenAI-compatible endpoints, ...):
-pip install -e ".[llm]"
 ```
+
+Install both development and LiteLLM backend dependencies when running the full
+test suite or using `LiteLLMClient` / `LiteLLMClassifier`:
+
+```bash
+pip install -e ".[dev,llm]"
+```
+
+The core SDK intentionally has no required third-party runtime dependencies;
+`litellm` is optional and imported lazily only when a LiteLLM-backed component
+is instantiated.
 
 ## Run tests
 
+Run the full suite after installing both extras:
+
 ```bash
-pytest -q
+python -m pytest -q
 ```
+
+If only `.[dev]` is installed, tests that import or instantiate the LiteLLM
+backend will fail because `litellm` is not present. Install `.[dev,llm]` before
+using the LiteLLM backend tests.
 
 ## Minimal example
 
@@ -41,9 +82,8 @@ to/from the OpenAI shape that `litellm.completion` expects.
 
 ```python
 from kinetic_sdk.agent import Agent
-from kinetic_sdk.conversation import ConversationState
-from kinetic_sdk.event import EventBus
 from kinetic_sdk.llm.client import LiteLLMClient
+from kinetic_sdk.security.policy import AllowListPolicy
 from kinetic_sdk.tool.base import Tool, ToolResult
 
 
@@ -60,22 +100,43 @@ class EchoTool(Tool):
         return ToolResult(output=message)
 
 
-# Anthropic Claude via the "anthropic/" provider prefix:
 llm = LiteLLMClient(model="anthropic/claude-sonnet-4-5", api_key="sk-ant-...")
 
-# Or an OpenAI-compatible endpoint (e.g. the OpenHands proxy) via api_base:
-# llm = LiteLLMClient(
-#     model="openai/openhands/glm-5.2",
-#     api_key="...",
-#     api_base="https://llm-proxy.app.all-hands.dev",
-# )
-
-agent = Agent(llm=llm, tools=[EchoTool()])
+agent = Agent(
+    llm=llm,
+    tools=[EchoTool()],
+    # The default policy is deny-by-default. Allow tools explicitly.
+    permission_policy=AllowListPolicy(always_allow=["echo"]),
+)
 print(agent.run("Echo back: hello"))
 ```
 
+For an OpenAI-compatible endpoint, provide both the LiteLLM model string and
+`api_base`:
+
+```python
+llm = LiteLLMClient(
+    model="openai/openhands/glm-5.2",
+    api_key="...",
+    api_base="https://llm-proxy.app.all-hands.dev",
+)
+```
+
+## Security defaults
+
+Tool execution is safe-by-default: when no `permission_policy` is provided,
+`Agent` uses an empty `AllowListPolicy`, so every tool call is denied until the
+SDK user explicitly allows that tool. Use `PermissivePolicy` only for local
+development, sandboxed demos, or tests.
+
+Tool inputs, outputs, audit entries, and observability payloads are redacted
+before being persisted or published.
+
 ## Roadmap
 
-- Stage 2 — context window management + secret handling.
-- Stage 3 — security, observability, hooks, testing utils, critic.
-- Stage 4 — subagents, plugins, MCP, skills, workspace, git, profiles.
+- Add a confirmation UX for permission decisions that require manual approval.
+- Add richer policy presets for filesystem, terminal, git, and network tools.
+- Add metrics aggregation and external tracing exporters such as OpenTelemetry
+  or Jaeger.
+- Add Stage 4 extension points for subagents, plugins, MCP, skills, workspace
+  helpers, git integrations, and profiles.

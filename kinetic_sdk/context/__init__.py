@@ -2,6 +2,8 @@
 
 from kinetic_sdk.context.manager import (
     ContextManager,
+    ContextSummarizer,
+    LLMContextSummarizer,
     NoopContextManager,
     SimpleTruncateContextManager,
     SummarizingContextManager,
@@ -10,6 +12,8 @@ from kinetic_sdk.context.manager import (
 
 __all__ = [
     "ContextManager",
+    "ContextSummarizer",
+    "LLMContextSummarizer",
     "NoopContextManager",
     "SimpleTruncateContextManager",
     "SummarizingContextManager",

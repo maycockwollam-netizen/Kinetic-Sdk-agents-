@@ -13,6 +13,7 @@ import pytest
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.context.manager import (
     ContextManager,
+    LLMContextSummarizer,
     NoopContextManager,
     SimpleTruncateContextManager,
     SummarizingContextManager,
@@ -21,6 +22,21 @@ from kinetic_sdk.context.manager import (
 from kinetic_sdk.conversation.state import ConversationState
 from kinetic_sdk.event.bus import EventBus
 from tests._helpers import EchoTool, MockLLM, text_response
+
+
+class FakeSummarizer:
+    def __init__(self, summary: str = "Đã phân tích lỗi flaky test và giữ lại log quan trọng.") -> None:
+        self.summary = summary
+        self.calls: list[list[dict]] = []
+
+    def summarize(self, messages: list[dict]) -> str:
+        self.calls.append(messages)
+        return self.summary
+
+
+class RaisingSummarizer:
+    def summarize(self, messages: list[dict]) -> str:
+        raise RuntimeError("summarizer unavailable")
 
 
 def _user(text: str) -> dict:
@@ -178,13 +194,55 @@ def test_noop_manager_never_compacts_and_copies():
     assert copied is not state
 
 
-def test_summarizing_manager_falls_back_to_truncation_for_now():
-    # Interface is reserved for LLM summarisation; behaviour matches the
-    # truncation manager until that lands.
+def test_summarizing_manager_uses_summary_for_elided_span():
     assert issubclass(SummarizingContextManager, SimpleTruncateContextManager)
+    summarizer = FakeSummarizer()
+    manager = SummarizingContextManager(keep_last_tool_results=2, summarizer=summarizer)
+    state = _long_conversation(turns=5)
+
+    compacted = manager.compact(state)
+
+    assert summarizer.calls
+    assert compacted.messages[0] == state.messages[0]
+    summary = compacted.messages[1]["content"]
+    assert "đã được tóm tắt" in summary
+    assert summarizer.summary in summary
+    assert "rút gọn" not in summary
+    assert state.messages[1]["content"] not in summary
+
+
+def test_summarizing_manager_falls_back_to_truncation_without_summarizer():
     manager = SummarizingContextManager(keep_last_tool_results=2)
     compacted = manager.compact(_long_conversation(turns=5))
     assert any("rút gọn" in str(m["content"]) for m in compacted.messages)
+
+
+def test_summarizing_manager_falls_back_to_truncation_on_failure_or_empty_summary():
+    for summarizer in (RaisingSummarizer(), FakeSummarizer(summary="")):
+        manager = SummarizingContextManager(keep_last_tool_results=2, summarizer=summarizer)
+        compacted = manager.compact(_long_conversation(turns=5))
+        assert any("rút gọn" in str(m["content"]) for m in compacted.messages)
+
+
+def test_summarizing_manager_truncates_long_summary():
+    manager = SummarizingContextManager(
+        keep_last_tool_results=2,
+        summarizer=FakeSummarizer(summary="x" * 50),
+        max_summary_chars=10,
+    )
+    compacted = manager.compact(_long_conversation(turns=5))
+    summary = compacted.messages[1]["content"]
+    assert "xxxxxxxxxx…" in summary
+
+
+def test_llm_context_summarizer_uses_injected_llm():
+    llm = MockLLM([text_response("Tóm tắt ngắn.")])
+    summarizer = LLMContextSummarizer(llm, max_tokens=42)
+
+    assert summarizer.summarize([_user("xin chào")]) == "Tóm tắt ngắn."
+    assert llm.calls[0]["kwargs"] == {"max_tokens": 42}
+    assert llm.calls[0]["messages"][0]["role"] == "system"
+    assert "xin chào" in llm.calls[0]["messages"][1]["content"]
 
 
 def test_simple_manager_is_a_context_manager():
