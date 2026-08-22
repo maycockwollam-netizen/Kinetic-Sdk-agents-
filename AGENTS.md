@@ -10,16 +10,17 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (207 tests: 85 Stage 1+classifier +
+- Run tests: `python -m pytest -q` (254 tests: 85 Stage 1+classifier +
   30 context manager + 20 security + 23 secret + 12 observability +
-  16 hooks + 13 testing utils + 8 confirmation UX). NOTE: the
+  16 hooks + 13 testing utils + 8 confirmation UX + 20 git tool +
+  18 workspace + 9 profiles). NOTE: the
   litellm tests need
   the `[llm]` extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or
   11 tests error.
 - No build step beyond pip install.
 - CI: `.github/workflows/test.yml` — minimal GitHub Actions workflow (push any
   branch + PR -> main, ubuntu-latest, Python 3.11, `pip install -e ".[dev,llm]"`,
-  `pytest -q`). No secrets needed: all 207 tests run with mocked LLM/tool.
+  `pytest -q`). No secrets needed: all 254 tests run with mocked LLM/tool.
   Deferred on purpose: version matrix, dep cache, coverage, lint, CD.
 
 ## Stage status
@@ -36,7 +37,9 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   Confirmation UX via `ON_PERMISSION_CHECK` hooks (see "Confirmation UX"
   below). Deferred to later versions: richer policies, metrics/aggregation,
   external tracing (OTel/Jaeger).
-- Stage 4 (Extensions): TODO.
+- Stage 4 (Extensions): IN PROGRESS — `git/` (GitTool), `workspace/`
+  (Workspace) and `profiles/` (presets) DONE (see "Stage 4 modules" below).
+  TODO: `subagent/`, `mcp/`, `plugin/`, `skills/`.
 
 ## Key design rules
 - All communication in Vietnamese during task work (per user instruction).
@@ -300,6 +303,48 @@ behind alias `kinetic-classifier-v1` — never leak the real model name.
 - GOTCHA: hooks/assertion helpers registered via lambdas must return None —
   a lambda returning a tuple/value (e.g. `lambda ctx: (a.append(x), b())`)
   is collected as a HookResult and breaks `should_continue` checks.
+
+## Stage 4 modules (git/, workspace/, profiles/ — DONE)
+- `git/tool.py` — `GitTool(Tool)`: curated git sub-actions via one `action`
+  param (`status`, `diff`, `add`, `commit`, `branch`, `checkout`, `push`,
+  `pull`, `log`); NOT a full git wrapper (no rebase/cherry-pick/submodule).
+  All commands run as argv lists (never `shell=True`), refs starting with
+  `-` are rejected (option-injection guard), `add` always inserts `--`, and
+  `log` caps `max_count` at `MAX_LOG_COUNT` (100, default 20) so history
+  can't flood the context. Constructor: `workdir` (default cwd),
+  `secrets: SecretRegistry` (default env registry — the module never reads
+  `os.environ` directly), `remote_token_key` (default `GIT_TOKEN`),
+  `timeout`, and an injectable `runner` (default `subprocess.run`) so tests
+  never spawn real git. push/pull resolve the token via the registry, reveal
+  it only when building `-c http.extraHeader=AUTHORIZATION: bearer ...`, and
+  scrub the literal value + `redact_secrets` from all output/metadata before
+  returning. Missing token is NOT an error (git falls back to its own
+  credential config).
+- Force-push safety: the JSON-serialised input of a force push contains
+  `"force": true`; `GitTool.REQUIRE_CONFIRMATION_PATTERNS` is a ready-made
+  pattern list for `AllowListPolicy(require_confirmation_patterns={"git":
+  GitTool.REQUIRE_CONFIRMATION_PATTERNS})` so force pushes require
+  confirmation (via ON_PERMISSION_CHECK hooks; denied without one). The
+  result metadata also records `force=True`. GitTool is an ordinary Tool —
+  no bypass of `permission_policy` (test asserts the default empty
+  AllowListPolicy denies it).
+- `workspace/manager.py` — `Workspace(root_path)` (root must be an existing
+  dir, canonicalised once) with `resolve(relative_path)` (realpath +
+  commonpath containment check; `../`, absolute paths outside root and
+  symlink escapes all raise `PathTraversalError`) and
+  `list_files(pattern=None)` (sorted root-relative POSIX paths, files only,
+  `fnmatch` filter where `*` crosses directories). One agent, one workspace
+  this version; migrating existing tools to route paths through it is
+  deferred (GitTool pairs via `GitTool(workdir=workspace.root_path)`).
+- `profiles/presets.py` — `dev_profile()` (PermissivePolicy +
+  InMemoryAuditLogger + ConsoleObservabilityLogger) and
+  `production_profile(*, audit_log_path, allowed_tools=None,
+  summarizer_client=None)` (AllowListPolicy deny-by-default, git
+  confirmation patterns pre-loaded when "git" is allowed, JSONLAuditLogger,
+  SummarizingContextManager only when a summarizer client is given). Both
+  return plain kwargs dicts for `Agent(**profile)` — they NEVER construct an
+  Agent themselves (no import-time side effects); docstrings stress they are
+  starting points, not the one true config.
 
 ## LLM backend notes
 - `llm/client.py` now ships `LiteLLMClient(LLMClient)` instead of the old
