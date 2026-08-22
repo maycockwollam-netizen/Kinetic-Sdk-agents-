@@ -15,13 +15,15 @@ rewriting the agent loop.
   routing, the model-backed `LiteLLMClassifier`, truncation-based context
   compaction, LLM-summarized context compaction with safe truncation fallback,
   and secret management are implemented.
-- **Stage 3 — Quality & Ops: partial.** Permission policies, audit logging,
-  secret redaction, structured observability logging, and per-run trace
-  summaries are implemented. Richer confirmation UX, policy sets, metrics, and
-  external tracing exporters are still future work.
-- **Stage 4 — Extensions: planned.** Multi-agent orchestration, plugins, MCP,
-  skills, workspace helpers, git integrations, and profiles are not implemented
-  yet.
+- **Stage 3 — Quality & Ops: done.** Permission policies, audit logging,
+  secret redaction, structured observability logging, per-run trace summaries,
+  lifecycle hooks, public testing utilities, and hook-based confirmation UX
+  are implemented. Richer policy sets, metrics, and external tracing exporters
+  are still future work.
+- **Stage 4 — Extensions: in progress.** Git integration (`GitTool`),
+  workspace path safety (`Workspace`), agent profiles (dev/production
+  presets), and full MCP support (client + server) are implemented. Subagents,
+  plugins, and skills are not implemented yet.
 
 ## Module map
 
@@ -32,15 +34,30 @@ rewriting the agent loop.
 - `kinetic_sdk/context/` — context-window management with a zero-dependency
   token estimate and truncation-based compaction.
 - `kinetic_sdk/event/` — synchronous/async event bus with wildcard subscribers.
+- `kinetic_sdk/git/` — `GitTool`: curated git operations (status/diff/add/
+  commit/branch/checkout/push/pull/log) as a first-class, policy-gated tool.
+- `kinetic_sdk/hooks/` — lifecycle hooks (`BEFORE_RUN`, `BEFORE_TOOL_CALL`,
+  `ON_PERMISSION_CHECK`, ...) with fail-safe semantics.
 - `kinetic_sdk/llm/` — provider-neutral `LLMClient` interface plus optional
   `LiteLLMClient` for Anthropic/OpenAI-compatible providers.
+- `kinetic_sdk/mcp/` — Model Context Protocol in both directions: client
+  (connect to external MCP servers — Unity, filesystem, GitHub — and use
+  their tools as Kinetic `Tool`s via stdio/SSE transports) and server
+  (expose Kinetic tools to external MCP clients, with the same permission
+  policy + audit log as the internal agent loop).
 - `kinetic_sdk/observability/` — structured event loggers and `RunTrace`
   helpers for summarizing one agent run.
+- `kinetic_sdk/profiles/` — ready-made agent configuration presets
+  (`dev_profile`, `production_profile`).
 - `kinetic_sdk/secret/` — secret value wrapper, providers, and registry for
   safe credential resolution.
 - `kinetic_sdk/security/` — permission policies, audit loggers, and recursive
   secret redaction.
+- `kinetic_sdk/testing/` — public test utilities: `MockLLMClient`, `MockTool`,
+  and trace assertions.
 - `kinetic_sdk/tool/` — abstract tool interface and `ToolResult` dataclass.
+- `kinetic_sdk/workspace/` — `Workspace`: root-confined path resolution and
+  file listing (path-traversal safe).
 
 ## Install (editable)
 
@@ -134,9 +151,9 @@ before being persisted or published.
 
 ## Roadmap
 
-- Add a confirmation UX for permission decisions that require manual approval.
 - Add richer policy presets for filesystem, terminal, git, and network tools.
 - Add metrics aggregation and external tracing exporters such as OpenTelemetry
   or Jaeger.
-- Add Stage 4 extension points for subagents, plugins, MCP, skills, workspace
-  helpers, git integrations, and profiles.
+- Add the remaining Stage 4 extension points: subagents, plugins, and skills.
+- MCP follow-ups: tool-list caching, server-initiated requests (sampling),
+  and resources/prompts capabilities.
