@@ -16,6 +16,10 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   the `[llm]` extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or
   11 tests error.
 - No build step beyond pip install.
+- CI: `.github/workflows/test.yml` — minimal GitHub Actions workflow (push any
+  branch + PR -> main, ubuntu-latest, Python 3.11, `pip install -e ".[dev,llm]"`,
+  `pytest -q`). No secrets needed: all 170 tests run with mocked LLM/tool.
+  Deferred on purpose: version matrix, dep cache, coverage, lint, CD.
 
 ## Stage status
 - Stage 1 (Core): DONE — `tool`, `event`, `llm`, `conversation`, `agent` loop.
