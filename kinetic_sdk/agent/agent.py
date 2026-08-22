@@ -29,7 +29,11 @@ from typing import Any, Iterable
 
 from kinetic_sdk.agent.classifier import TaskClassifier, DefaultClassifier
 from kinetic_sdk.agent.modes import AgentMode
-from kinetic_sdk.context.manager import ContextManager, SimpleTruncateContextManager
+from kinetic_sdk.context.manager import (
+    ContextManager,
+    SimpleTruncateContextManager,
+    SummarizingContextManager,
+)
 from kinetic_sdk.conversation.state import ConversationState
 from kinetic_sdk.event.bus import EventBus, Event
 from kinetic_sdk.llm.client import LLMClient, LLMResponse, ToolCall
@@ -61,7 +65,7 @@ class Agent:
               ``agent.llm_response``, ``agent.tool_call_started``,
               ``agent.tool_call_finished``, ``agent.run_finished``,
               ``agent.escalated``, ``agent.classified``, ``agent.error``,
-              ``context.compacted``.
+              ``context.compacted``, ``context.summarization_failed``.
         classifier: Optional :class:`TaskClassifier`. When provided (or when
             the default is used) :meth:`run` classifies the task exactly once
             before the first turn and routes to FLASH or MAX. Pass ``None`` to
@@ -74,7 +78,10 @@ class Agent:
         context_manager: Strategy that keeps the history inside the model's
             context window. ``None`` (default) uses
             :class:`SimpleTruncateContextManager`; pass
-            :class:`NoopContextManager` to disable compaction entirely.
+            :class:`NoopContextManager` to disable compaction entirely, or
+            :class:`SummarizingContextManager` to replace elided spans with an
+            LLM-generated summary (the agent's bus is wired into it so
+            ``context.summarization_failed`` is observable).
         model_context_limit: The model's context window in tokens, used as
             the reference for the manager's safety threshold.
         permission_policy: Gate checked before every tool execution. ``None``
@@ -133,6 +140,12 @@ class Agent:
         self.context_manager: ContextManager = (
             context_manager if context_manager is not None else SimpleTruncateContextManager()
         )
+        if isinstance(self.context_manager, SummarizingContextManager) and (
+            self.context_manager.event_bus is None
+        ):
+            # Route summarization-failure events through the agent's bus so
+            # they land in the same observability stream as context.compacted.
+            self.context_manager.event_bus = self.event_bus
         self.model_context_limit: int = (
             model_context_limit if model_context_limit is not None else self.DEFAULT_MODEL_CONTEXT_LIMIT
         )

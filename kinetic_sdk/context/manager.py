@@ -20,11 +20,16 @@ provided, with safe fallback to truncation on any summarizer failure.
 from __future__ import annotations
 
 import json
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Protocol
 
 from kinetic_sdk.conversation.state import ConversationState
+from kinetic_sdk.event.bus import Event, EventBus
 from kinetic_sdk.llm.client import LLMClient, Message
+from kinetic_sdk.security.redact import redact_secrets, redact_value
+
+logger = logging.getLogger(__name__)
 
 
 def estimate_tokens(text: str, chars_per_token: int = 4) -> int:
@@ -87,7 +92,7 @@ class LLMContextSummarizer:
 
     alias = "kinetic-context-summarizer-v1"
 
-    def __init__(self, client: LLMClient, max_tokens: int = 160) -> None:
+    def __init__(self, client: LLMClient, max_tokens: int = 150) -> None:
         if max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
         self.client = client
@@ -278,14 +283,31 @@ class SimpleTruncateContextManager(ContextManager):
 class SummarizingContextManager(SimpleTruncateContextManager):
     """Summarization-based compaction with safe truncation fallback.
 
-    When a :class:`ContextSummarizer` is provided, the dropped middle span is
-    replaced by a concise summary instead of a plain placeholder. If no
-    summarizer is configured, or if summarization raises/returns an empty
-    string, this manager falls back to :class:`SimpleTruncateContextManager` so
-    compaction remains deterministic and never blocks the agent loop.
+    When a summarizer is configured, the dropped middle span is replaced by a
+    concise summary instead of a plain placeholder. Pass either a ready-made
+    :class:`ContextSummarizer` (``summarizer``) or a plain
+    :class:`~kinetic_sdk.llm.client.LLMClient` (``summarizer_client``, wrapped
+    in :class:`LLMContextSummarizer` with a low ``summary_max_tokens`` cap) so
+    SDK users can pick a cheap/fast model for summaries, mirroring the
+    classifier pattern. Passing both raises ``ValueError``.
+
+    Safety rails, in line with the rest of the SDK:
+
+    * The elided span is scrubbed with
+      :func:`~kinetic_sdk.security.redact.redact_value` before it leaves the
+      process — tool results may carry credentials and the summarizer is a
+      separate model call that does not need them.
+    * Any summarizer failure (exception, non-string or empty summary) falls
+      back to :class:`SimpleTruncateContextManager`'s static placeholder
+      instead of crashing ``compact()``, and emits
+      ``context.summarization_failed`` on ``event_bus`` (when configured) so
+      the failure can be traced via the observability module.
     """
 
     SUMMARY_TEMPLATE = "[{n} tin nhắn trước đó đã được tóm tắt: {summary}]"
+
+    #: Event emitted when summarization fails and truncation fallback kicks in.
+    FAILURE_EVENT = "context.summarization_failed"
 
     def __init__(
         self,
@@ -293,16 +315,24 @@ class SummarizingContextManager(SimpleTruncateContextManager):
         safety_threshold: float = 0.8,
         chars_per_token: int = 4,
         summarizer: ContextSummarizer | None = None,
+        summarizer_client: LLMClient | None = None,
+        event_bus: EventBus | None = None,
         max_summary_chars: int = 1_000,
+        summary_max_tokens: int = 150,
     ) -> None:
         super().__init__(
             keep_last_tool_results=keep_last_tool_results,
             safety_threshold=safety_threshold,
             chars_per_token=chars_per_token,
         )
+        if summarizer is not None and summarizer_client is not None:
+            raise ValueError("pass either `summarizer` or `summarizer_client`, not both")
+        if summarizer is None and summarizer_client is not None:
+            summarizer = LLMContextSummarizer(summarizer_client, max_tokens=summary_max_tokens)
         if max_summary_chars < 1:
             raise ValueError("max_summary_chars must be >= 1")
         self.summarizer = summarizer
+        self.event_bus = event_bus
         self.max_summary_chars = max_summary_chars
 
     def _elided_message(self, elided: list[Message], removed: int) -> Message:
@@ -315,13 +345,38 @@ class SummarizingContextManager(SimpleTruncateContextManager):
         }
 
     def _summarize(self, messages: list[Message]) -> str:
+        if self.summarizer is None:
+            return ""
+        # Scrub credentials out of the span before it is sent to another model.
+        redacted = [redact_value(dict(m)) for m in messages]
         try:
-            summary = self.summarizer.summarize([dict(m) for m in messages]) if self.summarizer else ""
-        except Exception:  # noqa: BLE001 - compaction must safely degrade
+            summary = self.summarizer.summarize(redacted)
+        except Exception as exc:  # noqa: BLE001 - compaction must safely degrade
+            logger.warning("Context summarization failed: %s", exc)
+            self._emit_failure("exception", messages, exc)
             return ""
         if not isinstance(summary, str):
+            self._emit_failure("non_string_summary", messages, None)
             return ""
         summary = " ".join(summary.split())
+        if not summary:
+            self._emit_failure("empty_summary", messages, None)
+            return ""
         if len(summary) > self.max_summary_chars:
             summary = summary[: self.max_summary_chars].rstrip() + "…"
         return summary
+
+    def _emit_failure(
+        self, reason: str, messages: list[Message], exc: Exception | None
+    ) -> None:
+        """Publish ``context.summarization_failed`` if a bus is attached."""
+        if self.event_bus is None:
+            return
+        payload: dict[str, Any] = {
+            "manager": type(self).__name__,
+            "reason": reason,
+            "elided_messages": len(messages),
+        }
+        if exc is not None:
+            payload["error"] = redact_secrets(f"{type(exc).__name__}: {exc}")
+        self.event_bus.publish(Event(type=self.FAILURE_EVENT, payload=payload, source="context"))

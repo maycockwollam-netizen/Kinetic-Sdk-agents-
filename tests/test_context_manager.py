@@ -259,6 +259,157 @@ def test_simple_manager_is_a_context_manager():
     assert isinstance(SimpleTruncateContextManager(), ContextManager)
 
 
+# --- SummarizingContextManager: prompt, fallback event, redaction, parity -----
+
+
+def test_summarizing_manager_accepts_summarizer_client_directly():
+    """An LLMClient alone is enough; it is wrapped in LLMContextSummarizer."""
+    llm = MockLLM([text_response("Tóm tắt từ client.")])
+    manager = SummarizingContextManager(keep_last_tool_results=2, summarizer_client=llm)
+
+    compacted = manager.compact(_long_conversation(turns=5))
+
+    assert isinstance(manager.summarizer, LLMContextSummarizer)
+    assert "Tóm tắt từ client." in compacted.messages[1]["content"]
+    # The summary call uses the low max_tokens cap (the LLM gets no tools).
+    assert llm.calls[0]["kwargs"] == {"max_tokens": 150}
+    assert llm.calls[0]["tools"] is None
+
+
+def test_summarizing_manager_rejects_both_summarizer_and_client():
+    with pytest.raises(ValueError, match="not both"):
+        SummarizingContextManager(
+            summarizer=FakeSummarizer(), summarizer_client=MockLLM([])
+        )
+
+
+def test_summarizing_manager_prompt_contains_elided_content():
+    """The summarizer receives exactly the elided middle span."""
+    summarizer = FakeSummarizer()
+    manager = SummarizingContextManager(keep_last_tool_results=2, summarizer=summarizer)
+    state = _long_conversation(turns=5)
+
+    manager.compact(state)
+
+    assert len(summarizer.calls) == 1
+    elided = summarizer.calls[0]
+    contents = [str(m["content"]) for m in elided]
+    # The span is the middle: neither the first user message nor the tail.
+    assert state.messages[0]["content"] not in contents
+    assert any("step 0" in c for c in contents)
+    # The tail (last 2 tool results + neighbours) is NOT sent for summarization.
+    assert not any("call_4" in c for c in contents)
+
+
+def test_summarizing_manager_failure_emits_event_and_falls_back():
+    bus = EventBus()
+    events = []
+    bus.subscribe("context.summarization_failed", events.append)
+    manager = SummarizingContextManager(
+        keep_last_tool_results=2, summarizer=RaisingSummarizer(), event_bus=bus
+    )
+
+    compacted = manager.compact(_long_conversation(turns=5))  # must not raise
+
+    # Fallback placeholder replaces the middle, exactly like truncation.
+    assert any("rút gọn" in str(m["content"]) for m in compacted.messages)
+    assert len(events) == 1
+    payload = events[0].payload
+    assert events[0].type == "context.summarization_failed"
+    assert payload["reason"] == "exception"
+    assert payload["elided_messages"] > 0
+    assert "summarizer unavailable" in payload["error"]
+    assert payload["manager"] == "SummarizingContextManager"
+
+
+def test_summarizing_manager_failure_event_without_bus_does_not_crash():
+    manager = SummarizingContextManager(
+        keep_last_tool_results=2, summarizer=RaisingSummarizer()
+    )
+    compacted = manager.compact(_long_conversation(turns=5))
+    assert any("rút gọn" in str(m["content"]) for m in compacted.messages)
+
+
+def test_summarizing_manager_empty_and_nonstring_summary_emit_event():
+    for summarizer, reason in (
+        (FakeSummarizer(summary=""), "empty_summary"),
+        (NoneSummarizer(), "non_string_summary"),
+    ):
+        bus = EventBus()
+        events = []
+        bus.subscribe("context.summarization_failed", events.append)
+        manager = SummarizingContextManager(
+            keep_last_tool_results=2, summarizer=summarizer, event_bus=bus
+        )
+        compacted = manager.compact(_long_conversation(turns=5))
+        assert any("rút gọn" in str(m["content"]) for m in compacted.messages)
+        assert [e.payload["reason"] for e in events] == [reason]
+
+
+def test_summarizing_manager_redacts_secrets_before_summarizing():
+    secret = "ghp_" + "a1B2c3" * 6  # matches the GitHub token pattern
+    summarizer = FakeSummarizer()
+    manager = SummarizingContextManager(keep_last_tool_results=2, summarizer=summarizer)
+    state = ConversationState(system_prompt="sys")
+    state.messages.append(_user("task"))
+    for i in range(4):
+        state.messages.append(_assistant(f"step {i} " + "x" * 100))
+        output = f"api_key = {secret}" if i == 0 else "ok " + "y" * 100
+        state.messages.append(_tool_result(f"c{i}", output))
+
+    manager.compact(state)
+
+    assert summarizer.calls
+    sent = str(summarizer.calls[0])
+    assert secret not in sent
+    assert "[REDACTED]" in sent
+
+
+def test_summarizing_and_simple_manager_agree_on_kept_structure():
+    """Same input: identical head/tail, only the elided replacement differs."""
+    simple = SimpleTruncateContextManager(keep_last_tool_results=2)
+    summarizing = SummarizingContextManager(
+        keep_last_tool_results=2, summarizer=FakeSummarizer()
+    )
+    state = _long_conversation(turns=6)
+
+    a = simple.compact(state)
+    b = summarizing.compact(state)
+
+    assert len(a.messages) == len(b.messages)
+    # Head (first user message) and protected tail are identical.
+    assert a.messages[0] == b.messages[0] == state.messages[0]
+    assert a.messages[2:] == b.messages[2:]
+    assert a.system_prompt == b.system_prompt == state.system_prompt
+    # Only the replacement for the elided span differs.
+    assert "rút gọn" in a.messages[1]["content"]
+    assert "tóm tắt" in b.messages[1]["content"]
+
+
+def test_agent_wires_bus_into_summarizing_manager():
+    """The agent's bus receives context.summarization_failed during run()."""
+    bus = EventBus()
+    events = []
+    bus.subscribe("context.summarization_failed", events.append)
+    manager = SummarizingContextManager(
+        keep_last_tool_results=2, summarizer=RaisingSummarizer()
+    )
+    agent = Agent(
+        llm=MockLLM([text_response("done")]),
+        tools=[EchoTool()],
+        state=_long_conversation(turns=8, filler=400),
+        event_bus=bus,
+        context_manager=manager,
+        model_context_limit=500,
+    )
+
+    assert agent.run() == "done"
+    assert len(events) == 1
+    # The event flows through the agent's bus, sharing its stream (the
+    # manager publishes directly, so it carries no run_id of its own).
+    assert events[0].payload["reason"] == "exception"
+
+
 # --- agent loop integration -------------------------------------------------
 
 

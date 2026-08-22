@@ -10,8 +10,8 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (157 tests: 85 Stage 1+classifier +
-  17 context manager + 20 security + 23 secret + 12 observability). NOTE: the
+- Run tests: `python -m pytest -q` (170 tests: 85 Stage 1+classifier +
+  30 context manager + 20 security + 23 secret + 12 observability). NOTE: the
   litellm tests need
   the `[llm]` extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or
   11 tests error.
@@ -19,11 +19,11 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 
 ## Stage status
 - Stage 1 (Core): DONE — `tool`, `event`, `llm`, `conversation`, `agent` loop.
-- Stage 2 (Context & Memory): PARTIAL — classifier + FLASH/MAX routing DONE;
+- Stage 2 (Context & Memory): DONE — classifier + FLASH/MAX routing DONE;
   `context/manager.py` real truncation-based compaction DONE and wired into
   the agent loop (see "Context manager" below); `secret/` module DONE (see
-  "Secret management" below). Remaining: LLM-summarised compaction
-  (`SummarizingContextManager` is a placeholder subclass).
+  "Secret management" below); `SummarizingContextManager` real LLM-summarised
+  compaction DONE (see "Summarizing context manager" below).
 - Stage 3 (Quality & Ops): PARTIAL — `security/` module DONE (permission
   policy + audit log + secret redaction, wired into the agent loop). See
   "Security" below. `observability/` module DONE (structured logging + run
@@ -72,8 +72,9 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 - `kinetic_sdk/tool/base.py` — `Tool` ABC + `ToolResult` dataclass.
 - `kinetic_sdk/context/manager.py` — `ContextManager` ABC
   (`should_compact`/`compact`), `SimpleTruncateContextManager` (default),
-  `NoopContextManager`, `SummarizingContextManager` (placeholder subclass),
-  `estimate_tokens` heuristic.
+  `NoopContextManager`, `SummarizingContextManager` (real LLM summarisation +
+  truncation fallback), `ContextSummarizer` Protocol + `LLMContextSummarizer`
+  (alias `kinetic-context-summarizer-v1`), `estimate_tokens` heuristic.
 
 ## Classifier & routing (Stage 2 — DONE)
 - `LiteLLMClassifier` drives `openai/openhands/glm-5.2` via
@@ -121,14 +122,36 @@ behind alias `kinetic-classifier-v1` — never leak the real model name.
   `_maybe_compact_context()` runs before EVERY LLM call; on compaction it
   swaps `agent.state` and emits `context.compacted` with
   messages_before/after/removed + estimated_tokens_after.
-- `SummarizingContextManager` exists as a subclass placeholder (falls back to
-  truncation) — real LLM summarisation still TODO.
+- `SummarizingContextManager` — real LLM summarisation with safe truncation
+  fallback (see "Summarizing context manager" below).
 
-## Next next task (Stage 2 remainder)
-- `SummarizingContextManager`: replace the placeholder with a 1-2 sentence
-  LLM summary of the elided span (cheap model behind an alias, like the
-  classifier). The classifier already accepts a `summary` kwarg that the
-  summary can feed into.
+## Summarizing context manager (Stage 2 — DONE)
+- `SummarizingContextManager` extends `SimpleTruncateContextManager` so the
+  kept structure (system prompt + first user message + N most recent tool
+  results) is identical; only the elided middle span's replacement differs —
+  a 1-2 sentence LLM summary instead of the static placeholder.
+- Constructor accepts EITHER `summarizer` (any `ContextSummarizer`, e.g. the
+  test `FakeSummarizer`) OR `summarizer_client` (a plain `LLMClient`, wrapped
+  internally in `LLMContextSummarizer` with `max_tokens=150` by default) —
+  passing both raises `ValueError`. Optional `event_bus` receives
+  `context.summarization_failed`.
+- `LLMContextSummarizer(alias="kinetic-context-summarizer-v1")` mirrors the
+  classifier pattern: the SDK alias surfaces in logs/config, never a concrete
+  model name. Prompt asks for a 1-2 sentence Vietnamese summary of the elided
+  span (goal, key decisions, notable errors/tool results), `max_tokens`
+  capped low (default 150).
+- Safety rails: (1) the elided span is scrubbed with
+  `security/redact.redact_value` BEFORE being sent to the summarizer model;
+  (2) any summarizer failure (exception / empty / non-string result) falls
+  back to the static truncation placeholder and emits
+  `context.summarization_failed` (payload: manager, reason
+  exception|empty_summary|non_string_summary, elided_messages, redacted
+  error) — compaction never crashes the agent loop.
+- `Agent.__init__` auto-wires its event bus into a `SummarizingContextManager`
+  that has no bus of its own, so failure events share the agent's
+  observability stream (the manager publishes directly, so these events carry
+  no `run_id`). Default context manager stays `SimpleTruncateContextManager`;
+  summarization is opt-in (extra model call has a cost).
 
 ## Secret management (Stage 2 — DONE)
 - `secret/value.py` — `SecretValue`: wraps a secret string; `repr()`/`str()`
