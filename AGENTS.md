@@ -10,17 +10,18 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (254 tests: 85 Stage 1+classifier +
+- Run tests: `python -m pytest -q` (381 tests: 85 Stage 1+classifier +
   30 context manager + 20 security + 23 secret + 12 observability +
   16 hooks + 13 testing utils + 8 confirmation UX + 20 git tool +
-  18 workspace + 9 profiles). NOTE: the
+  18 workspace + 9 profiles + 127 MCP). NOTE: the
   litellm tests need
   the `[llm]` extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or
   11 tests error.
 - No build step beyond pip install.
 - CI: `.github/workflows/test.yml` — minimal GitHub Actions workflow (push any
   branch + PR -> main, ubuntu-latest, Python 3.11, `pip install -e ".[dev,llm]"`,
-  `pytest -q`). No secrets needed: all 254 tests run with mocked LLM/tool.
+  `pytest -q`). No secrets needed: all 381 tests run with mocked LLM/tool
+  (MCP tests use fake stdio/SSE servers, no real Unity/GitHub server).
   Deferred on purpose: version matrix, dep cache, coverage, lint, CD.
 
 ## Stage status
@@ -38,8 +39,9 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   below). Deferred to later versions: richer policies, metrics/aggregation,
   external tracing (OTel/Jaeger).
 - Stage 4 (Extensions): IN PROGRESS — `git/` (GitTool), `workspace/`
-  (Workspace) and `profiles/` (presets) DONE (see "Stage 4 modules" below).
-  TODO: `subagent/`, `mcp/`, `plugin/`, `skills/`.
+  (Workspace), `profiles/` (presets) and `mcp/` (MCP client + server) DONE
+  (see "Stage 4 modules" and "MCP" below).
+  TODO: `subagent/`, `plugin/`, `skills/`.
 
 ## Key design rules
 - All communication in Vietnamese during task work (per user instruction).
@@ -360,3 +362,94 @@ behind alias `kinetic-classifier-v1` — never leak the real model name.
   `{type:"function", function:{name,description,parameters}}`.
 - Tests for the client mock `litellm.completion` (see `tests/test_litellm_client.py`);
   the agent tests still mock via the `LLMClient` interface (`MockLLM`).
+
+## MCP (Stage 4 — DONE)
+- `mcp/protocol.py` — JSON-RPC 2.0 message layer: `JsonRpcRequest`/
+  `JsonRpcResponse`/`JsonRpcNotification` dataclasses, `encode` (one message
+  = one JSON line ending `\n` — newline-delimited, NOT LSP Content-Length
+  framing), strict `decode` (malformed JSON / missing `jsonrpc: "2.0"` /
+  missing fields / response with both or neither of result+error all raise
+  `MCPProtocolError` — never silently degrade to None), thread-safe
+  `RequestIdGenerator` (monotonic int ids).
+- `mcp/transport.py` — `Transport` ABC (`send`/`receive(timeout)`/`close`,
+  context manager). `StdioTransport(command, args, env, process_factory)`
+  spawns a subprocess (factory injectable; `env=None` inherits os.environ, a
+  dict REPLACES it); a daemon pump thread feeds stdout lines into a queue so
+  `receive(timeout)` works on blocking pipes and raises `MCPTimeoutError`;
+  child death (EOF) surfaces as `MCPTransportError` with exit code + stderr
+  tail, and STAYS raised on later receives. `StdioTransport.attach(reader,
+  writer)` is the SERVER-side entry (protocol on own stdin/stdout;
+  `close()` only flushes — streams belong to the host). `SSETransport(url,
+  headers, connect_timeout, read_timeout)`: lazy `_open()` on first
+  send/receive reads the mandatory `endpoint` event first (connect_timeout
+  bound), `send` POSTs JSON to that endpoint (new connection per POST,
+  expects 200/202), `receive` reads `message` events off the SSE stream.
+  Both transports have `__del__` best-effort cleanup (no orphan subprocess
+  when users skip `with`).
+- `mcp/client.py` — `MCPClient(transport, init_timeout=10, request_timeout=30)`
+  is transport-agnostic. `initialize()` runs the mandated 3-step handshake
+  (initialize request -> response validated for a string `protocolVersion`,
+  else `MCPHandshakeError` -> `notifications/initialized` notification) and
+  is idempotent; `list_tools()`/`call_tool()` raise `MCPClientError` if
+  called before it (`_initialized` flag). `_request` correlates responses by
+  id (mismatch raises, never silently pairs), skips interleaved
+  notifications (optional `on_notification` callback), ignores
+  server-initiated requests (sampling/roots unsupported this version), and
+  raises `MCPServerError(code, message, data)` for JSON-RPC errors.
+- `mcp/adapter.py` — `MCPToolAdapter(Tool)`: wraps ONE server tool; the
+  registered name is ALWAYS `"{server_name}.{tool_name}"` (e.g.
+  `"unity.search"`) so two servers' same-named tools never collide;
+  `from_mcp_schema` maps MCP's camelCase `inputSchema` -> Kinetic
+  `parameters`. `execute()` maps every failure mode (transport dead,
+  `MCPServerError`, `isError: true`, malformed result) to
+  `ToolResult(error=...)` — never raises into the agent loop — and scrubs
+  ALL output through `redact_value` (external server output is untrusted).
+- `mcp/registry.py` — `MCPServerConfig.stdio(command, args, env)` /
+  `.sse(url, headers)` (exactly one flavour, XOR enforced);
+  env/headers values may be `str | SecretValue` — plaintext revealed ONLY at
+  transport-build time, module never reads `os.environ` (same rule as
+  `git/`). `MCPServerRegistry(secrets=...)`: `register` stores config
+  without connecting; `connect(name)` spawns transport + handshake lazily,
+  caches the client, and closes the half-open transport if the handshake
+  fails (no orphans); `get_tools_as_kinetic_tools(name)` wraps every server
+  tool in an adapter with the server-name prefix.
+- `mcp/server.py` — `MCPServer(tools, permission_policy, audit_logger)` is
+  direction B: Kinetic AS an MCP server. `handle_message` is transport-free
+  (unit-testable); it answers `initialize`, refuses `tools/list`/
+  `tools/call` with `-32002` until `notifications/initialized` arrives, and
+  routes EVERY `tools/call` through `permission_policy.check` + audit log
+  exactly like the internal agent loop (deny -> MCP `isError` result;
+  `requires_confirmation` -> denied, same safe fallback message; unknown
+  tool -> `-32602`; unknown method -> `-32601`). Tool output is redacted
+  before serving. `serve_forever(transport)` loops until the peer hangs up
+  (clean shutdown signal), answering malformed lines with `-32700` and
+  continuing. `MCPServer.serve_stdio(tools, policy)` is the entry point when
+  Kinetic is spawned as an MCP subprocess (stdout = protocol channel, never
+  print to it).
+- Example config (no real Unity server needed for tests — the test fakes in
+  `tests/_mcp_fakes.py` speak just enough MCP over real pipes/sockets):
+
+  ```python
+  from kinetic_sdk.mcp import MCPServerConfig, MCPServerRegistry
+  from kinetic_sdk.secret import SecretRegistry
+
+  secrets = SecretRegistry()  # env-based
+  registry = MCPServerRegistry(secrets=secrets)
+  registry.register(
+      "unity",
+      MCPServerConfig.stdio(
+          command="unity-mcp",
+          args=["--project", "./Game"],
+          env={"UNITY_API_KEY": secrets.resolve("UNITY_API_KEY")},
+      ),
+  )
+  tools = registry.get_tools_as_kinetic_tools("unity")  # ["unity.search", ...]
+  agent = Agent(llm=..., tools=[*tools, GitTool()], ...)
+  ```
+- GOTCHA: `StdioTransport.attach()` does NOT close the streams on `close()`
+  (they belong to the host process) — tests driving `serve_forever` over
+  `os.pipe()` must close the client writer themselves to send the EOF that
+  ends the server loop (see `tests/test_mcp_server.py`).
+- NOT done (later versions): tool-list caching across runs, concurrent/async
+  calls (id correlation is already spec-correct), server-initiated requests
+  (sampling/roots), resources/prompts MCP capabilities, config UI/CLI.
