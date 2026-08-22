@@ -26,9 +26,10 @@ class PermissionDecision:
             and recorded in the audit log either way.
         requires_confirmation: When ``True`` the call is only allowed after
             explicit human confirmation (e.g. deleting files, ``rm -rf``,
-            pushing to a remote). The agent loop currently denies such calls
-            in automated mode; the flag exists so a future confirmation
-            mechanism can let them through.
+            pushing to a remote). The agent loop asks the
+            ``ON_PERMISSION_CHECK`` hooks (see :mod:`kinetic_sdk.hooks`) to
+            supply that confirmation; when no hook confirms, the call is
+            denied — the safe default.
     """
 
     allowed: bool

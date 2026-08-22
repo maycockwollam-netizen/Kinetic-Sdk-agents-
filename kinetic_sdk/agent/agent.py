@@ -36,10 +36,12 @@ from kinetic_sdk.context.manager import (
 )
 from kinetic_sdk.conversation.state import ConversationState
 from kinetic_sdk.event.bus import EventBus, Event
+from kinetic_sdk.hooks.base import HookContext, HookPoint, HookResult
+from kinetic_sdk.hooks.registry import HookRegistry
 from kinetic_sdk.llm.client import LLMClient, LLMResponse, ToolCall
 from kinetic_sdk.observability.logger import ObservabilityLogger
 from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
-from kinetic_sdk.security.policy import AllowListPolicy, PermissionPolicy
+from kinetic_sdk.security.policy import AllowListPolicy, PermissionDecision, PermissionPolicy
 from kinetic_sdk.security.redact import redact_secrets
 from kinetic_sdk.tool.base import Tool, ToolResult
 
@@ -65,7 +67,9 @@ class Agent:
               ``agent.llm_response``, ``agent.tool_call_started``,
               ``agent.tool_call_finished``, ``agent.run_finished``,
               ``agent.escalated``, ``agent.classified``, ``agent.error``,
-              ``context.compacted``, ``context.summarization_failed``.
+              ``context.compacted``, ``context.summarization_failed``,
+              ``security.permission_denied``, ``hooks.error`` (via the
+              hook registry).
         classifier: Optional :class:`TaskClassifier`. When provided (or when
             the default is used) :meth:`run` classifies the task exactly once
             before the first turn and routes to FLASH or MAX. Pass ``None`` to
@@ -94,6 +98,15 @@ class Agent:
             (default) keeps observability off entirely — no subscription, no
             overhead. When provided it is attached to the event bus at
             construction time so it also captures ``agent.run_started``.
+        hooks: Optional :class:`HookRegistry` with callbacks fired at each
+            :class:`HookPoint` of the loop. ``None`` (default) means no hooks
+            run at all (zero overhead). If the registry has no event bus of
+            its own, the agent's bus is wired in so ``hooks.error`` events
+            share the agent's observability stream. Hooks are also the
+            extension point for a real confirmation UX: when the permission
+            policy flags a call ``requires_confirmation=True``, the agent
+            asks the ``ON_PERMISSION_CHECK`` hooks instead of denying
+            outright — see :meth:`_execute_one`.
 
     Attributes:
         mode: Current :class:`AgentMode`. Set once by the classifier at the
@@ -129,6 +142,7 @@ class Agent:
         permission_policy: PermissionPolicy | None = None,
         audit_logger: AuditLogger | None = None,
         observability_logger: ObservabilityLogger | None = None,
+        hooks: HookRegistry | None = None,
     ) -> None:
         self.llm = llm
         # NOTE: use ``is not None`` rather than truthiness because
@@ -159,6 +173,10 @@ class Agent:
         if observability_logger is not None:
             # Attach at construction (not in run()) so run_started is caught.
             observability_logger.attach(self.event_bus)
+        self.hooks = hooks
+        if hooks is not None and hooks.event_bus is None:
+            # Route hooks.error events through the agent's bus.
+            hooks.event_bus = self.event_bus
         #: UUID of the in-flight (or most recent) :meth:`run`; ``None`` before
         #: the first run. Every event emitted during a run carries it.
         self._run_id: str | None = None
@@ -222,6 +240,12 @@ class Agent:
             self.state.add_user_message(user_message)
 
         self._run_id = str(uuid.uuid4())
+        self._trigger_hooks(
+            HookPoint.BEFORE_RUN,
+            HookContext(
+                point=HookPoint.BEFORE_RUN, run_id=self._run_id, user_message=user_message
+            ),
+        )
         self._classify_and_route(user_message)
 
         self._emit(
@@ -233,9 +257,23 @@ class Agent:
         try:
             final_text = self._run_loop()
         except Exception as exc:
+            self._trigger_hooks(
+                HookPoint.ON_ERROR,
+                HookContext(
+                    point=HookPoint.ON_ERROR,
+                    run_id=self._run_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                ),
+            )
             self._emit("agent.error", {"reason": "exception", "error": str(exc)})
             raise
 
+        self._trigger_hooks(
+            HookPoint.AFTER_RUN,
+            HookContext(
+                point=HookPoint.AFTER_RUN, run_id=self._run_id, final_text=final_text
+            ),
+        )
         self._emit("agent.run_finished", {"final_text": final_text, "mode": self.mode.value})
         return final_text
 
@@ -303,7 +341,24 @@ class Agent:
         while iteration < self.max_iterations:
             self._emit("agent.turn_started", {"iteration": iteration, "mode": self.mode.value})
             self._maybe_compact_context()
+            self._trigger_hooks(
+                HookPoint.BEFORE_LLM_CALL,
+                HookContext(
+                    point=HookPoint.BEFORE_LLM_CALL,
+                    run_id=self._run_id,
+                    iteration=iteration,
+                ),
+            )
             response = self._call_llm()
+            self._trigger_hooks(
+                HookPoint.AFTER_LLM_CALL,
+                HookContext(
+                    point=HookPoint.AFTER_LLM_CALL,
+                    run_id=self._run_id,
+                    iteration=iteration,
+                    llm_response=response,
+                ),
+            )
             self.state.add_assistant(self._assistant_content(response))
             self._emit(
                 "agent.llm_response",
@@ -419,23 +474,63 @@ class Agent:
         return any_error
 
     def _execute_one(self, call: ToolCall) -> ToolResult:
-        """Dispatch a single tool call, gated by the permission policy.
+        """Dispatch a single tool call, gated by hooks + permission policy.
 
-        Every call is policy-checked and audit-logged first. Denied calls
-        (explicitly rejected, or flagged ``requires_confirmation`` which the
-        automated loop cannot satisfy yet) never execute; the model receives
-        an error :class:`ToolResult` explaining the denial so it can try
-        another approach, and ``security.permission_denied`` is emitted.
+        Flow per call:
+
+        1. ``BEFORE_TOOL_CALL`` hooks run. A hook may cancel the call
+           (``should_continue=False``) or replace the input via
+           ``modified_context={"tool_input": {...}}`` — the replacement is
+           what gets policy-checked, audited and executed.
+        2. The permission policy checks the call; the decision is audit-logged.
+        3. ``requires_confirmation=True`` decisions are the Confirmation UX
+           extension point: the ``ON_PERMISSION_CHECK`` hooks are consulted,
+           and any hook answering ``should_continue=True`` counts as an
+           explicit confirmation (e.g. a CLI prompt the user answered "yes").
+           With no hooks configured, no hook registered at that point, or all
+           hooks declining, the historical safe fallback applies — the call is
+           denied with an explanatory message. The SDK core deliberately does
+           not ship a concrete confirmation UI; it only provides the hook
+           point (see ``kinetic_sdk.security`` for an ``input()``-based
+           example).
+        4. Allowed calls execute; the result is audit-logged and the
+           ``AFTER_TOOL_CALL`` hooks run. Denied/cancelled calls return an
+           error :class:`ToolResult` so the model can react, and denials
+           emit ``security.permission_denied``.
         """
-        decision = self.permission_policy.check(call.name, call.arguments)
-        self.audit_logger.log_tool_call(call.name, call.arguments, decision, _utcnow())
+        arguments = call.arguments
+        if self.hooks is not None:
+            results = self._trigger_hooks(
+                HookPoint.BEFORE_TOOL_CALL,
+                HookContext(
+                    point=HookPoint.BEFORE_TOOL_CALL,
+                    run_id=self._run_id,
+                    tool_name=call.name,
+                    tool_input=arguments,
+                ),
+            )
+            if any(not r.should_continue for r in results):
+                return ToolResult(
+                    error=f"Tool call {call.name!r} cancelled by a before_tool_call hook"
+                )
+            for r in results:
+                if r.modified_context and isinstance(
+                    r.modified_context.get("tool_input"), dict
+                ):
+                    arguments = r.modified_context["tool_input"]
+
+        decision = self.permission_policy.check(call.name, arguments)
+        self.audit_logger.log_tool_call(call.name, arguments, decision, _utcnow())
         if not decision.allowed:
-            return self._deny_call(call, decision.reason)
-        if decision.requires_confirmation:
+            return self._deny_call(call, decision.reason, arguments)
+        if decision.requires_confirmation and not self._confirmed_by_hooks(
+            call, arguments, decision
+        ):
             return self._deny_call(
                 call,
                 "requires manual confirmation, not yet supported in automated "
                 f"mode ({decision.reason})",
+                arguments,
             )
 
         tool = self._tools.get(call.name)
@@ -443,24 +538,67 @@ class Agent:
             logger.error("Unknown tool requested: %s", call.name)
             return ToolResult(error=f"Unknown tool: {call.name}")
         try:
-            result = tool.execute(**call.arguments)
+            result = tool.execute(**arguments)
         except Exception as exc:  # noqa: BLE001 - surface as tool error
             logger.exception("Tool %s raised", call.name)
             result = ToolResult(error=f"{type(exc).__name__}: {exc}")
         self.audit_logger.log_tool_result(call.name, result, _utcnow())
+        self._trigger_hooks(
+            HookPoint.AFTER_TOOL_CALL,
+            HookContext(
+                point=HookPoint.AFTER_TOOL_CALL,
+                run_id=self._run_id,
+                tool_name=call.name,
+                tool_input=arguments,
+                tool_result=result,
+            ),
+        )
         return result
 
-    def _deny_call(self, call: ToolCall, reason: str) -> ToolResult:
+    def _trigger_hooks(self, point: HookPoint, context: HookContext) -> list[HookResult]:
+        """Run the hooks registered for *point*, or nothing when unconfigured."""
+        if self.hooks is None:
+            return []
+        return self.hooks.trigger(point, context)
+
+    def _confirmed_by_hooks(
+        self, call: ToolCall, arguments: dict[str, Any], decision: PermissionDecision
+    ) -> bool:
+        """Ask ``ON_PERMISSION_CHECK`` hooks to confirm a flagged tool call.
+
+        Returns ``True`` when at least one hook explicitly allows the call
+        (``should_continue=True``). No hooks configured, none registered at
+        this point, or all declining (``False``/``None``) means *not*
+        confirmed — the safe default.
+        """
+        if self.hooks is None:
+            return False
+        results = self._trigger_hooks(
+            HookPoint.ON_PERMISSION_CHECK,
+            HookContext(
+                point=HookPoint.ON_PERMISSION_CHECK,
+                run_id=self._run_id,
+                tool_name=call.name,
+                tool_input=arguments,
+                permission_decision=decision,
+            ),
+        )
+        return any(r.should_continue for r in results)
+
+    def _deny_call(
+        self, call: ToolCall, reason: str, tool_input: dict[str, Any] | None = None
+    ) -> ToolResult:
         """Audit-log + emit a denial and build the error result for the model."""
+        tool_input = tool_input if tool_input is not None else call.arguments
         logger.warning("Permission denied for tool %s: %s", call.name, reason)
-        self.audit_logger.log_permission_denied(call.name, call.arguments, reason, _utcnow())
+        self.audit_logger.log_permission_denied(call.name, tool_input, reason, _utcnow())
         self._emit(
             "security.permission_denied",
             {
                 "name": call.name,
                 "id": call.id,
                 "reason": reason,
-                "input_preview": redact_secrets(self._preview(call.arguments)),
+                "input_preview": redact_secrets(self._preview(tool_input)),
             },
         )
         return ToolResult(error=f"Permission denied for tool {call.name!r}: {reason}")

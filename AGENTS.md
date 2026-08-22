@@ -10,15 +10,16 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (170 tests: 85 Stage 1+classifier +
-  30 context manager + 20 security + 23 secret + 12 observability). NOTE: the
+- Run tests: `python -m pytest -q` (207 tests: 85 Stage 1+classifier +
+  30 context manager + 20 security + 23 secret + 12 observability +
+  16 hooks + 13 testing utils + 8 confirmation UX). NOTE: the
   litellm tests need
   the `[llm]` extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or
   11 tests error.
 - No build step beyond pip install.
 - CI: `.github/workflows/test.yml` — minimal GitHub Actions workflow (push any
   branch + PR -> main, ubuntu-latest, Python 3.11, `pip install -e ".[dev,llm]"`,
-  `pytest -q`). No secrets needed: all 170 tests run with mocked LLM/tool.
+  `pytest -q`). No secrets needed: all 207 tests run with mocked LLM/tool.
   Deferred on purpose: version matrix, dep cache, coverage, lint, CD.
 
 ## Stage status
@@ -28,11 +29,13 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   the agent loop (see "Context manager" below); `secret/` module DONE (see
   "Secret management" below); `SummarizingContextManager` real LLM-summarised
   compaction DONE (see "Summarizing context manager" below).
-- Stage 3 (Quality & Ops): PARTIAL — `security/` module DONE (permission
-  policy + audit log + secret redaction, wired into the agent loop). See
-  "Security" below. `observability/` module DONE (structured logging + run
-  tracing, see "Observability" below). Remaining Stage 3: real confirmation
-  UX, richer policies, metrics/aggregation, external tracing (OTel/Jaeger).
+- Stage 3 (Quality & Ops): DONE — `security/` (permission policy + audit log
+  + secret redaction, wired into the agent loop), `observability/` (structured
+  logging + run tracing), `hooks/` (lifecycle hooks, see "Hooks" below),
+  `testing/` (public test utilities, see "Testing utilities" below), and the
+  Confirmation UX via `ON_PERMISSION_CHECK` hooks (see "Confirmation UX"
+  below). Deferred to later versions: richer policies, metrics/aggregation,
+  external tracing (OTel/Jaeger).
 - Stage 4 (Extensions): TODO.
 
 ## Key design rules
@@ -240,6 +243,63 @@ behind alias `kinetic-classifier-v1` — never leak the real model name.
   payload shape untouched). `agent.run_id` property exposes the current/last
   run id.
 - NOT done (later): OpenTelemetry/Jaeger export, metrics/aggregation.
+
+## Hooks (Stage 3, part 3 — DONE)
+- `hooks/base.py` — `HookPoint` enum (`BEFORE_RUN`, `AFTER_RUN`,
+  `BEFORE_LLM_CALL`, `AFTER_LLM_CALL`, `BEFORE_TOOL_CALL`, `AFTER_TOOL_CALL`,
+  `ON_PERMISSION_CHECK`, `ON_ERROR`), `HookContext` (ONE shared dataclass,
+  optional fields; which are populated is documented per HookPoint member),
+  `HookResult(should_continue=True, modified_context=None)`, `Hook` Protocol
+  (any callable `(HookContext) -> HookResult | None`; `None` = pure observer).
+- `hooks/registry.py` — `HookRegistry(event_bus=None)`; `register` (same hook
+  twice = no-op) / `unregister` / `hooks_for` / `trigger(point, context) ->
+  list[HookResult]` runs hooks in registration order. A raising hook NEVER
+  crashes the agent: caught, logged, emitted as `hooks.error` (payload: hook
+  name, point, redacted error) on the bus, remaining hooks still run.
+- Wiring: `Agent.__init__` gained `hooks` (None default = no hooks, zero
+  overhead); the agent's bus is wired into a registry that has none.
+  `_trigger_hooks` is the single guard. Trigger points: `run()` start/end
+  (BEFORE_RUN before classification, AFTER_RUN before `agent.run_finished`),
+  around every `_call_llm`, around every tool execution, ON_ERROR before
+  re-raise in `run()`.
+- Semantics: `should_continue=False` is honoured at BEFORE_TOOL_CALL (call
+  cancelled, error ToolResult to the model, AFTER_TOOL_CALL skipped) and at
+  ON_PERMISSION_CHECK (stays denied); ignored elsewhere.
+  `modified_context={"tool_input": {...}}` at BEFORE_TOOL_CALL replaces the
+  input BEFORE the policy check — the replacement is what gets checked,
+  audited and executed. AFTER_TOOL_CALL fires only after real execution
+  (not on denial/cancellation).
+
+## Confirmation UX (Stage 3 — DONE, debt from security/ cleared)
+- `_execute_one`: `requires_confirmation=True` no longer auto-denies when
+  hooks exist — `_confirmed_by_hooks` triggers `ON_PERMISSION_CHECK` with
+  tool_name/tool_input/permission_decision; ANY hook returning
+  `should_continue=True` confirms and the call executes.
+- Safe fallback unchanged: no hooks configured / none registered at that
+  point / all decline (False or None) / hook raises → deny with the SAME
+  historical message ("requires manual confirmation, not yet supported in
+  automated mode (...)"). A raising confirmation hook thus fails CLOSED.
+- SDK core ships no concrete confirmation UI on purpose; an `input()`-based
+  CLI example lives in the `security/__init__.py` docstring.
+
+## Testing utilities (Stage 3, part 4 — DONE)
+- `testing/mocks.py` — `MockLLMClient(LLMClient)` (scripted list of
+  `LLMResponse` or callables `(messages, tools, system) -> LLMResponse`;
+  empty script -> empty `end_turn`; records `.calls`), `text_response` /
+  `tool_response` builders, `MockTool(Tool)` (fixed `result` — a ToolResult
+  verbatim incl. error path, any other value wrapped as output — or
+  `handler(**params)`; both together -> ValueError; records `.calls`).
+- `testing/assertions.py` — `assert_tool_called(trace, name, times=None)`,
+  `assert_mode(trace, AgentMode | str)`, `assert_no_permission_denied(trace)`;
+  all read `RunTrace`/`to_summary()`, no event parsing reimplemented.
+- `testing/__init__.py` docstring = minimal end-to-end example (MockLLMClient
+  + MockTool + PermissivePolicy + InMemoryObservabilityLogger + RunTrace).
+- `tests/_helpers.py` now aliases `MockLLM = MockLLMClient` and re-exports
+  the builders from `kinetic_sdk.testing` (no duplicated mock code);
+  `EchoTool`/`FailingTool` stay test-only there.
+- GOTCHA: hooks/assertion helpers registered via lambdas must return None —
+  a lambda returning a tuple/value (e.g. `lambda ctx: (a.append(x), b())`)
+  is collected as a HookResult and breaks `should_continue` checks.
 
 ## LLM backend notes
 - `llm/client.py` now ships `LiteLLMClient(LLMClient)` instead of the old
