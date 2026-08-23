@@ -10,17 +10,17 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (381 tests: 85 Stage 1+classifier +
+- Run tests: `python -m pytest -q` (478 tests: 85 Stage 1+classifier +
   30 context manager + 20 security + 23 secret + 12 observability +
   16 hooks + 13 testing utils + 8 confirmation UX + 20 git tool +
-  18 workspace + 9 profiles + 127 MCP). NOTE: the
+  18 workspace + 9 profiles + 127 MCP + 97 skills). NOTE: the
   litellm tests need
   the `[llm]` extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or
   11 tests error.
 - No build step beyond pip install.
 - CI: `.github/workflows/test.yml` — minimal GitHub Actions workflow (push any
   branch + PR -> main, ubuntu-latest, Python 3.11, `pip install -e ".[dev,llm]"`,
-  `pytest -q`). No secrets needed: all 381 tests run with mocked LLM/tool
+  `pytest -q`). No secrets needed: all 478 tests run with mocked LLM/tool
   (MCP tests use fake stdio/SSE servers, no real Unity/GitHub server).
   Deferred on purpose: version matrix, dep cache, coverage, lint, CD.
 
@@ -39,9 +39,10 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   below). Deferred to later versions: richer policies, metrics/aggregation,
   external tracing (OTel/Jaeger).
 - Stage 4 (Extensions): IN PROGRESS — `git/` (GitTool), `workspace/`
-  (Workspace), `profiles/` (presets) and `mcp/` (MCP client + server) DONE
-  (see "Stage 4 modules" and "MCP" below).
-  TODO: `subagent/`, `plugin/`, `skills/`.
+  (Workspace), `profiles/` (presets), `mcp/` (MCP client + server) and
+  `skills/` (skill discovery + vetting) DONE (see "Stage 4 modules", "MCP"
+  and "Skills" below).
+  TODO: `subagent/`, `plugin/`.
 
 ## Key design rules
 - All communication in Vietnamese during task work (per user instruction).
@@ -453,3 +454,74 @@ behind alias `kinetic-classifier-v1` — never leak the real model name.
 - NOT done (later versions): tool-list caching across runs, concurrent/async
   calls (id correlation is already spec-correct), server-initiated requests
   (sampling/roots), resources/prompts MCP capabilities, config UI/CLI.
+
+## Skills (Stage 4 — DONE)
+- `skills/skill.py` — `Skill` frozen dataclass (name, description, source,
+  root_path, version). `from_directory(dir, source)` parses SKILL.md
+  frontmatter with a hand-rolled flat `key: value` parser (no pyyaml dep);
+  name must match `^[a-z0-9]+(-[a-z0-9]+)*$` (max 64 chars) AND equal the
+  directory name; description non-empty, truncated at
+  `MAX_DESCRIPTION_LENGTH = 1024` with a notice instead of rejected.
+  `read_main()` returns the body (lazy, uncached — a deleted directory raises
+  `SkillParseError` immediately). `list_resources(pattern, resource_type)`
+  and `read_resource()` are HARD-SCOPED to `scripts/`/`references/`/`assets/`
+  (exposure layer — deliberately narrower than the zip extension allowlist,
+  which is the extraction layer; the two filters are independent). All reads
+  go through `Workspace(root_path)` — no hand-rolled traversal checks.
+- `skills/loader.py` — `SkillLoader` ABC + `FileSystemSkillLoader(root_dir,
+  source_label="local")`: one level deep, sorted, skips non-dirs / missing
+  SKILL.md silently, parse errors and symlink-duplicate realpaths warn+skip
+  (one broken skill never fails the scan). Discovery is metadata-only
+  (progressive disclosure) — bodies/resources are read lazily later.
+- `skills/zip_loader.py` — `ZipSkillLoader(zip_path, max_total_size_bytes=
+  10MB, max_entries=500, allowed_extensions=DEFAULT_ALLOWED_EXTENSIONS)`:
+  context manager; temp dir lives until `close()` (discover() caches, second
+  call returns cached, discover-after-close raises RuntimeError). Extraction
+  checks entries one by one (NEVER `extractall()`): zip-slip raises
+  `ZipSkillError` (whole archive poisoned); symlink entries and disallowed
+  file extensions warn+skip (one bad entry never fails the archive);
+  directory entries bypass the extension allowlist (they have no extension);
+  declared-size sum pre-check + running-bytes guard against forged headers.
+  GOTCHA (lifecycle, hit twice during spec review): `Skill` objects from
+  `discover()` point into the temp dir — after `close()` they raise on read.
+  Callers wanting long-lived skills MUST use `add_skill_from_zip` (below),
+  which materialises vetted skills into `persist_dir` while the temp dir is
+  still alive; the registry never holds a temp-dir-backed skill.
+- `skills/registry.py` — `SkillRegistry` with `add`/`add_many`/`load_from`
+  (NOT constructor-injected loaders): the ONLY acceptance gate. Invariant:
+  `source != "local"` requires a `VetResult` with `clean=True`, else
+  `SkillVetError` — no bypass path exists. First registration wins on name
+  collision (warn+skip, no overwrite). `get`/`load(name)` (`load`, not
+  `invoke` — skills are read text, not executed actions),
+  `to_prompt_catalog()` = sorted `- name: description` lines.
+- `skills/vet.py` — `VetFlag`/`VetResult`, `StaticSkillScanner` (regex
+  categories prompt_injection / auto_exec / credential_exfil /
+  permission_bypass as critical, suspicious_url as warning, hidden Unicode —
+  Tag block U+E0000–E007F, zero-width, C0 controls — as critical),
+  `LLMSkillReviewer(llm, max_tokens=200)` (separate judge client, fixed JSON
+  schema, content redacted via `redact_value` before sending; ANY failure →
+  fail-safe `review_failed` WARNING flag, clean stays True), and
+  `vet_skill(skill, llm_reviewer=None, raise_on_critical=True)` as the single
+  policy entry point. Two iron rules: (1) `clean` is ALWAYS re-derived from
+  parsed `severity` — the model's own `clean` field is never trusted
+  (critical => not clean, whatever the model claims); reviewer output is
+  untrusted data, never interpolated/executed. (2) `raise_on_critical=False`
+  only suppresses the exception — the result is still `clean=False` and the
+  registry still rejects it; the two mechanisms are fully independent.
+  LLM review is skipped when static scan already found a critical (no wasted
+  call). Static scanner intentionally has NO negation analysis — negated
+  warnings ("Never read ~/.ssh/...") false-positive by design; disambiguation
+  is the LLM reviewer's job (documented in the class docstring).
+- `skills/__init__.py` — `add_skill_from_zip(registry, zip_path, persist_dir,
+  llm_reviewer=None, raise_on_critical=True)`: discover → vet each skill →
+  `shutil.copytree` pass-vet skills into `persist_dir/<name>/` (destination
+  resolved through a `Workspace` over persist_dir; existing destination →
+  `FileExistsError`, never silent overwrite) → `registry.add` the PERSISTENT
+  `Skill` (source stays `"zip"`). All temp-dir access happens inside one
+  `with ZipSkillLoader(...)` block.
+- Loading a skill NEVER grants tools/permissions — a skill is instructional
+  text; anything it tells the agent to do still passes `permission_policy`.
+- NOT done (later versions): GitHub/remote loaders (pin by commit SHA,
+  `fetch(...) -> (path, resolved_sha)`), trigger-based auto-injection,
+  persistent installed-state manager, `mcp_tools` frontmatter (rejected on
+  principle — skills must not self-grant tools).
