@@ -10,17 +10,17 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (478 tests: 85 Stage 1+classifier +
+- Run tests: `python -m pytest -q` (607 tests: 85 Stage 1+classifier +
   30 context manager + 20 security + 23 secret + 12 observability +
   16 hooks + 13 testing utils + 8 confirmation UX + 20 git tool +
-  18 workspace + 9 profiles + 127 MCP + 97 skills). NOTE: the
+  18 workspace + 9 profiles + 127 MCP + 97 skills + 129 plugin). NOTE: the
   litellm tests need
   the `[llm]` extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or
   11 tests error.
 - No build step beyond pip install.
 - CI: `.github/workflows/test.yml` — minimal GitHub Actions workflow (push any
   branch + PR -> main, ubuntu-latest, Python 3.11, `pip install -e ".[dev,llm]"`,
-  `pytest -q`). No secrets needed: all 478 tests run with mocked LLM/tool
+  `pytest -q`). No secrets needed: all 607 tests run with mocked LLM/tool
   (MCP tests use fake stdio/SSE servers, no real Unity/GitHub server).
   Deferred on purpose: version matrix, dep cache, coverage, lint, CD.
 
@@ -39,10 +39,11 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   below). Deferred to later versions: richer policies, metrics/aggregation,
   external tracing (OTel/Jaeger).
 - Stage 4 (Extensions): IN PROGRESS — `git/` (GitTool), `workspace/`
-  (Workspace), `profiles/` (presets), `mcp/` (MCP client + server) and
-  `skills/` (skill discovery + vetting) DONE (see "Stage 4 modules", "MCP"
-  and "Skills" below).
-  TODO: `subagent/`, `plugin/`.
+  (Workspace), `profiles/` (presets), `mcp/` (MCP client + server),
+  `skills/` (skill discovery + vetting) and `plugin/` (dynamic loading +
+  static scanning) DONE (see "Stage 4 modules", "MCP", "Skills" and
+  "Plugin" below).
+  TODO: `subagent/`.
 
 ## Key design rules
 - All communication in Vietnamese during task work (per user instruction).
@@ -525,3 +526,90 @@ behind alias `kinetic-classifier-v1` — never leak the real model name.
   `fetch(...) -> (path, resolved_sha)`), trigger-based auto-injection,
   persistent installed-state manager, `mcp_tools` frontmatter (rejected on
   principle — skills must not self-grant tools).
+
+## Plugin (Stage 4 — DONE)
+- `plugin/` = discover + load động các package Python bên ngoài để chúng
+  đăng ký thêm `Tool` vào Kinetic. Đây KHÔNG phải kiến trúc "everything is
+  a plugin": agent loop, `permission_policy`, `EventBus` giữ nguyên —
+  plugin chỉ đóng góp tool, và tool đó chạy qua `permission_policy.check`
+  y hệt tool nội bộ/MCP (có test tích hợp verify cả chiều allow lẫn deny
+  trong `tests/test_plugin_registry.py`).
+- **GIỚI HẠN BẢO MẬT — scanner là TRIPWIRE, KHÔNG phải sandbox.** Plugin là
+  code Python chạy TRỰC TIẾP trong cùng process với Kinetic: khác MCP
+  server (subprocess cách ly — worst case là ngắt kết nối) và khác skill
+  (text trơ — agent vẫn phải "đọc rồi quyết định"), plugin độc hại có thể
+  đọc `os.environ`, mở socket, hay monkey-patch `kinetic_sdk.security` để
+  vô hiệu hoá permission check của mọi request SAU nó mà không cần lừa ai.
+  Python không có sandbox thật in-process, nên static scanner chỉ bắt lỗi
+  vô tình + tấn công không tinh vi và tăng chi phí tấn công — kẻ cố tình
+  né (obfuscation, decode string lúc runtime) vẫn lách được. "Plugin qua
+  scan" TUYỆT ĐỐI không có nghĩa "plugin an toàn"; chỉ load plugin từ nguồn
+  đáng tin cậy ngang credential của chính bạn. Mọi docstring/log message
+  trong module đều phải giữ đúng sự thật này — không được quảng cáo
+  scanner như sandbox.
+- `plugin/manifest.py` — `PluginManifest` (frozen): name (tái dùng
+  `SKILL_NAME_PATTERN` + `MAX_NAME_LENGTH` từ skills), version (optional),
+  entry_point dạng `"module.sub:factory"` (validate bằng regex), source
+  (`"entry_point"` | `"directory"` — do loader gán, plugin không tự xưng),
+  `declared_capabilities: frozenset[str]` (subset của
+  `KNOWN_CAPABILITIES = {"tool","hook"}`; chỉ "tool" được implement, khai
+  "hook" bị `PluginLoadError` rõ ràng), `directory` (bắt buộc khi source =
+  directory, cấm khi source = entry_point). Directory plugin đọc frontmatter
+  `PLUGIN.md` (tái dùng `_split_frontmatter` của skills — cùng 1 parser
+  khỏi lo drift); name phải khớp tên thư mục như skill.
+- `plugin/discovery.py` — gộp 2 nguồn: entry points
+  (`importlib.metadata.entry_points(group="kinetic_sdk.plugins")`,
+  `entry_points_provider` inject được cho test) + directory convention
+  (quét 1 cấp, sorted, dir thiếu PLUGIN.md skip lặng, PLUGIN.md hỏng
+  warn+skip — y hệt FileSystemSkillLoader). Trùng tên giữa 2 nguồn →
+  `PluginManifestError` NGAY ở discover, trước khi import bất cứ thứ gì.
+  Discovery TUYỆT ĐỐI không import code plugin (progressive disclosure, có
+  test bằng side-effect marker).
+- `plugin/scanner.py` — AST-based (KHÔNG regex trên text), visitor resolve
+  alias import (`from subprocess import run as r; r(...)` bị bắt y như
+  `subprocess.run(...)`). Critical: `eval/exec/compile` với input
+  non-literal; `os.system/os.popen` + `subprocess.Popen/run/call/
+  check_call/check_output` gọi trực tiếp (GitTool wrapper KHÔNG bị chặn);
+  truy cập `os.environ` mọi dạng (attribute, `from os import environ`,
+  `getattr(os,"environ")`) — phải qua SecretRegistry; GHI vào namespace
+  `kinetic_sdk.security.*` (assign/delete/setattr — đọc API công khai thì
+  OK); `__import__`/`importlib.import_module` với tên non-constant.
+  Warning: import socket/urllib/http/requests/httpx/aiohttp (network trực
+  tiếp ngoài kênh mcp/); `open()` với path non-literal. Source không parse
+  được = critical "unparseable". Policy nằm ĐÚNG 1 chỗ:
+  `scan_plugin(manifest) -> ScanResult`; loader chỉ đọc `ScanResult.clean`
+  (tái dùng `VetFlag` của skills/vet, `location` = `path:lineno`).
+  GOTCHA: locate module entry_point-source dùng `PathFinder.find_spec`
+  walk từng cấp (`_find_spec_no_import`) — KHÔNG dùng
+  `importlib.util.find_spec` vì hàm đó import parent package = chạy code
+  plugin TRƯỚC scan. Directory source: scan MỌI file `*.py` dưới plugin
+  root, không chỉ entry module.
+- `plugin/loader.py` — `PluginLoader(audit_logger=None)`. Thứ tự cố định:
+  scan (không clean → `PluginVetError`, KHÔNG import) → import → gọi
+  factory → kết quả PHẢI là `list[Tool]` (sai kiểu → `PluginLoadError`,
+  không coerce; factory trả `PluginManifest` thì follow đúng 1 hop —
+  entry-point plugin làm manifest provider) → validate từng phần tử là
+  `Tool`. MỌI exception lúc import/factory bị bọc `PluginLoadError` kèm
+  tên plugin + `__cause__` — 1 plugin hỏng không kéo sập plugin khác.
+  Directory module import dưới tên `kinetic_plugin_<name>.<module>` (không
+  bao giờ shadow package thật trong sys.modules), parent package dựng sẵn
+  để relative import trong plugin chạy được mà không đụng `sys.path`;
+  import lỗi thì dọn sys.modules. Audit MỌI lần load pass lẫn fail qua
+  `AuditLogger.log_event("plugin_load", ...)` (method MỚI thêm vào
+  `security/audit.py` cho non-tool events, field values redacted): plugin,
+  source, outcome (loaded/rejected/failed), toàn bộ scan flags (kể cả
+  warning), danh sách tool đăng ký.
+- `plugin/registry.py` — `PluginRegistry(directory, entry_points_provider,
+  audit_logger, loader, reserved_names)`: `discover()` +
+  `load_all(on_error="skip"|"raise")` (mặc định skip+log; "raise" =
+  fail-fast). Trùng tên TOOL giữa 2 plugin, hoặc plugin tool đụng
+  `reserved_names` (tool nội bộ/MCP) → `PluginLoadError` luôn raise, kể cả
+  skip mode. Lý do REJECT thay vì prefix như `mcp/adapter.py`: tool MCP
+  prefix vì 2 server độc lập hợp lệ khi trùng tên generic; plugin tool
+  chạy in-process dưới cái tên tác giả tự chọn — trùng = lỗi packaging
+  hoặc cố shadow tool khác trong mắt model, đổi tên ngầm sẽ làm model gọi
+  sai.
+- NOT done (later versions): unload/hot-reload, `hook` capability cho
+  plugin (chỗ mở rộng đã để sẵn trong KNOWN_CAPABILITIES), sandbox thật
+  (subprocess/container — hạn chế đã biết trước, ghi rõ trong docs, không
+  phải việc "khắc phục ngay").

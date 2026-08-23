@@ -115,3 +115,75 @@ def skill_zip_entries(
     for relative, content in (resources or {}).items():
         entries[f"{name}/{relative}"] = content
     return entries
+
+
+#: A minimal but fully valid plugin factory module used by plugin tests.
+PLUGIN_CLEAN_MODULE = '''from kinetic_sdk.tool.base import Tool, ToolResult
+
+
+class {class_name}(Tool):
+    name = "{tool_name}"
+    description = "Echoes its input (plugin fixture)."
+    parameters = {{"type": "object", "properties": {{"message": {{"type": "string"}}}}}}
+
+    def execute(self, message: str = "") -> ToolResult:
+        return ToolResult(output=f"{tool_name}:{{message}}")
+
+
+def make_tools():
+    return [{class_name}()]
+'''
+
+
+def write_plugin(
+    base: Path,
+    name: str,
+    *,
+    entry_point: str = "plugin:make_tools",
+    version: str | None = "0.1",
+    capabilities: str = "tool",
+    modules: dict[str, str] | None = None,
+    frontmatter_name: str | None = None,
+) -> Path:
+    """Create a plugin directory (PLUGIN.md + Python files) under *base*.
+
+    ``modules`` maps plugin-relative file paths to source text; when omitted
+    a single clean ``plugin.py`` exposing ``make_tools`` (matching the
+    default *entry_point*) is written. ``frontmatter_name`` overrides the
+    ``name`` written into the frontmatter to exercise the
+    name-must-match-directory rule.
+    """
+    directory = base / name
+    directory.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "---",
+        f"name: {frontmatter_name if frontmatter_name is not None else name}",
+        f"entry_point: {entry_point}",
+        f"capabilities: {capabilities}",
+    ]
+    if version is not None:
+        lines.insert(2, f"version: {version}")
+    lines += ["---", "", f"# {name} plugin fixture"]
+    (directory / "PLUGIN.md").write_text("\n".join(lines), encoding="utf-8")
+    if modules is None:
+        class_name = "".join(part.capitalize() for part in name.split("-")) + "Tool"
+        modules = {
+            "plugin.py": PLUGIN_CLEAN_MODULE.format(
+                class_name=class_name, tool_name=name
+            )
+        }
+    for relative, content in modules.items():
+        target = directory / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    return directory
+
+
+class FakeEntryPoint:
+    """Minimal stand-in for importlib.metadata.EntryPoint (name/value/dist)."""
+
+    def __init__(self, name: str, value: str, version: str | None = None) -> None:
+        self.name = name
+        self.value = value
+        if version is not None:
+            self.dist = type("FakeDist", (), {"version": version})()

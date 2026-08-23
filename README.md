@@ -22,8 +22,9 @@ rewriting the agent loop.
   are still future work.
 - **Stage 4 — Extensions: in progress.** Git integration (`GitTool`),
   workspace path safety (`Workspace`), agent profiles (dev/production
-  presets), and full MCP support (client + server) are implemented. Subagents,
-  plugins, and skills are not implemented yet.
+  presets), full MCP support (client + server), skills (discovery + vetting),
+  and plugins (dynamic loading with static scanning) are implemented. Only
+  subagents are not implemented yet.
 
 ## Module map
 
@@ -47,12 +48,20 @@ rewriting the agent loop.
   policy + audit log as the internal agent loop).
 - `kinetic_sdk/observability/` — structured event loggers and `RunTrace`
   helpers for summarizing one agent run.
+- `kinetic_sdk/plugin/` — dynamic loading of external Python packages that
+  register extra tools: metadata-only discovery (entry points + PLUGIN.md
+  directory convention), an AST-based static scanner (a tripwire, NOT a
+  sandbox — see the package docstring), scan-before-import loading with full
+  audit logging, and collision-rejecting tool merge.
 - `kinetic_sdk/profiles/` — ready-made agent configuration presets
   (`dev_profile`, `production_profile`).
 - `kinetic_sdk/secret/` — secret value wrapper, providers, and registry for
   safe credential resolution.
 - `kinetic_sdk/security/` — permission policies, audit loggers, and recursive
   secret redaction.
+- `kinetic_sdk/skills/` — Markdown skill packages: metadata-first discovery,
+  zip loading with extraction guards, and static + LLM-assisted vetting for
+  untrusted sources.
 - `kinetic_sdk/testing/` — public test utilities: `MockLLMClient`, `MockTool`,
   and trace assertions.
 - `kinetic_sdk/tool/` — abstract tool interface and `ToolResult` dataclass.
@@ -154,6 +163,8 @@ before being persisted or published.
 - Add richer policy presets for filesystem, terminal, git, and network tools.
 - Add metrics aggregation and external tracing exporters such as OpenTelemetry
   or Jaeger.
-- Add the remaining Stage 4 extension points: subagents, plugins, and skills.
+- Add the remaining Stage 4 extension point: subagents.
 - MCP follow-ups: tool-list caching, server-initiated requests (sampling),
   and resources/prompts capabilities.
+- Plugin follow-ups: `hook` capability, unload/hot-reload, and (research
+  only — never a promise) real isolation such as subprocess-hosted plugins.

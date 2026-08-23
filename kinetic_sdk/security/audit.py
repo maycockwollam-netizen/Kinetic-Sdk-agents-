@@ -85,6 +85,23 @@ class AuditLogger:
             reason=reason,
         )
 
+    def log_event(
+        self,
+        event: str,
+        subject: str,
+        timestamp: datetime,
+        **fields: Any,
+    ) -> dict[str, Any]:
+        """Record a non-tool-call audit event (e.g. a plugin load).
+
+        The plugin loader and similar subsystems emit their lifecycle
+        events through here so everything lands in the same audit trail as
+        tool calls. ``subject`` fills the ``tool_name`` field of the entry
+        (kept for shape compatibility); all field values are redacted.
+        """
+        safe_fields = {key: redact_value(value) for key, value in fields.items()}
+        return self._entry(event, subject, timestamp, **safe_fields)
+
     def _entry(self, event: str, tool_name: str, timestamp: datetime, **fields: Any) -> dict[str, Any]:
         entry: dict[str, Any] = {
             "id": uuid.uuid4().hex,
