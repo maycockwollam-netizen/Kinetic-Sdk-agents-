@@ -20,11 +20,12 @@ rewriting the agent loop.
   lifecycle hooks, public testing utilities, and hook-based confirmation UX
   are implemented. Richer policy sets, metrics, and external tracing exporters
   are still future work.
-- **Stage 4 — Extensions: in progress.** Git integration (`GitTool`),
-  workspace path safety (`Workspace`), agent profiles (dev/production
-  presets), full MCP support (client + server), skills (discovery + vetting),
-  and plugins (dynamic loading with static scanning) are implemented. Only
-  subagents are not implemented yet.
+- **Stage 4 — Extensions: done.** Git integration (`GitTool`), workspace
+  path safety (`Workspace`), agent profiles (dev/production presets), full
+  MCP support (client + server), skills (discovery + vetting), plugins
+  (dynamic loading with static scanning), and subagents (delegation with
+  inherited permissions plus budget/circuit-breaker guardrails) are all
+  implemented.
 
 ## Module map
 
@@ -62,6 +63,10 @@ rewriting the agent loop.
 - `kinetic_sdk/skills/` — Markdown skill packages: metadata-first discovery,
   zip loading with extraction guards, and static + LLM-assisted vetting for
   untrusted sources.
+- `kinetic_sdk/subagent/` — sub-agent delegation: `DelegateTool` spawns
+  sub-agents that inherit the parent's full tool set and permission policy
+  (each with its own system prompt and fresh context), guarded by a shared
+  tree-wide tool-call budget and per-agent repetition circuit breakers.
 - `kinetic_sdk/testing/` — public test utilities: `MockLLMClient`, `MockTool`,
   and trace assertions.
 - `kinetic_sdk/tool/` — abstract tool interface and `ToolResult` dataclass.
@@ -163,7 +168,8 @@ before being persisted or published.
 - Add richer policy presets for filesystem, terminal, git, and network tools.
 - Add metrics aggregation and external tracing exporters such as OpenTelemetry
   or Jaeger.
-- Add the remaining Stage 4 extension point: subagents.
+- Subagent follow-ups: parallel sub-agent execution (the shared budget is
+  already thread-safe), optional tool-narrowing overrides on `SubagentSpec`.
 - MCP follow-ups: tool-list caching, server-initiated requests (sampling),
   and resources/prompts capabilities.
 - Plugin follow-ups: `hook` capability, unload/hot-reload, and (research

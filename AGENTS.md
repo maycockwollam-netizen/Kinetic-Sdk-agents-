@@ -10,17 +10,18 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (607 tests: 85 Stage 1+classifier +
+- Run tests: `python -m pytest -q` (678 tests: 85 Stage 1+classifier +
   30 context manager + 20 security + 23 secret + 12 observability +
   16 hooks + 13 testing utils + 8 confirmation UX + 20 git tool +
-  18 workspace + 9 profiles + 127 MCP + 97 skills + 129 plugin). NOTE: the
+  18 workspace + 9 profiles + 127 MCP + 97 skills + 129 plugin +
+  71 subagent). NOTE: the
   litellm tests need
   the `[llm]` extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or
   11 tests error.
 - No build step beyond pip install.
 - CI: `.github/workflows/test.yml` — minimal GitHub Actions workflow (push any
   branch + PR -> main, ubuntu-latest, Python 3.11, `pip install -e ".[dev,llm]"`,
-  `pytest -q`). No secrets needed: all 607 tests run with mocked LLM/tool
+  `pytest -q`). No secrets needed: all 678 tests run with mocked LLM/tool
   (MCP tests use fake stdio/SSE servers, no real Unity/GitHub server).
   Deferred on purpose: version matrix, dep cache, coverage, lint, CD.
 
@@ -38,12 +39,12 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   Confirmation UX via `ON_PERMISSION_CHECK` hooks (see "Confirmation UX"
   below). Deferred to later versions: richer policies, metrics/aggregation,
   external tracing (OTel/Jaeger).
-- Stage 4 (Extensions): IN PROGRESS — `git/` (GitTool), `workspace/`
-  (Workspace), `profiles/` (presets), `mcp/` (MCP client + server),
-  `skills/` (skill discovery + vetting) and `plugin/` (dynamic loading +
-  static scanning) DONE (see "Stage 4 modules", "MCP", "Skills" and
-  "Plugin" below).
-  TODO: `subagent/`.
+- Stage 4 (Extensions): DONE — toàn bộ 7 module: `git/` (GitTool),
+  `workspace/` (Workspace), `profiles/` (presets), `mcp/` (MCP client +
+  server), `skills/` (skill discovery + vetting), `plugin/` (dynamic
+  loading + static scanning) và `subagent/` (delegation + lưới an toàn chi
+  phí) — xem "Stage 4 modules", "MCP", "Skills", "Plugin" và "Subagent"
+  bên dưới.
 
 ## Key design rules
 - All communication in Vietnamese during task work (per user instruction).
@@ -613,3 +614,85 @@ behind alias `kinetic-classifier-v1` — never leak the real model name.
   plugin (chỗ mở rộng đã để sẵn trong KNOWN_CAPABILITIES), sandbox thật
   (subprocess/container — hạn chế đã biết trước, ghi rõ trong docs, không
   phải việc "khắc phục ngay").
+
+## Subagent (Stage 4 — DONE)
+- `subagent/` = agent TỰ SINH agent khác dùng chính tool/credential của
+  mình — module duy nhất của Stage 4 có rủi ro runaway recursion đốt tiền
+  API thật và rò rỉ output trung gian nhạy cảm ngược vào context cha.
+- **3 QUYẾT ĐỊNH THIẾT KẾ ĐÃ CHỐT (KHÔNG phải thiếu sót, đừng "sửa"):**
+  1. **Kế thừa toàn bộ, không thu hẹp.** Sub-agent nhận NGUYÊN tool list +
+     CÙNG object `permission_policy` của cha (giống Claude Agent SDK). Thu
+     hẹp cứng sẽ phá pattern hợp lệ "controller hẹp → executor cần tool
+     rộng hơn để làm việc thật" (đã có tiền lệ lỗi thật trên OpenCode khi
+     làm ngược lại). Điểm khác DUY NHẤT so với "sao chép y hệt cha": mỗi
+     sub-agent có `system_prompt` RIÊNG — bắt buộc non-empty trong
+     `SubagentSpec`, không bao giờ dùng lại system prompt của cha.
+  2. **KHÔNG giới hạn cứng số tầng lồng nhau** (giống OpenHands):
+     delegation là 1 tool bình thường (`DelegateTool`), không đặc biệt hoá
+     số tầng trong `Agent.run()`.
+  3. **Thay giới hạn tầng bằng 2 lưới an toàn theo CHI PHÍ/HÀNH VI**
+     (mô hình oh-my-opencode): `SpawnBudget` — 1 instance CHIA SẺ cho toàn
+     cây (thread-safe bằng lock, sẵn sàng cho parallel sau này), mọi tool
+     call của mọi agent trong cây đều trừ chung 1 ngân sách (default 4000),
+     hết → `BudgetExceededError`; và `RepetitionCircuitBreaker` — RIÊNG
+     từng agent (không cộng dồn cây), cùng (tool_name + arguments serialize
+     ổn định `json.dumps(sort_keys=True, default=str)`) quá N lần liên
+     tiếp (default 20) → `RepetitionLimitError`. Đổi tool hoặc đổi args là
+     reset bộ đếm.
+- `subagent/manifest.py` — `SubagentSpec` frozen dataclass (name theo đúng
+  `SKILL_NAME_PATTERN`/`MAX_NAME_LENGTH` của skills, `system_prompt` bắt
+  buộc, `description` cho cha quyết định khi nào delegate, `model` optional
+  để dùng model rẻ hơn). `model` khác model cha CHỈ có tác dụng khi caller
+  truyền `llm_factory(model) -> LLMClient` — SDK không tự biết cách dựng
+  provider client generic; thiếu factory → `SubagentError`, không lặng lẽ
+  chạy model cha.
+- `subagent/delegation.py` — `spawn_subagent(parent, spec, budget)` trả về
+  1 `Agent` MỚI: kế thừa tools/policy/audit_logger/event_bus/classifier/
+  context_manager/hooks từ cha, `ConversationState` MỚI HOÀN TOÀN chỉ với
+  `spec.system_prompt` (kênh cha→con DUY NHẤT là `task_prompt` lúc run;
+  kênh con→cha DUY NHẤT là `DelegationResult.final_message` — transcript
+  trung gian không bao giờ rò ngược). `run_subagent(...)` = spawn + run +
+  trả `DelegationResult(final_message, agent_id)`, để lỗi guardrail
+  propagate cho caller.
+- **Cơ chế enforcement — `_GuardedLLMClient`, KHÔNG sửa `Agent.run()`:**
+  LLM client của sub-agent được bọc 1 lớp guard charge MỌI tool call model
+  REQUEST (kể cả call sau đó bị policy deny — turn LLM đã tốn tiền rồi)
+  vào budget + breaker TRƯỚC khi thực thi. Raise xảy ra trong `chat()` —
+  đường `_call_llm` mà `Agent.run` RE-RAISE chứ không nuốt (khác hook bị
+  `HookRegistry` catch, khác exception trong `tool.execute` bị
+  `_execute_one` thành `ToolResult`). Đây là lý do guardrail fail-fast
+  thay vì chờ `max_iterations`. `DelegateTool.execute` bắt
+  `BudgetExceededError`/`RepetitionLimitError`/mọi Exception và map thành
+  `ToolResult(error=...)` — loop của cha không bao giờ sập.
+- GOTCHA (đã bắt gặp khi implement): sub-agent spawn tiếp sub-sub-agent thì
+  `parent_agent.llm` đã LÀ `_GuardedLLMClient` — phải UNWRAP (`base.inner`)
+  trước khi wrap guard mới, nếu không mỗi tool call bị charge budget 2 lần
+  và breaker của cha đếm lẫn call của con (phá nguyên tắc per-agent).
+  `spawn_subagent` đã xử lý; đừng wrap guard chồng lớp ở chỗ khác.
+- `DelegateTool` (name `"delegate"`): registry `dict[str, SubagentSpec]`
+  trong constructor, PHẢI `bind(agent)` sau khi dựng agent (tool cần agent,
+  agent cần tools — gài 2 bước). Khi spawn, mọi DelegateTool trong tool
+  list cha được CLONE (`_clone_for(budget)`) + bind vào sub-agent mới,
+  dùng CHUNG spec registry và CHUNG budget instance — đây là cơ chế khiến
+  cây nhiều tầng chia sẻ 1 ngân sách. Chính DelegateTool vẫn đi qua
+  `permission_policy.check` như mọi tool (deny `"delegate"` trong
+  AllowListPolicy = không sub-agent nào spawn được — có test).
+- Root agent (task gốc) KHÔNG được guard — tool call của chính root không
+  trừ budget (budget canh "cây sub-agent phát sinh", root nằm TRÊN cây).
+  Chỉ các agent do `spawn_subagent` tạo ra mới có guarded client.
+- Audit: `subagent_spawn` (parent_agent_id + agent_id — mint qua
+  `agent_id_for`, WeakKeyDictionary có lock) và `subagent_finished`
+  (outcome: completed | budget_exceeded | repetition_limit | error) đều qua
+  `AuditLogger.log_event` trên audit logger CHIA SẺ của cả cây → dựng lại
+  được cây cha-con sau này. Final message của sub-agent bị
+  `redact_secrets` trước khi vào context cha (chống rò rỉ bí mật/PII).
+- Hạn chế đã biết (sequential execution bản này): runaway đệ quy với
+  budget mặc định 4000 sẽ chạm giới hạn đệ quy Python (~1000 frames) trước
+  khi hết budget — `RecursionError` vẫn được map thành `ToolResult` error,
+  budget vẫn chặn tổng số spawn, không crash. Test runaway dùng budget nhỏ
+  (30) để `BudgetExceededError` bắn trước. `chat_stream` của guard delegate
+  thẳng không charge (agent loop chỉ dùng `chat()`).
+- NOT done (later versions): chạy sub-agent song song thật (budget đã
+  thread-safe sẵn), field tuỳ chọn trong `SubagentSpec` để thu hẹp tool khi
+  spawn (chỗ mở rộng đã để, bản này luôn kế thừa toàn bộ), giới hạn tầng
+  (đã quyết định KHÔNG làm — thay bằng budget + circuit breaker).

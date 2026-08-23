@@ -12,6 +12,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from kinetic_sdk.llm.client import LLMClient
 from kinetic_sdk.testing.mocks import (
     MockLLMClient,
     text_response,
@@ -21,6 +22,39 @@ from kinetic_sdk.tool.base import Tool, ToolResult
 
 #: Backwards-compatible alias: the SDK's own tests predate ``testing/``.
 MockLLM = MockLLMClient
+
+
+class LoopLLM(LLMClient):
+    """An LLM that requests the SAME tool call on every turn, forever.
+
+    Runaway fixture for the subagent tests: a model that never stops
+    calling one tool with identical arguments is exactly what the budget /
+    circuit-breaker guardrails must contain. ``calls`` counts total chat
+    invocations (shared across every agent inheriting this instance).
+    """
+
+    def __init__(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        model: str = "loop-model",
+    ) -> None:
+        self.model = model
+        self.tool_name = tool_name
+        self.arguments = dict(arguments or {})
+        self.calls = 0
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        system: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        self.calls += 1
+        return tool_response(
+            f"{self.tool_name}-{self.calls}", self.tool_name, dict(self.arguments)
+        )
 
 
 class EchoTool(Tool):
