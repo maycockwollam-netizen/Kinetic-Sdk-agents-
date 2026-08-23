@@ -42,7 +42,7 @@ import uuid
 import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.conversation.state import ConversationState

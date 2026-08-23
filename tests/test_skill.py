@@ -6,12 +6,11 @@ All fixtures live in pytest's tmp_path — no real system files are touched.
 from __future__ import annotations
 
 import pytest
-from tests._helpers import write_skill
 
 from kinetic_sdk.skills.exceptions import SkillParseError
 from kinetic_sdk.skills.skill import MAX_DESCRIPTION_LENGTH, Skill
 from kinetic_sdk.workspace.manager import PathTraversalError
-
+from tests._helpers import write_skill
 
 # --- from_directory / frontmatter parsing ------------------------------------
 

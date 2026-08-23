@@ -22,7 +22,7 @@ budget instance) — that is how multi-level trees share one budget.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Iterable, Mapping
 
 from kinetic_sdk.security.redact import redact_secrets
 from kinetic_sdk.subagent.budget import (

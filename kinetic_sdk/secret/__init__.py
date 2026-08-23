@@ -7,7 +7,11 @@ distinct from :mod:`kinetic_sdk.security.redact`, which only scrubs secrets
 out of text about to be logged.
 """
 
-from kinetic_sdk.secret.provider import DictSecretProvider, EnvSecretProvider, SecretProvider
+from kinetic_sdk.secret.provider import (
+    DictSecretProvider,
+    EnvSecretProvider,
+    SecretProvider,
+)
 from kinetic_sdk.secret.registry import SecretNotFoundError, SecretRegistry
 from kinetic_sdk.secret.value import SecretValue
 

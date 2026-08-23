@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
-from kinetic_sdk.event.bus import EventBus, Event
+from kinetic_sdk.event.bus import Event, EventBus
 
 
 def test_sync_subscribe_and_publish():
@@ -106,3 +104,26 @@ def test_event_source_is_preserved():
     bus.subscribe("x", seen.append)
     bus.publish(Event(type="x", payload={}, source="agent"))
     assert seen[0].source == "agent"
+
+
+def test_coroutine_subscribe_warns(caplog):
+    """Registering a coroutine must warn: sync publish() would drop it."""
+    bus = EventBus()
+
+    async def listener(event: Event) -> None:
+        return None
+
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="kinetic_sdk.event.bus"):
+        bus.subscribe("x", listener)
+    assert any("Coroutine subscriber" in r.message for r in caplog.records)
+
+
+def test_sync_subscribe_does_not_warn(caplog):
+    bus = EventBus()
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="kinetic_sdk.event.bus"):
+        bus.subscribe("x", lambda event: None)
+    assert not caplog.records

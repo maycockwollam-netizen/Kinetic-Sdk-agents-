@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from kinetic_sdk.plugin.exceptions import PluginManifestError
+
 # The skills frontmatter parser is shared within the SDK on purpose: plugin
 # manifests use the exact same flat key: value format as SKILL.md, and
 # duplicating the parser would let the two drift apart.
@@ -35,8 +37,6 @@ from kinetic_sdk.skills.skill import (
     SKILL_NAME_PATTERN,
     _split_frontmatter,
 )
-
-from kinetic_sdk.plugin.exceptions import PluginManifestError
 
 #: Canonical file every plugin directory must contain.
 PLUGIN_FILE_NAME = "PLUGIN.md"

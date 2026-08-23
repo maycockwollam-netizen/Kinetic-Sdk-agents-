@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import pytest
-from tests._helpers import write_skill
 
 from kinetic_sdk.skills.exceptions import SkillNotFoundError, SkillVetError
 from kinetic_sdk.skills.loader import FileSystemSkillLoader
 from kinetic_sdk.skills.registry import SkillRegistry
 from kinetic_sdk.skills.skill import Skill
 from kinetic_sdk.skills.vet import VetFlag, VetResult
+from tests._helpers import write_skill
 
 
 def _local_skill(tmp_path, name: str, description: str = "A demo skill.") -> Skill:

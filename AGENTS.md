@@ -10,20 +10,19 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
-- Run tests: `python -m pytest -q` (678 tests: 85 Stage 1+classifier +
-  30 context manager + 20 security + 23 secret + 12 observability +
-  16 hooks + 13 testing utils + 8 confirmation UX + 20 git tool +
-  18 workspace + 9 profiles + 127 MCP + 97 skills + 129 plugin +
-  71 subagent). NOTE: the
-  litellm tests need
-  the `[llm]` extra — install BOTH extras (`pip install -e ".[dev,llm]"`) or
-  11 tests error.
+- Install (real tokenizer, optional): `pip install -e ".[tokens]"` (tiktoken)
+- Run tests: `python -m pytest -q` (775 tests). NOTE: the litellm tests need
+  the `[llm]` extra — install BOTH (`pip install -e ".[dev,llm]"`) or 11
+  tests error. The tiktoken tests `importorskip` without `[tokens]`.
+- Lint: `ruff check kinetic_sdk tests` — rule set DELIBERATELY narrow
+  (`F`, `E9`, `I` only, configured in `pyproject.toml`); broader style rules
+  are a future decision, do not silently expand.
 - No build step beyond pip install.
-- CI: `.github/workflows/test.yml` — minimal GitHub Actions workflow (push any
-  branch + PR -> main, ubuntu-latest, Python 3.11, `pip install -e ".[dev,llm]"`,
-  `pytest -q`). No secrets needed: all 678 tests run with mocked LLM/tool
+- CI: `.github/workflows/test.yml` — two jobs: `lint` (ruff) and `test`
+  (matrix Python 3.10/3.11/3.12, `pip install -e ".[dev,llm,tokens]"`,
+  `pytest -q`). No secrets needed: all tests run with mocked LLM/tool
   (MCP tests use fake stdio/SSE servers, no real Unity/GitHub server).
-  Deferred on purpose: version matrix, dep cache, coverage, lint, CD.
+  Deferred on purpose: dep cache, coverage gate, CD.
 
 ## Stage status
 - Stage 1 (Core): DONE — `tool`, `event`, `llm`, `conversation`, `agent` loop.
@@ -696,3 +695,119 @@ behind alias `kinetic-classifier-v1` — never leak the real model name.
   thread-safe sẵn), field tuỳ chọn trong `SubagentSpec` để thu hẹp tool khi
   spawn (chỗ mở rộng đã để, bản này luôn kế thừa toàn bộ), giới hạn tầng
   (đã quyết định KHÔNG làm — thay bằng budget + circuit breaker).
+
+## Hardening pass (2026-08, post-Stage-4 — DONE)
+
+Đợt tăng cường độ chịu lỗi runtime sau khi review toàn SDK. Mọi quyết định
+dưới đây là ĐÃ CHỐT, đừng "sửa" ngược trừ khi có lý do mới.
+
+### Correctness fixes (bug thật, đã có regression test)
+- **Compaction orphan `tool_result` (parallel tool calls).** Bug gốc:
+  `_tail_start` neo tail vào "1 message trước tool_result thứ N-từ-cuối" —
+  với parallel calls (1 assistant chứa N `tool_use` + N message
+  `tool_result`), anchor rơi GIỮA nhóm → tail giữ result mồ côi → provider
+  400 ở call kế tiếp. Fix: `_expand_to_group_boundary` lùi `tail_start` cho
+  tới khi mọi `tool_result` trong tail có `tool_use` tương ứng; không resolve
+  được (history đã corrupt từ trước) thì trả 0 → compact no-op (an toàn,
+  KHÔNG bao giờ xuất history invalid). Head (message[0]) chỉ được giữ khi
+  không chứa tool block. Fixture test cũ (`_long_conversation`) từng build
+  assistant text-trơn + result rời = history vốn invalid — đã sửa fixture
+  thành dạng thật (assistant chứa `tool_use` blocks).
+- **`chars_per_token` constructor param từng được lưu nhưng KHÔNG bao giờ
+  dùng** (ABC `estimate_state_tokens` gọi heuristic default 4). Giờ estimation
+  đi qua `self._count_tokens` per-manager.
+
+### Resilience mới
+- **LLM retry/timeout** (`LiteLLMClient`): `timeout` forward sang
+  `litellm.completion`; `max_retries=2` mặc định (0 = hành vi cũ 1 phát 1),
+  backoff `retry_base_delay * 2^k` cap `retry_max_delay` + jitter 25%.
+  `_is_retryable`: status 408/409/429/5xx hoặc tên class chứa
+  timeout/connection/ratelimit/unavailable; 4xx khác raise ngay (retry chỉ
+  đốt quota). `chat_stream` chỉ retry lúc TẠO stream, không retry giữa
+  chừng (tránh duplicate text). `LiteLLMClassifier` dùng chung client nên
+  hưởng retry tự động.
+- **Tool timeout** (`Agent(tool_timeout=...)`): `tool.execute` chạy trên
+  thread pool dùng chung (`_get_executor`, max_workers=8); hết giờ → error
+  ToolResult, loop sống tiếp. Python không kill được thread → timed-out call
+  CHẠY NGẦM tiếp (ghi rõ trong docstring); tool bọc subprocess vẫn phải tự
+  có timeout thật (GitTool/TerminalTool đã có).
+- **EventBus**: `subscribe()` giờ WARN khi đăng ký coroutine function
+  (sync `publish()` skip coroutine lặng lẽ — trước đây user không biết tại
+  sao listener không chạy).
+
+### Context & routing
+- **Token counter cắm được**: `SimpleTruncateContextManager(token_counter=...)`
+  + `context/tokens.py` `TiktokenCounter` (extra `[tokens]`, lazy import,
+  fallback heuristic khi encode lỗi). `SummarizingContextManager` nhận
+  `token_counter` qua super.
+- **Cắt nội dung tool result lớn**: `max_tool_result_chars` (None = tắt,
+  min 100). Kept `tool_result` vượt ngưỡng → head 2/3 + marker
+  `"[... N ký tự ở giữa đã được cắt bớt ...]"` + tail 1/3. Chạy CẢ KHI
+  `removed <= 0` — đây là fix cho "tail được bảo vệ nhưng tự nó đã tràn
+  window" (5 build log khổng lồ) mà elision không cứu được.
+- **Sticky MAX**: `_sticky_max` — run nào classify MAX (hoặc escalate) thì
+  các run SAU trong cùng conversation không bao giờ rớt về FLASH (trước đây
+  `_classify_and_route` chạy lại mỗi run và có thể hạ MAX→FLASH, tự thu nhỏ
+  iteration budget giữa chừng). Fallback do classifier exception KHÔNG set
+  sticky (lỗi tạm thời không được ghim MAX mãi). Event `agent.classified`
+  thêm field `applied_mode` khi override.
+
+### Agent loop mới
+- **Persistence**: `conversation/store.py` — `ConversationStore` ABC +
+  `JsonFileConversationStore` (atomic write tmp+rename, `SCHEMA_VERSION=1`,
+  file corrupt/sai version → `ConversationStoreError`, KHÔNG lặng lẽ start
+  fresh). `Agent(state_store=...)`: explicit `state` vẫn thắng; không thì
+  load lúc init; `_persist_state()` sau MỖI TURN nhưng CHỈ ở boundary
+  replay-valid (assistant text turn hoặc ngay sau tool results) — persist
+  giữa chừng sẽ lưu history dangling `tool_use`, resume xong provider 400.
+  Store hỏng → log warning + event `agent.state_persist_failed`, run không
+  chết. File lưu RAW history (có thể chứa credential trong tool output) —
+  không redact, docstring cảnh báo rõ.
+- **Cancellation**: `agent.cancel()` (threading.Event, gọi từ thread khác
+  được), check ở đầu mỗi iteration + ngay sau BEFORE_LLM_CALL hooks (hook
+  cancel phải chặn được LLM call sắp xảy ra) + giữa tool batch. Hủy giữa
+  batch: call còn lại KHÔNG execute nhưng vẫn nhận error `tool_result`
+  ("skipped: run cancelled") để history không dangling. Emit
+  `agent.cancelled`, `run()` trả final text tốt nhất hiện có (có thể rỗng),
+  KHÔNG raise. Flag clear ở đầu `run()` mới. Tool đang chạy KHÔNG bị preempt.
+- **Schema validation**: `tool/validation.py` `validate_tool_input(schema,
+  params) -> list[str]` — subset JSON Schema (type/properties/required/
+  items/enum/additionalProperties; KHÔNG $ref/combinators, keyword lạ bỏ
+  qua). Strict ở top-level: param lạ bị reject trừ khi schema khai
+  `additionalProperties: true` hoặc không khai `properties` (vì extra kwarg
+  sẽ TypeError trong `execute(**params)` — giờ thành error message rõ ràng
+  cho model tự sửa). bool KHÔNG phải integer. Wire trong `_prepare_call`
+  (sau policy, trước execute), tắt bằng `Agent(validate_tool_inputs=False)`.
+- **Parallel tool execution (OPT-IN)**: `Agent(parallel_tool_execution=True)`
+  — `_execute_one` đã tách 3 phase: `_prepare_call` (hooks/policy/confirm/
+  validation — main thread, tuần tự), execute (pool), `_finalize_call`
+  (audit + AFTER hooks — main thread, THEO THỨ TỰ GỐC của model). Mặc định
+  False = tuần tự như cũ. Tool custom phải thread-safe mới được bật.
+  KHÔNG gọi `_run_tool` trong parallel path (nested pool → deadlock) —
+  submit `tool.execute` trực tiếp, timeout qua `future.result(timeout)`.
+
+### Bộ tool chuẩn (mới)
+- `terminal/` — `TerminalTool(workspace=None, timeout=120, max_timeout=600,
+  max_output_chars=30_000, env=None)`: `bash -c`, process-group kill khi
+  timeout (start_new_session + killpg SIGKILL), stdout+stderr gộp, cắt
+  head/tail. `env=None` inherit env của process (module KHÔNG đọc os.environ
+  — cùng rule với git/mcp); dict thì REPLACE. KHÔNG tự chặn lệnh nguy hiểm
+  (đó là việc của policy); ship sẵn `REQUIRE_CONFIRMATION_PATTERNS`
+  (rm -rf/sudo/mkfs/dd/chmod -R/...) cắm vào AllowListPolicy như GitTool.
+- `files/` — `FileTool(workspace, max_view_lines=2000)`: actions
+  view/create/str_replace(unique match bắt buộc)/insert/undo_edit (in-memory
+  1-level, redo-able). MỌI path qua `Workspace.resolve` — `../`, absolute
+  ngoài root, symlink escape đều bị chặn trước khi đụng disk. Workspace
+  BẮT BUỘC (file tool không biên giới = whole-filesystem tool, từ chối).
+
+### CI/DX
+- Ruff lint (`F,E9,I`) trong `pyproject.toml` + CI job riêng; test matrix
+  3.10/3.11/3.12; CI install `.[dev,llm,tokens]`.
+- GOTCHA ruff: `--select F --fix` xóa re-export trong `tests/_helpers.py`
+  (F401 false positive) → tests sập hàng loạt. Re-export viết dạng
+  `MockLLM = _mocks.MockLLMClient` (alias assignment) — ruff không đụng.
+- NOT done (later): async agent loop (AsyncLLMClient vẫn interface-only),
+  streaming vào loop (client có `chat_stream`, loop chưa dùng), cost/token
+  budget cho root run, metrics/OTel, policy theo resource, MCP
+  resources/prompts + reconnect, integration test với LLM thật (toàn mock
+  hiện tại), hot-reload plugin.

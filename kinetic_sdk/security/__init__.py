@@ -29,7 +29,11 @@ auto-approver::
     agent = Agent(llm=..., tools=[...], hooks=hooks)
 """
 
-from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger, JSONLAuditLogger
+from kinetic_sdk.security.audit import (
+    AuditLogger,
+    InMemoryAuditLogger,
+    JSONLAuditLogger,
+)
 from kinetic_sdk.security.policy import (
     AllowListPolicy,
     PermissionDecision,

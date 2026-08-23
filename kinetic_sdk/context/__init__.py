@@ -9,6 +9,7 @@ from kinetic_sdk.context.manager import (
     SummarizingContextManager,
     estimate_tokens,
 )
+from kinetic_sdk.context.tokens import TiktokenCounter
 
 __all__ = [
     "ContextManager",
@@ -17,5 +18,6 @@ __all__ = [
     "NoopContextManager",
     "SimpleTruncateContextManager",
     "SummarizingContextManager",
+    "TiktokenCounter",
     "estimate_tokens",
 ]

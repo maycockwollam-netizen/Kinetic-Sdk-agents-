@@ -10,7 +10,6 @@ import pytest
 
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.agent.modes import AgentMode
-from kinetic_sdk.llm.client import LLMResponse
 from kinetic_sdk.observability import InMemoryObservabilityLogger, RunTrace
 from kinetic_sdk.security import AllowListPolicy, PermissivePolicy
 from kinetic_sdk.testing import (
@@ -23,7 +22,6 @@ from kinetic_sdk.testing import (
     tool_response,
 )
 from kinetic_sdk.tool.base import ToolResult
-
 
 # --- MockLLMClient ---------------------------------------------------------
 

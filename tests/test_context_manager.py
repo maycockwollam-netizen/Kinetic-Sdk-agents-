@@ -60,11 +60,23 @@ def _tool_result(call_id: str, output: str) -> dict:
 
 
 def _long_conversation(turns: int = 8, filler: int = 200) -> ConversationState:
-    """user request, then ``turns`` rounds of assistant + tool_result."""
+    """user request, then ``turns`` rounds of assistant + tool_result.
+
+    The assistant turns carry real ``tool_use`` blocks — the exact shape the
+    agent loop stores — so every tool_result has a matching tool_use.
+    """
     state = ConversationState(system_prompt="You are a coding agent.")
     state.messages.append(_user("Fix the flaky test in the payments module."))
     for i in range(turns):
-        state.messages.append(_assistant(f"step {i}: " + "x" * filler))
+        state.messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": f"step {i}: " + "x" * filler},
+                    {"type": "tool_use", "id": f"call_{i}", "name": "t", "input": {}},
+                ],
+            }
+        )
         state.messages.append(_tool_result(f"call_{i}", "result " + "y" * filler))
     return state
 
@@ -190,6 +202,159 @@ def test_compact_when_everything_is_protected_returns_copy():
     assert compacted is not state
 
 
+# --- parallel tool-call group integrity (regression: orphaned tool_result) --
+
+
+def _parallel_group(prefix: str, n: int, output_filler: int = 60) -> list[dict]:
+    """ONE assistant message with N tool_use blocks + N tool_result messages.
+
+    This is the exact shape the agent loop stores when the model issues
+    parallel tool calls in a single turn.
+    """
+    msgs = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": f"{prefix}{i}", "name": "t", "input": {}}
+                for i in range(n)
+            ],
+        }
+    ]
+    msgs.extend(
+        _tool_result(f"{prefix}{i}", f"out-{prefix}{i} " + "y" * output_filler)
+        for i in range(n)
+    )
+    return msgs
+
+
+def _assert_tool_block_integrity(messages: list[dict]) -> None:
+    """Every tool_result must follow its tool_use; every tool_use must have
+    its result (providers reject histories violating either)."""
+    seen_uses: set[str] = set()
+    open_uses: set[str] = set()
+    for msg in messages:
+        content = msg["content"]
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                seen_uses.add(block["id"])
+                open_uses.add(block["id"])
+            elif block.get("type") == "tool_result":
+                assert block["tool_use_id"] in seen_uses, (
+                    f"orphaned tool_result {block['tool_use_id']}"
+                )
+                open_uses.discard(block["tool_use_id"])
+    assert not open_uses, f"dangling tool_use without result: {open_uses}"
+
+
+def test_compact_never_orphans_parallel_tool_results():
+    """Regression: the old anchor could land mid-parallel-group, keeping
+    tool_results whose tool_use was elided -> provider rejects the next call."""
+    state = ConversationState(system_prompt="sys")
+    state.messages.append(_user("task gốc"))
+    for prefix, n in (("A", 2), ("B", 3), ("C", 2), ("D", 2)):
+        state.messages.extend(_parallel_group(prefix, n))
+
+    manager = SimpleTruncateContextManager(keep_last_tool_results=5)
+    compacted = manager.compact(state)
+
+    _assert_tool_block_integrity(compacted.messages)
+    # Compaction still happened (a placeholder replaced the middle span).
+    assert any(
+        isinstance(m["content"], str) and "rút gọn" in m["content"]
+        for m in compacted.messages
+    )
+    # The boundary widened back past the whole B group: either all of B's
+    # results survive together with their tool_use, or none do.
+    b_results = [
+        b["tool_use_id"]
+        for m in compacted.messages
+        for b in (m["content"] if isinstance(m["content"], list) else [])
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    ]
+    b_survivors = [i for i in b_results if i.startswith("B")]
+    assert b_survivors in ([], ["B0", "B1", "B2"])
+
+
+def test_compact_parallel_groups_integrity_fuzz():
+    """Integrity holds across many group-size / keep-count combinations."""
+    for keep in range(1, 7):
+        for sizes in ((1, 1, 1, 1), (2, 3, 1, 4), (5,), (1, 2)):
+            state = ConversationState(system_prompt="sys")
+            state.messages.append(_user("task"))
+            for gi, n in enumerate(sizes):
+                state.messages.extend(_parallel_group(f"g{gi}_", n, output_filler=5))
+            manager = SimpleTruncateContextManager(keep_last_tool_results=keep)
+            compacted = manager.compact(state)
+            _assert_tool_block_integrity(compacted.messages)
+
+
+def test_compact_head_with_tool_blocks_is_not_kept_alone():
+    """A first message carrying tool blocks must not survive in isolation."""
+    state = ConversationState()
+    state.messages.append(
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "x0", "name": "t", "input": {}}],
+        }
+    )
+    state.messages.append(_tool_result("x0", "done " + "y" * 100))
+    state.messages.extend(_parallel_group("B", 2, output_filler=100))
+    state.messages.extend(_parallel_group("C", 2, output_filler=100))
+
+    manager = SimpleTruncateContextManager(keep_last_tool_results=2)
+    compacted = manager.compact(state)
+
+    _assert_tool_block_integrity(compacted.messages)
+    assert compacted.messages[0] is not state.messages[0]
+
+
+def test_compact_unresolvable_tool_reference_returns_unchanged():
+    """A corrupted tail (result without any use anywhere) must degrade to no
+    compaction instead of emitting another invalid history."""
+    state = ConversationState()
+    state.messages.append(_user("task"))
+    state.messages.extend(_parallel_group("A", 2))
+    state.messages.extend(_parallel_group("B", 2))
+    # Ghost sits INSIDE the protected tail: no cut can ever pair it.
+    state.messages.append(_tool_result("ghost", "no matching tool_use anywhere"))
+
+    manager = SimpleTruncateContextManager(keep_last_tool_results=3)
+    compacted = manager.compact(state)
+
+    assert len(compacted.messages) == len(state.messages)
+    assert compacted.messages == state.messages
+    assert compacted is not state
+
+
+def test_compact_elides_orphaned_result_left_behind_the_tail():
+    """An orphaned result that falls into the elided span is dropped, which
+    actually REPAIRS integrity for the surviving tail."""
+    state = ConversationState()
+    state.messages.append(_user("task"))
+    state.messages.append(_tool_result("ghost", "orphan from an older bug"))
+    state.messages.extend(_parallel_group("A", 2))
+    state.messages.extend(_parallel_group("B", 2))
+
+    manager = SimpleTruncateContextManager(keep_last_tool_results=3)
+    compacted = manager.compact(state)
+
+    _assert_tool_block_integrity(compacted.messages)
+    assert all(
+        not (
+            isinstance(m["content"], list)
+            and any(
+                isinstance(b, dict) and b.get("tool_use_id") == "ghost"
+                for b in m["content"]
+            )
+        )
+        for m in compacted.messages
+    )
+
+
 def test_noop_manager_never_compacts_and_copies():
     manager = NoopContextManager()
     state = _long_conversation(turns=8)
@@ -213,7 +378,8 @@ def test_summarizing_manager_uses_summary_for_elided_span():
     assert "đã được tóm tắt" in summary
     assert summarizer.summary in summary
     assert "rút gọn" not in summary
-    assert state.messages[1]["content"] not in summary
+    elided_text = state.messages[1]["content"][0]["text"]
+    assert elided_text not in summary
 
 
 def test_summarizing_manager_falls_back_to_truncation_without_summarizer():
@@ -353,7 +519,15 @@ def test_summarizing_manager_redacts_secrets_before_summarizing():
     state = ConversationState(system_prompt="sys")
     state.messages.append(_user("task"))
     for i in range(4):
-        state.messages.append(_assistant(f"step {i} " + "x" * 100))
+        state.messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": f"step {i} " + "x" * 100},
+                    {"type": "tool_use", "id": f"c{i}", "name": "t", "input": {}},
+                ],
+            }
+        )
         output = f"api_key = {secret}" if i == 0 else "ok " + "y" * 100
         state.messages.append(_tool_result(f"c{i}", output))
 
@@ -481,3 +655,174 @@ def test_agent_default_context_manager_is_simple_truncate():
     agent = Agent(llm=MockLLM([text_response("x")]))
     assert isinstance(agent.context_manager, SimpleTruncateContextManager)
     assert agent.model_context_limit == Agent.DEFAULT_MODEL_CONTEXT_LIMIT
+
+
+
+# --- pluggable token counters --------------------------------------------------
+
+
+def test_custom_token_counter_replaces_heuristic():
+    state = ConversationState(system_prompt="sys")
+    state.messages.append(_user("x" * 100))
+
+    default = SimpleTruncateContextManager()
+    counting_chars = SimpleTruncateContextManager(token_counter=len)
+
+    assert default.estimate_state_tokens(state) < counting_chars.estimate_state_tokens(state)
+    # The counter is consulted for every chunk (system + message).
+    seen: list[int] = []
+    SimpleTruncateContextManager(
+        token_counter=lambda t: seen.append(len(t)) or len(t)
+    ).estimate_state_tokens(state)
+    assert len(seen) == 2
+
+
+def test_chars_per_token_constructor_arg_is_respected():
+    """Regression: chars_per_token used to be stored but never consulted."""
+    state = ConversationState(system_prompt="sys")
+    state.messages.append(_user("x" * 400))
+
+    coarse = SimpleTruncateContextManager(chars_per_token=4)
+    fine = SimpleTruncateContextManager(chars_per_token=1)
+
+    assert fine.estimate_state_tokens(state) > coarse.estimate_state_tokens(state)
+    # fine fires compaction at limits coarse still considers safe.
+    limit = coarse.estimate_state_tokens(state)
+    assert coarse.should_compact(state, model_context_limit=int(limit / 0.8) + 10) is False
+    assert fine.should_compact(state, model_context_limit=int(limit / 0.8) + 10) is True
+
+
+def test_tiktoken_counter_counts_real_tokens():
+    pytest.importorskip("tiktoken")
+    from kinetic_sdk.context.tokens import TiktokenCounter
+
+    counter = TiktokenCounter()
+    vietnamese = "Xin chào, đây là một câu tiếng Việt đầy đủ dấu."
+    real = counter(vietnamese)
+    heuristic = estimate_tokens(vietnamese)
+    # cl100k splits Vietnamese into many more tokens than len//4 suggests.
+    assert real > heuristic
+
+
+def test_tiktoken_counter_integrates_with_manager():
+    pytest.importorskip("tiktoken")
+    from kinetic_sdk.context.tokens import TiktokenCounter
+
+    manager = SimpleTruncateContextManager(token_counter=TiktokenCounter())
+    state = ConversationState(system_prompt="sys")
+    state.messages.append(_user("một đoạn văn bản tiếng Việt " * 20))
+    assert manager.estimate_state_tokens(state) > 0
+
+
+def test_tiktoken_counter_never_returns_zero_or_negative():
+    pytest.importorskip("tiktoken")
+    from kinetic_sdk.context.tokens import TiktokenCounter
+
+    counter = TiktokenCounter()
+    assert counter("") >= 1
+
+
+# --- oversized tool-result content truncation ---------------------------------
+
+
+def _big_result_conversation(big_chars: int = 20_000, turns: int = 4) -> ConversationState:
+    state = ConversationState(system_prompt="sys")
+    state.messages.append(_user("task"))
+    for i in range(turns):
+        state.messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": f"b{i}", "name": "t", "input": {}}
+                ],
+            }
+        )
+        size = big_chars if i == turns - 1 else 200
+        state.messages.append(_tool_result(f"b{i}", "z" * size))
+    return state
+
+
+def test_compact_truncates_oversized_tool_result_in_tail():
+    manager = SimpleTruncateContextManager(
+        keep_last_tool_results=2, max_tool_result_chars=1_000
+    )
+    compacted = manager.compact(_big_result_conversation())
+
+    results = [
+        b
+        for m in compacted.messages
+        for b in (m["content"] if isinstance(m["content"], list) else [])
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    ]
+    biggest = max(results, key=lambda b: len(b["content"]))
+    assert "cắt bớt" in biggest["content"]
+    # head + marker + tail stays close to the limit (marker overhead aside).
+    assert len(biggest["content"]) < 1_200
+    _assert_tool_block_integrity(compacted.messages)
+
+
+def test_compact_truncation_applies_when_no_message_can_be_elided():
+    """The protected-tail-overflow case: everything is kept, but giant tool
+    results are still cut - the case elision alone could never fix."""
+    manager = SimpleTruncateContextManager(
+        keep_last_tool_results=10, max_tool_result_chars=1_000
+    )
+    state = _big_result_conversation(turns=2)
+    compacted = manager.compact(state)
+
+    assert len(compacted.messages) == len(state.messages)  # nothing elided
+    last = compacted.messages[-1]["content"][0]["content"]
+    assert "cắt bớt" in last
+
+
+def test_truncation_preserves_original_state():
+    manager = SimpleTruncateContextManager(
+        keep_last_tool_results=2, max_tool_result_chars=1_000
+    )
+    state = _big_result_conversation()
+    original_last = state.messages[-1]["content"][0]["content"]
+
+    manager.compact(state)
+
+    assert state.messages[-1]["content"][0]["content"] == original_last
+    assert "cắt bớt" not in original_last
+
+
+def test_truncation_leaves_small_results_untouched():
+    manager = SimpleTruncateContextManager(
+        keep_last_tool_results=2, max_tool_result_chars=1_000
+    )
+    state = _big_result_conversation(big_chars=200)
+    compacted = manager.compact(state)
+
+    assert all(
+        "cắt bớt" not in str(m["content"]) for m in compacted.messages
+    )
+
+
+def test_truncation_disabled_by_default():
+    manager = SimpleTruncateContextManager(keep_last_tool_results=2)
+    compacted = manager.compact(_big_result_conversation())
+    results = [
+        b
+        for m in compacted.messages
+        for b in (m["content"] if isinstance(m["content"], list) else [])
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    ]
+    assert max(len(b["content"]) for b in results) == 20_000
+
+
+def test_max_tool_result_chars_validation():
+    with pytest.raises(ValueError):
+        SimpleTruncateContextManager(max_tool_result_chars=10)
+
+
+def test_summarizing_manager_also_truncates():
+    manager = SummarizingContextManager(
+        keep_last_tool_results=2,
+        summarizer=FakeSummarizer(),
+        max_tool_result_chars=1_000,
+    )
+    compacted = manager.compact(_big_result_conversation())
+    assert any("cắt bớt" in str(m["content"]) for m in compacted.messages)
+    assert any("tóm tắt" in str(m["content"]) for m in compacted.messages)

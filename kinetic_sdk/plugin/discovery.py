@@ -29,7 +29,11 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from kinetic_sdk.plugin.exceptions import PluginManifestError
-from kinetic_sdk.plugin.manifest import ENTRY_POINT_GROUP, PLUGIN_FILE_NAME, PluginManifest
+from kinetic_sdk.plugin.manifest import (
+    ENTRY_POINT_GROUP,
+    PLUGIN_FILE_NAME,
+    PluginManifest,
+)
 
 logger = logging.getLogger(__name__)
 

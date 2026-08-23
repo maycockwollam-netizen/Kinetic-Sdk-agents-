@@ -26,18 +26,16 @@ though pipes are blocking; SSE reads set the socket timeout per read.
 from __future__ import annotations
 
 import http.client
-import json
 import queue
 import subprocess
 import sys
 import threading
 from abc import ABC, abstractmethod
-from typing import Any, BinaryIO, Callable
+from typing import BinaryIO, Callable
 from urllib.parse import urljoin, urlsplit
 
 from kinetic_sdk.mcp.protocol import (
     JsonRpcMessage,
-    MCPProtocolError,
     decode,
     encode,
 )

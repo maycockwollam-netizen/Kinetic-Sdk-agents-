@@ -13,15 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from kinetic_sdk.llm.client import LLMClient
-from kinetic_sdk.testing.mocks import (
-    MockLLMClient,
-    text_response,
-    tool_response,
-)
+from kinetic_sdk.testing import mocks as _mocks
 from kinetic_sdk.tool.base import Tool, ToolResult
 
-#: Backwards-compatible alias: the SDK's own tests predate ``testing/``.
-MockLLM = MockLLMClient
+#: Backwards-compatible aliases: the SDK's own tests predate ``testing/``.
+MockLLM = _mocks.MockLLMClient
+text_response = _mocks.text_response
+tool_response = _mocks.tool_response
 
 
 class LoopLLM(LLMClient):

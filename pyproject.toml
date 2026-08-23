@@ -14,7 +14,14 @@ dependencies = []
 
 [project.optional-dependencies]
 llm = ["litellm>=1.50"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+tokens = ["tiktoken>=0.7"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6"]
+
+[tool.ruff]
+target-version = "py310"
+# Deliberately narrow: pyflakes (F), syntax-level pycodestyle (E9) and import
+# sorting (I). Broader style rules are a future decision, not silently imposed.
+lint.select = ["F", "E9", "I"]
 
 [tool.setuptools.packages.find]
 include = ["kinetic_sdk*"]

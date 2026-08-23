@@ -26,16 +26,31 @@ rewriting the agent loop.
   (dynamic loading with static scanning), and subagents (delegation with
   inherited permissions plus budget/circuit-breaker guardrails) are all
   implemented.
+- **Hardening pass — done.** Runtime resilience on top of the four stages:
+  LLM retry/backoff + timeout, per-tool wall-clock timeout, parallel-group-safe
+  context compaction (no orphaned `tool_result`, oversized tool outputs are
+  trimmed head/tail), pluggable token counters (`tiktoken` extra), sticky-MAX
+  routing across runs, conversation persistence (`JsonFileConversationStore`),
+  cooperative cancellation (`agent.cancel()`), tool-input schema validation,
+  optional parallel tool execution, and the standard `terminal` +
+  `file_editor` tools.
 
 ## Module map
 
 - `kinetic_sdk/agent/` — `Agent` tool-calling loop, `AgentMode` FLASH/MAX
   routing, task classification, mid-run FLASH -> MAX escalation.
-- `kinetic_sdk/conversation/` — in-memory conversation history using an
-  Anthropic-style typed message shape.
-- `kinetic_sdk/context/` — context-window management with a zero-dependency
-  token estimate and truncation-based compaction.
+- `kinetic_sdk/conversation/` — conversation history using an Anthropic-style
+  typed message shape, plus pluggable persistence (`ConversationStore` ABC,
+  `JsonFileConversationStore`) for save/resume across processes.
+- `kinetic_sdk/context/` — context-window management: zero-dependency token
+  estimate or pluggable real tokenizers (`TiktokenCounter`), parallel-safe
+  truncation compaction, oversized tool-result trimming, and optional
+  LLM-summarised compaction with safe fallback.
 - `kinetic_sdk/event/` — synchronous/async event bus with wildcard subscribers.
+- `kinetic_sdk/files/` — `FileTool`: workspace-confined view/create/
+  str_replace/insert/undo_edit (all paths traversal-safe via `Workspace`).
+- `kinetic_sdk/terminal/` — `TerminalTool`: shell commands with process-group
+  kill on timeout and head/tail output truncation.
 - `kinetic_sdk/git/` — `GitTool`: curated git operations (status/diff/add/
   commit/branch/checkout/push/pull/log) as a first-class, policy-gated tool.
 - `kinetic_sdk/hooks/` — lifecycle hooks (`BEFORE_RUN`, `BEFORE_TOOL_CALL`,
@@ -88,9 +103,16 @@ test suite or using `LiteLLMClient` / `LiteLLMClassifier`:
 pip install -e ".[dev,llm]"
 ```
 
+Add the `tokens` extra for a real tokenizer (tiktoken) backing context-window
+estimation instead of the built-in heuristic:
+
+```bash
+pip install -e ".[tokens]"
+```
+
 The core SDK intentionally has no required third-party runtime dependencies;
-`litellm` is optional and imported lazily only when a LiteLLM-backed component
-is instantiated.
+`litellm` and `tiktoken` are optional and imported lazily only when a
+component backed by them is instantiated.
 
 ## Run tests
 

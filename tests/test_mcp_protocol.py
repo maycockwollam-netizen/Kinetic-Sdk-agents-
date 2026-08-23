@@ -7,7 +7,6 @@ import threading
 import pytest
 
 from kinetic_sdk.mcp.protocol import (
-    JSONRPC_VERSION,
     JsonRpcNotification,
     JsonRpcRequest,
     JsonRpcResponse,

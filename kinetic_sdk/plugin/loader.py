@@ -36,7 +36,6 @@ from typing import Any
 
 from kinetic_sdk.plugin.exceptions import (
     PluginLoadError,
-    PluginManifestError,
     PluginVetError,
 )
 from kinetic_sdk.plugin.manifest import PluginManifest

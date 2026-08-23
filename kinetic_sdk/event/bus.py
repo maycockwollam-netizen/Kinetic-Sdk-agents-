@@ -18,7 +18,6 @@ Design goals for Stage 1:
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import logging
 from dataclasses import dataclass, field
@@ -64,7 +63,19 @@ class EventBus:
         The same subscriber can be registered for multiple event types.
         Registering the same callable twice for the same type is a no-op.
         ``"*"`` is a wildcard type that receives every published event.
+
+        A coroutine function is only ever awaited by :meth:`publish_async`;
+        the synchronous :meth:`publish` skips it. Registering one is warned
+        about because sync publishers (e.g. the agent loop's ``_emit``) would
+        otherwise drop it silently.
         """
+        if inspect.iscoroutinefunction(subscriber):
+            logger.warning(
+                "Coroutine subscriber %r registered for %r is skipped by the "
+                "synchronous publish(); it only runs via publish_async().",
+                subscriber,
+                event_type,
+            )
         self._subscribers.setdefault(event_type, [])
         if subscriber not in self._subscribers[event_type]:
             self._subscribers[event_type].append(subscriber)

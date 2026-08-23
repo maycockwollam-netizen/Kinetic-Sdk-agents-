@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from kinetic_sdk.conversation.state import ConversationState
 from kinetic_sdk.event.bus import Event, EventBus
@@ -57,13 +57,43 @@ def _stringify_content(content: Any) -> str:
 
 def _message_has_tool_result(msg: Message) -> bool:
     """True if the message carries at least one ``tool_result`` block."""
+    return bool(_message_tool_result_ids(msg))
+
+
+def _message_tool_use_ids(msg: Message) -> set[str]:
+    """Ids of ``tool_use`` blocks in the message (empty for plain turns)."""
     content = msg.get("content")
     if not isinstance(content, list):
-        return False
-    return any(
-        isinstance(block, dict) and block.get("type") == "tool_result"
+        return set()
+    return {
+        block["id"]
         for block in content
-    )
+        if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id")
+    }
+
+
+def _message_tool_result_ids(msg: Message) -> set[str]:
+    """Ids referenced by ``tool_result`` blocks in the message."""
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return set()
+    return {
+        block["tool_use_id"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and block.get("tool_use_id")
+    }
+
+
+def _message_has_tool_content(msg: Message) -> bool:
+    """True if the message carries any tool block (``tool_use`` or result).
+
+    A message like that is unsafe to keep in isolation: providers reject a
+    ``tool_use`` whose result was elided and a ``tool_result`` whose use was
+    elided, so compaction must never keep such a message on its own.
+    """
+    return bool(_message_tool_use_ids(msg) or _message_tool_result_ids(msg))
 
 
 class ContextSummarizer(Protocol):
@@ -139,13 +169,17 @@ class ContextManager(ABC):
 
     # --- shared helpers ------------------------------------------------
 
+    def _count_tokens(self, text: str) -> int:
+        """Count tokens of one text chunk; overridable per implementation."""
+        return estimate_tokens(text)
+
     def estimate_state_tokens(self, state: ConversationState) -> int:
         """Estimated total tokens of system prompt + all messages."""
         total = 0
         if state.system_prompt:
-            total += estimate_tokens(state.system_prompt)
+            total += self._count_tokens(state.system_prompt)
         for msg in state.messages:
-            total += estimate_tokens(_stringify_content(msg.get("content")))
+            total += self._count_tokens(_stringify_content(msg.get("content")))
         return total
 
 
@@ -178,6 +212,10 @@ class SimpleTruncateContextManager(ContextManager):
             :meth:`should_compact` fires (default 0.8). Below 1.0 so the
             loop compacts early instead of riding the window edge.
         chars_per_token: Heuristic divisor for :func:`estimate_tokens`.
+        token_counter: Optional callable ``str -> int`` replacing the
+            heuristic entirely (e.g.
+            :class:`~kinetic_sdk.context.tokens.TiktokenCounter`). When set,
+            ``chars_per_token`` is unused.
 
     Compaction keeps, in order: the first message (normally the original
     user request) and the tail of the conversation starting just before the
@@ -192,6 +230,8 @@ class SimpleTruncateContextManager(ContextManager):
         keep_last_tool_results: int = 5,
         safety_threshold: float = 0.8,
         chars_per_token: int = 4,
+        token_counter: Callable[[str], int] | None = None,
+        max_tool_result_chars: int | None = None,
     ) -> None:
         if keep_last_tool_results < 0:
             raise ValueError("keep_last_tool_results must be >= 0")
@@ -199,9 +239,22 @@ class SimpleTruncateContextManager(ContextManager):
             raise ValueError("safety_threshold must be in (0, 1]")
         if chars_per_token < 1:
             raise ValueError("chars_per_token must be >= 1")
+        if max_tool_result_chars is not None and max_tool_result_chars < 100:
+            raise ValueError("max_tool_result_chars must be >= 100 or None")
         self.keep_last_tool_results = keep_last_tool_results
         self.safety_threshold = safety_threshold
         self.chars_per_token = chars_per_token
+        self.token_counter = token_counter
+        #: When set, every kept ``tool_result`` whose text exceeds this many
+        #: characters is cut to head + marker + tail. This is what saves a
+        #: conversation whose protected tail alone overflows the window
+        #: (e.g. 5 huge build logs) - eliding messages cannot help there.
+        self.max_tool_result_chars = max_tool_result_chars
+
+    def _count_tokens(self, text: str) -> int:
+        if self.token_counter is not None:
+            return self.token_counter(text)
+        return estimate_tokens(text, self.chars_per_token)
 
     # --- ContextManager interface ---------------------------------------
 
@@ -220,21 +273,35 @@ class SimpleTruncateContextManager(ContextManager):
         single placeholder message records how many messages were elided.
         Edge cases (0-2 messages, or everything protected) return an
         unchanged copy.
+
+        Tool-block integrity is guaranteed: the tail is widened so every
+        kept ``tool_result`` keeps its ``tool_use`` (parallel tool calls are
+        never split across the elision boundary), and the head is only kept
+        when it carries no tool blocks. Providers reject histories with
+        dangling tool references, so violating this would fail the next LLM
+        call outright.
         """
         messages = state.messages
         if len(messages) <= 2:
-            return self._copy(state, list(messages))
+            return self._copy(state, self._truncate_oversized_tool_results(list(messages)))
 
         tail_start = self._tail_start(messages)
-        head_end = 1 if tail_start > 0 else 0  # keep original request iff outside the tail
+        head_end = (
+            1
+            if tail_start > 0 and not _message_has_tool_content(messages[0])
+            else 0
+        )
         removed = tail_start - head_end
         if removed <= 0:
-            return self._copy(state, list(messages))
+            # No message-level cut is possible, but oversized tool results in
+            # the kept span may still need trimming (a giant protected tail
+            # is exactly the case elision cannot fix).
+            return self._copy(state, self._truncate_oversized_tool_results(list(messages)))
 
         kept = [dict(m) for m in messages[:head_end]]
         kept.append(self._elided_message(messages[head_end:tail_start], removed))
         kept.extend(dict(m) for m in messages[tail_start:])
-        return self._copy(state, kept)
+        return self._copy(state, self._truncate_oversized_tool_results(kept))
 
     def _elided_message(self, elided: list[Message], removed: int) -> Message:
         """The single message replacing the dropped middle span.
@@ -253,7 +320,8 @@ class SimpleTruncateContextManager(ContextManager):
 
         One message before the Nth-from-last tool result (to also keep the
         assistant turn that requested it), clamped so the tail is never the
-        whole conversation when compaction is actually needed.
+        whole conversation when compaction is actually needed, then widened
+        to a parallel-group boundary by :meth:`_expand_to_group_boundary`.
         """
         n = len(messages)
         if self.keep_last_tool_results == 0:
@@ -267,7 +335,80 @@ class SimpleTruncateContextManager(ContextManager):
             anchor = tool_result_idx[0]
         else:
             anchor = n - 1
-        return max(0, min(anchor - 1, n - 1))
+        start = max(0, min(anchor - 1, n - 1))
+        return self._expand_to_group_boundary(messages, start)
+
+    @staticmethod
+    def _expand_to_group_boundary(messages: list[Message], start: int) -> int:
+        """Move *start* back until no kept ``tool_result`` is orphaned.
+
+        Parallel tool calls are stored as ONE assistant message carrying N
+        ``tool_use`` blocks followed by N separate ``tool_result`` messages.
+        A naive anchor can therefore land mid-group — keeping results whose
+        ``tool_use`` was elided, which every provider rejects with a 400.
+        We walk the boundary back until every ``tool_result`` in the tail
+        has its ``tool_use`` inside the tail. If the references can never be
+        resolved (e.g. a history already corrupted by an older buggy
+        compaction), *start* reaches 0 and :meth:`compact` returns the state
+        unchanged — degrading to no compaction instead of emitting an
+        invalid history.
+        """
+        needed: set[str] = set()
+        provided: set[str] = set()
+        for msg in messages[start:]:
+            needed |= _message_tool_result_ids(msg)
+            provided |= _message_tool_use_ids(msg)
+        while start > 0 and not needed <= provided:
+            start -= 1
+            needed |= _message_tool_result_ids(messages[start])
+            provided |= _message_tool_use_ids(messages[start])
+        return start
+
+    TRUNCATION_MARKER = "\n[... {n} ký tự ở giữa đã được cắt bớt ...]\n"
+
+    def _truncate_oversized_tool_results(self, messages: list[Message]) -> list[Message]:
+        """Cut oversized ``tool_result`` text blocks to head + marker + tail.
+
+        No-op when ``max_tool_result_chars`` is unset. Original messages are
+        never mutated: messages needing a cut get a fresh dict + content list.
+        """
+        if self.max_tool_result_chars is None:
+            return messages
+        out: list[Message] = []
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list) or not any(
+                isinstance(b, dict)
+                and b.get("type") == "tool_result"
+                and isinstance(b.get("content"), str)
+                and len(b["content"]) > self.max_tool_result_chars
+                for b in content
+            ):
+                out.append(msg)
+                continue
+            new_content = [
+                self._truncate_block(b) if isinstance(b, dict) else b
+                for b in content
+            ]
+            out.append({**msg, "content": new_content})
+        return out
+
+    def _truncate_block(self, block: dict[str, Any]) -> dict[str, Any]:
+        """Return a copy of a ``tool_result`` block with its text trimmed."""
+        if block.get("type") != "tool_result" or not isinstance(block.get("content"), str):
+            return block
+        text = block["content"]
+        limit = self.max_tool_result_chars
+        assert limit is not None  # guarded by the caller
+        if len(text) <= limit:
+            return block
+        head = limit * 2 // 3
+        tail = limit - head
+        omitted = len(text) - head - tail
+        return {
+            **block,
+            "content": text[:head] + self.TRUNCATION_MARKER.format(n=omitted) + text[-tail:],
+        }
 
     @staticmethod
     def _copy(state: ConversationState, messages: list[Message]) -> ConversationState:
@@ -319,11 +460,15 @@ class SummarizingContextManager(SimpleTruncateContextManager):
         event_bus: EventBus | None = None,
         max_summary_chars: int = 1_000,
         summary_max_tokens: int = 150,
+        token_counter: Callable[[str], int] | None = None,
+        max_tool_result_chars: int | None = None,
     ) -> None:
         super().__init__(
             keep_last_tool_results=keep_last_tool_results,
             safety_threshold=safety_threshold,
             chars_per_token=chars_per_token,
+            token_counter=token_counter,
+            max_tool_result_chars=max_tool_result_chars,
         )
         if summarizer is not None and summarizer_client is not None:
             raise ValueError("pass either `summarizer` or `summarizer_client`, not both")

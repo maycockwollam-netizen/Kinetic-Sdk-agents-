@@ -28,14 +28,42 @@ Design notes:
 
 from __future__ import annotations
 
+import logging
+import random
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterator, Literal
 
 from kinetic_sdk.secret.value import SecretValue
+from kinetic_sdk.security.redact import redact_secrets
+
+logger = logging.getLogger(__name__)
 
 #: Role of a message in the conversation.
 Role = Literal["system", "user", "assistant", "tool"]
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Classify an LLM-call failure as worth retrying (transient) or not.
+
+    Provider-neutral: litellm raises many exception types (its own plus the
+    underlying SDKs'), so we look at the HTTP ``status_code`` attribute when
+    present and fall back to the exception class name. Retryable: 408, 409,
+    429, any 5xx, timeouts and connection errors. Everything else - 400/401/
+    403/404, invalid requests, content filters - is raised immediately.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        if status in (408, 409, 429) or status >= 500:
+            return True
+        if 400 <= status < 500:
+            return False
+    name = type(exc).__name__.lower()
+    return any(
+        marker in name
+        for marker in ("timeout", "connection", "ratelimit", "rate_limit", "unavailable")
+    )
 
 #: A single message in the conversation history. The shape intentionally
 #: matches Anthropic's message format (``role`` + ``content`` where ``content``
@@ -168,6 +196,16 @@ class LiteLLMClient(LLMClient):
     working). The plaintext is only revealed inside ``_build_request`` when
     the actual API call is constructed - it never appears in ``repr()`` of
     the client or its ``__dict__``.
+
+    Resilience: ``timeout`` is forwarded to ``litellm.completion`` (when set)
+    and transient failures are retried with exponential backoff + jitter
+    (``max_retries`` retries after the first attempt; ``0`` restores the old
+    single-attempt behaviour). An error is retryable when it carries an HTTP
+    status of 408/409/429 or 5xx, or its class name signals a timeout /
+    connection / rate-limit problem. Anything else (4xx auth errors, invalid
+    requests, ...) raises immediately - retrying those would just burn quota.
+    For ``chat_stream`` only stream CREATION is retried: once chunks are
+    flowing, an error propagates rather than risking duplicated text.
     """
 
     def __init__(
@@ -176,11 +214,25 @@ class LiteLLMClient(LLMClient):
         api_key: str | SecretValue | None = None,
         api_base: str | None = None,
         max_tokens: int = 4096,
+        timeout: float | None = None,
+        max_retries: int = 2,
+        retry_base_delay: float = 0.5,
+        retry_max_delay: float = 8.0,
     ) -> None:
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        if retry_base_delay <= 0 or retry_max_delay <= 0:
+            raise ValueError("retry delays must be positive")
         self.model = model
         self.api_key = self._wrap_secret(api_key)
         self.api_base = api_base
         self.max_tokens = max_tokens
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay
+        self.retry_max_delay = retry_max_delay
         # Import lazily so the rest of the SDK stays zero-dependency. We keep a
         # reference to the module to call ``completion`` on it (and so tests can
         # monkeypatch ``litellm.completion`` on the real module object).
@@ -402,7 +454,7 @@ class LiteLLMClient(LLMClient):
     ) -> LLMResponse:
         """Non-streaming chat turn via ``litellm.completion``."""
         request = self._build_request(messages, tools, system, **kwargs)
-        raw = self._litellm.completion(**request)
+        raw = self._completion_with_retry(request)
         return self._parse_response(raw)
 
     def chat_stream(
@@ -422,7 +474,7 @@ class LiteLLMClient(LLMClient):
         """
         request = self._build_request(messages, tools, system, **kwargs)
         request["stream"] = True
-        stream = self._litellm.completion(**request)
+        stream = self._completion_with_retry(request)
         text_buf: list[str] = []
         tool_calls: list[ToolCall] = []
         stop_reason: str | None = None
@@ -494,8 +546,33 @@ class LiteLLMClient(LLMClient):
             request["api_key"] = self.api_key.reveal()
         if self.api_base is not None:
             request["api_base"] = self.api_base
+        if self.timeout is not None:
+            request["timeout"] = self.timeout
         request.update(kwargs)
         return request
+
+    def _completion_with_retry(self, request: dict[str, Any]) -> Any:
+        """Call ``litellm.completion`` with retry + backoff on transient errors."""
+        attempt = 0
+        while True:
+            try:
+                return self._litellm.completion(**request)
+            except Exception as exc:  # noqa: BLE001 - classified by _is_retryable
+                if attempt >= self.max_retries or not _is_retryable(exc):
+                    raise
+                attempt += 1
+                delay = min(
+                    self.retry_base_delay * (2 ** (attempt - 1)), self.retry_max_delay
+                )
+                delay += random.uniform(0, delay * 0.25)
+                logger.warning(
+                    "LLM request failed (attempt %d/%d), retrying in %.2fs: %s",
+                    attempt,
+                    self.max_retries + 1,
+                    delay,
+                    redact_secrets(f"{type(exc).__name__}: {exc}"),
+                )
+                time.sleep(delay)
 
 
 class AsyncLLMClient(ABC):

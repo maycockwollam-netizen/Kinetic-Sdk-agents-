@@ -5,9 +5,9 @@ from __future__ import annotations
 import os
 
 import pytest
-from tests._helpers import write_skill
 
 from kinetic_sdk.skills.loader import FileSystemSkillLoader
+from tests._helpers import write_skill
 
 
 def test_missing_root_dir_raises(tmp_path):

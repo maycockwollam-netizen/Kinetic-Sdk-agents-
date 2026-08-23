@@ -26,7 +26,7 @@ from collections.abc import Iterable
 from typing import Literal
 
 from kinetic_sdk.plugin.discovery import EntryPointsProvider, discover_plugins
-from kinetic_sdk.plugin.exceptions import PluginLoadError, PluginManifestError
+from kinetic_sdk.plugin.exceptions import PluginLoadError
 from kinetic_sdk.plugin.loader import PluginLoader
 from kinetic_sdk.plugin.manifest import PluginManifest
 from kinetic_sdk.security.audit import AuditLogger

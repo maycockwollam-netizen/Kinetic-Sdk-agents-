@@ -16,7 +16,6 @@ from kinetic_sdk.security import (
 )
 from tests._helpers import EchoTool, MockLLM, text_response, tool_response
 
-
 # --- dev_profile ----------------------------------------------------------------
 
 

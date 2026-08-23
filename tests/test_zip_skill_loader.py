@@ -8,10 +8,10 @@ import tempfile
 import zipfile
 
 import pytest
-from tests._helpers import make_zip, skill_zip_entries
 
 from kinetic_sdk.skills.exceptions import SkillParseError, ZipSkillError
 from kinetic_sdk.skills.zip_loader import ZipSkillLoader
+from tests._helpers import make_zip, skill_zip_entries
 
 
 def _temp_skill_dirs() -> set[str]:

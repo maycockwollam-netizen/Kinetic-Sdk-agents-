@@ -23,11 +23,14 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from kinetic_sdk.agent.classifier import TaskClassifier, DefaultClassifier
+from kinetic_sdk.agent.classifier import DefaultClassifier, TaskClassifier
 from kinetic_sdk.agent.modes import AgentMode
 from kinetic_sdk.context.manager import (
     ContextManager,
@@ -35,15 +38,21 @@ from kinetic_sdk.context.manager import (
     SummarizingContextManager,
 )
 from kinetic_sdk.conversation.state import ConversationState
-from kinetic_sdk.event.bus import EventBus, Event
+from kinetic_sdk.conversation.store import ConversationStore
+from kinetic_sdk.event.bus import Event, EventBus
 from kinetic_sdk.hooks.base import HookContext, HookPoint, HookResult
 from kinetic_sdk.hooks.registry import HookRegistry
 from kinetic_sdk.llm.client import LLMClient, LLMResponse, ToolCall
 from kinetic_sdk.observability.logger import ObservabilityLogger
 from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
-from kinetic_sdk.security.policy import AllowListPolicy, PermissionDecision, PermissionPolicy
+from kinetic_sdk.security.policy import (
+    AllowListPolicy,
+    PermissionDecision,
+    PermissionPolicy,
+)
 from kinetic_sdk.security.redact import redact_secrets
 from kinetic_sdk.tool.base import Tool, ToolResult
+from kinetic_sdk.tool.validation import validate_tool_input
 
 logger = logging.getLogger(__name__)
 
@@ -143,12 +152,27 @@ class Agent:
         audit_logger: AuditLogger | None = None,
         observability_logger: ObservabilityLogger | None = None,
         hooks: HookRegistry | None = None,
+        tool_timeout: float | None = None,
+        state_store: ConversationStore | None = None,
+        validate_tool_inputs: bool = True,
+        parallel_tool_execution: bool = False,
     ) -> None:
         self.llm = llm
+        #: Optional persistence backend. When set (and no explicit ``state``
+        #: was passed) the saved conversation is resumed at construction, and
+        #: the state is persisted after every turn — a crash mid-run loses at
+        #: most the in-flight turn. Store failures are logged, never fatal.
+        self.state_store = state_store
         # NOTE: use ``is not None`` rather than truthiness because
         # ConversationState defines __len__ (an empty state is falsy but is
         # still a perfectly valid state object the caller passed in).
-        self.state = state if state is not None else ConversationState()
+        if state is not None:
+            self.state = state
+        elif state_store is not None:
+            resumed = state_store.load()
+            self.state = resumed if resumed is not None else ConversationState()
+        else:
+            self.state = ConversationState()
         self.event_bus = event_bus if event_bus is not None else EventBus()
         self.classifier: TaskClassifier = classifier if classifier is not None else DefaultClassifier()
         self.context_manager: ContextManager = (
@@ -177,6 +201,32 @@ class Agent:
         if hooks is not None and hooks.event_bus is None:
             # Route hooks.error events through the agent's bus.
             hooks.event_bus = self.event_bus
+        if tool_timeout is not None and tool_timeout <= 0:
+            raise ValueError("tool_timeout must be positive")
+        #: Per-call wall-clock limit for ``tool.execute``. ``None`` disables
+        #: the guard (historical behaviour). On expiry the loop receives an
+        #: error ToolResult and continues; Python cannot safely kill a running
+        #: thread, so the timed-out call keeps running in the background -
+        #: the timeout unblocks the agent, it does not cancel the work.
+        self.tool_timeout = tool_timeout
+        #: When True, a batch of tool calls in one model turn is fanned out to
+        #: a thread pool instead of running strictly in order. Gating (hooks,
+        #: policy, confirmation, validation) still runs sequentially on the
+        #: main thread BEFORE anything executes; results are finalized
+        #: (audit, AFTER hooks, state, events) in the model's original order.
+        #: OPT-IN because tools must be thread-safe for it to be sound:
+        #: built-in tools are (each call is an independent subprocess or file
+        #: op), but a custom tool sharing mutable state is not.
+        self.parallel_tool_execution = parallel_tool_execution
+        self._executor: ThreadPoolExecutor | None = None
+        #: Validate model-supplied arguments against each tool's declared
+        #: JSON schema before executing (see ``tool/validation.py``). Invalid
+        #: input becomes an error ToolResult with an actionable message
+        #: instead of a confusing TypeError inside the tool.
+        self.validate_tool_inputs = validate_tool_inputs
+        #: Cooperative cancellation flag, set via :meth:`cancel` from any
+        #: thread. Checked between iterations and between tool calls.
+        self._cancel_event = threading.Event()
         #: UUID of the in-flight (or most recent) :meth:`run`; ``None`` before
         #: the first run. Every event emitted during a run carries it.
         self._run_id: str | None = None
@@ -186,6 +236,11 @@ class Agent:
         self.max_iterations: int = max_iterations if max_iterations is not None else self.MODE_MAX_ITERATIONS[AgentMode.MAX]
         self.mode: AgentMode = AgentMode.MAX
         self.enable_extended_reasoning: bool = True
+        #: Once any run of this conversation classified MAX (or escalated to
+        #: it), later runs never route back to FLASH. Set on successful MAX
+        #: classification and on escalation - NOT on the exception fallback,
+        #: so a transient classifier outage does not pin MAX forever.
+        self._sticky_max: bool = False
 
         tool_list = list(tools or [])
         self._tools: dict[str, Tool] = {}
@@ -234,11 +289,14 @@ class Agent:
         Returns:
             The final assistant text. If the loop hit ``max_iterations``
             without a final answer, returns the last assistant text seen
-            (possibly empty) and publishes an ``agent.error`` event.
+            (possibly empty) and publishes an ``agent.error`` event. If the
+            run was cancelled via :meth:`cancel`, returns the best text seen
+            so far (possibly empty) and publishes ``agent.cancelled``.
         """
         if user_message is not None:
             self.state.add_user_message(user_message)
 
+        self._cancel_event.clear()  # a new run starts un-cancelled
         self._run_id = str(uuid.uuid4())
         self._trigger_hooks(
             HookPoint.BEFORE_RUN,
@@ -291,6 +349,11 @@ class Agent:
         previous = self.mode
         self.mode = target
         self.enable_extended_reasoning = target is AgentMode.MAX
+        if target is AgentMode.MAX:
+            # Once a conversation has run at MAX it never drops back to
+            # FLASH - a mid-conversation downgrade would silently shrink the
+            # iteration budget of later turns.
+            self._sticky_max = True
         if self._max_iterations_override is None:
             self.max_iterations = self.MODE_MAX_ITERATIONS[target]
         self._emit("agent.escalated", {"from": previous.value, "to": target.value})
@@ -313,14 +376,25 @@ class Agent:
         if classification is None:
             self._apply_mode(AgentMode.MAX, rationale="classifier_exception")
             return
-        self._apply_mode(classification.mode, rationale=classification.rationale)
+        rationale = classification.rationale
+        mode = classification.mode
+        if mode is AgentMode.FLASH and self._sticky_max:
+            # MAX is sticky across runs of one conversation: a run that
+            # classified MAX (or escalated) must not be followed by a FLASH
+            # run with its much smaller iteration budget.
+            mode = AgentMode.MAX
+            rationale = (rationale + " " if rationale else "") + "[max sticky: downgrade prevented]"
+        elif mode is AgentMode.MAX:
+            self._sticky_max = True
+        self._apply_mode(mode, rationale=rationale)
         self._emit(
             "agent.classified",
             {
                 "complexity": classification.complexity.value,
                 "mode": classification.mode.value,
+                "applied_mode": mode.value,
                 "confidence": classification.confidence,
-                "rationale": classification.rationale,
+                "rationale": rationale,
             },
         )
 
@@ -333,12 +407,32 @@ class Agent:
         else:
             self.max_iterations = self.MODE_MAX_ITERATIONS[mode]
 
+    def cancel(self) -> None:
+        """Ask the in-flight :meth:`run` to stop cooperatively.
+
+        Thread-safe. The loop notices between iterations and between tool
+        calls, fills in error results for any skipped tool calls (so the
+        history stays replay-valid), emits ``agent.cancelled`` and returns
+        the best final text it has. A tool call already executing is NOT
+        interrupted — cooperative cancellation cannot preempt running work.
+        """
+        self._cancel_event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        """True after :meth:`cancel` until the next :meth:`run` starts."""
+        return self._cancel_event.is_set()
+
     def _run_loop(self) -> str:
         """The tool-calling loop, with mid-run FLASH -> MAX escalation."""
         final_text = ""
         iteration = 0
         escalated = False
         while iteration < self.max_iterations:
+            if self._cancel_event.is_set():
+                logger.info("Agent run cancelled at iteration %d", iteration)
+                self._emit("agent.cancelled", {"iteration": iteration})
+                return final_text
             self._emit("agent.turn_started", {"iteration": iteration, "mode": self.mode.value})
             self._maybe_compact_context()
             self._trigger_hooks(
@@ -349,6 +443,12 @@ class Agent:
                     iteration=iteration,
                 ),
             )
+            # Re-check after hooks: a hook is a common place for UI-driven
+            # cancellation, and it should prevent the imminent LLM call.
+            if self._cancel_event.is_set():
+                logger.info("Agent run cancelled at iteration %d", iteration)
+                self._emit("agent.cancelled", {"iteration": iteration})
+                return final_text
             response = self._call_llm()
             self._trigger_hooks(
                 HookPoint.AFTER_LLM_CALL,
@@ -367,9 +467,13 @@ class Agent:
 
             if not response.tool_calls:
                 final_text = response.content
+                # Persist only at replay-valid boundaries: an assistant text
+                # turn (no dangling tool_use) or right after tool results.
+                self._persist_state()
                 break
 
             any_error = self._execute_tool_calls(response.tool_calls)
+            self._persist_state()
 
             if not escalated and self.mode is AgentMode.FLASH:
                 should_escalate = False
@@ -426,6 +530,26 @@ class Agent:
         tools = self.tool_schemas() or None
         return self.llm.chat(messages=messages, tools=tools, system=system)
 
+    def _persist_state(self) -> None:
+        """Save the conversation to the configured store, never fatally.
+
+        Only called at replay-valid boundaries (assistant text turn or right
+        after tool results), so a resumed history never ends on a dangling
+        ``tool_use`` — providers reject those outright. A broken store (disk
+        full, permissions) must not kill a run - the failure is logged and
+        the loop continues with the in-memory state.
+        """
+        if self.state_store is None:
+            return
+        try:
+            self.state_store.save(self.state)
+        except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+            logger.warning("Failed to persist conversation state: %s", exc)
+            self._emit(
+                "agent.state_persist_failed",
+                {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+            )
+
     def _assistant_content(self, response: LLMResponse) -> Any:
         """Build the assistant message ``content`` to store in history.
 
@@ -451,27 +575,127 @@ class Agent:
 
         Returns ``True`` if at least one tool call resulted in an error (used
         by the escalation logic to detect a failing first turn).
+
+        When the run is cancelled mid-batch the remaining calls are NOT
+        executed, but each still gets an error ``tool_result`` appended —
+        every ``tool_use`` in the history must have its result or providers
+        reject the whole conversation on the next call.
         """
+        if self.parallel_tool_execution and len(calls) > 1:
+            return self._execute_tool_calls_parallel(calls)
         any_error = False
         for call in calls:
+            if self._cancel_event.is_set():
+                result = ToolResult(error="skipped: run cancelled")
+                self.state.add_tool_result(
+                    call.id, self._format_tool_output(result), is_error=True
+                )
+                any_error = True
+                continue
             self._emit("agent.tool_call_started", {"name": call.name, "id": call.id})
             result = self._execute_one(call)
             any_error = any_error or result.is_error
-            self._emit(
-                "agent.tool_call_finished",
-                {
-                    "name": call.name,
-                    "id": call.id,
-                    "is_error": result.is_error,
-                    "output_preview": redact_secrets(self._preview(result.output)),
-                },
-            )
+            self._emit_tool_call_finished(call, result)
             self.state.add_tool_result(
                 call.id,
                 self._format_tool_output(result),
                 is_error=result.is_error,
             )
         return any_error
+
+    def _execute_tool_calls_parallel(self, calls: list[ToolCall]) -> bool:
+        """Fan a multi-call batch out to the thread pool.
+
+        Ordering guarantees, identical to the sequential path from the
+        outside: gating happens per call in order (main thread), results are
+        finalized and appended to the state in the model's original order,
+        and every event is emitted from the main thread. Only
+        ``tool.execute`` itself runs concurrently — a cancelled run still
+        cannot preempt in-flight executions, and skipped calls still receive
+        their error ``tool_result`` so the history stays valid.
+        """
+        any_error = False
+        early_or_skip: dict[int, ToolResult] = {}
+        skipped: set[int] = set()
+        pending: list[tuple[int, ToolCall, Tool, dict[str, Any]]] = []
+
+        for i, call in enumerate(calls):
+            if self._cancel_event.is_set():
+                early_or_skip[i] = ToolResult(error="skipped: run cancelled")
+                skipped.add(i)
+                continue
+            self._emit("agent.tool_call_started", {"name": call.name, "id": call.id})
+            tool, arguments, early = self._prepare_call(call)
+            if early is not None:
+                early_or_skip[i] = early
+            else:
+                assert tool is not None
+                pending.append((i, call, tool, arguments))
+
+        executed: dict[int, ToolResult] = {}
+        executed_args: dict[int, dict[str, Any]] = {}
+        if pending:
+            executor = self._get_executor()
+            futures = {
+                executor.submit(tool.execute, **arguments): (i, call, arguments)
+                for (i, call, tool, arguments) in pending
+            }
+            for future, (i, call, arguments) in futures.items():
+                executed_args[i] = arguments
+                try:
+                    executed[i] = (
+                        future.result(timeout=self.tool_timeout)
+                        if self.tool_timeout is not None
+                        else future.result()
+                    )
+                except FutureTimeoutError:
+                    executed[i] = ToolResult(
+                        error=(
+                            f"Tool {call.name!r} timed out after {self.tool_timeout}s "
+                            "(the call may still be running in the background)"
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - surface as tool error
+                    logger.exception("Tool %s raised", call.name)
+                    executed[i] = ToolResult(error=f"{type(exc).__name__}: {exc}")
+
+        for i, call in enumerate(calls):
+            if i in early_or_skip:
+                result = early_or_skip[i]
+                any_error = any_error or result.is_error
+                if i not in skipped:
+                    self._emit_tool_call_finished(call, result)
+                self.state.add_tool_result(
+                    call.id, self._format_tool_output(result), is_error=result.is_error
+                )
+                continue
+            result = executed[i]
+            any_error = any_error or result.is_error
+            self._finalize_call(call, executed_args[i], result)
+            self._emit_tool_call_finished(call, result)
+            self.state.add_tool_result(
+                call.id, self._format_tool_output(result), is_error=result.is_error
+            )
+        return any_error
+
+    def _get_executor(self) -> ThreadPoolExecutor:
+        """Lazily create the shared tool-execution thread pool."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=8, thread_name_prefix="kinetic-tool"
+            )
+        return self._executor
+
+    def _emit_tool_call_finished(self, call: ToolCall, result: ToolResult) -> None:
+        self._emit(
+            "agent.tool_call_finished",
+            {
+                "name": call.name,
+                "id": call.id,
+                "is_error": result.is_error,
+                "output_preview": redact_secrets(self._preview(result.output)),
+            },
+        )
 
     def _execute_one(self, call: ToolCall) -> ToolResult:
         """Dispatch a single tool call, gated by hooks + permission policy.
@@ -498,6 +722,30 @@ class Agent:
            error :class:`ToolResult` so the model can react, and denials
            emit ``security.permission_denied``.
         """
+        tool, arguments, early = self._prepare_call(call)
+        if early is not None:
+            return early
+        assert tool is not None  # guaranteed by _prepare_call's contract
+        try:
+            result = self._run_tool(tool, arguments)
+        except Exception as exc:  # noqa: BLE001 - surface as tool error
+            logger.exception("Tool %s raised", call.name)
+            result = ToolResult(error=f"{type(exc).__name__}: {exc}")
+        self._finalize_call(call, arguments, result)
+        return result
+
+    def _prepare_call(
+        self, call: ToolCall
+    ) -> tuple[Tool | None, dict[str, Any], ToolResult | None]:
+        """Run pre-execution gating for one call, on the CALLER's thread.
+
+        Steps 1-4 of :meth:`_execute_one`: BEFORE_TOOL_CALL hooks, permission
+        policy + audit, confirmation fallback, unknown-tool check, and input
+        schema validation. Returns ``(tool, arguments, None)`` when the call
+        may execute, or ``(None, arguments, error_result)`` when it was
+        short-circuited. Pure of thread-unsafe work: safe to run for a whole
+        batch before executions are fanned out to the pool.
+        """
         arguments = call.arguments
         if self.hooks is not None:
             results = self._trigger_hooks(
@@ -510,7 +758,7 @@ class Agent:
                 ),
             )
             if any(not r.should_continue for r in results):
-                return ToolResult(
+                return None, arguments, ToolResult(
                     error=f"Tool call {call.name!r} cancelled by a before_tool_call hook"
                 )
             for r in results:
@@ -522,11 +770,11 @@ class Agent:
         decision = self.permission_policy.check(call.name, arguments)
         self.audit_logger.log_tool_call(call.name, arguments, decision, _utcnow())
         if not decision.allowed:
-            return self._deny_call(call, decision.reason, arguments)
+            return None, arguments, self._deny_call(call, decision.reason, arguments)
         if decision.requires_confirmation and not self._confirmed_by_hooks(
             call, arguments, decision
         ):
-            return self._deny_call(
+            return None, arguments, self._deny_call(
                 call,
                 "requires manual confirmation, not yet supported in automated "
                 f"mode ({decision.reason})",
@@ -536,12 +784,19 @@ class Agent:
         tool = self._tools.get(call.name)
         if tool is None:
             logger.error("Unknown tool requested: %s", call.name)
-            return ToolResult(error=f"Unknown tool: {call.name}")
-        try:
-            result = tool.execute(**arguments)
-        except Exception as exc:  # noqa: BLE001 - surface as tool error
-            logger.exception("Tool %s raised", call.name)
-            result = ToolResult(error=f"{type(exc).__name__}: {exc}")
+            return None, arguments, ToolResult(error=f"Unknown tool: {call.name}")
+        if self.validate_tool_inputs:
+            problems = validate_tool_input(tool.parameters, arguments)
+            if problems:
+                result = ToolResult(error="invalid tool input: " + "; ".join(problems))
+                self.audit_logger.log_tool_result(call.name, result, _utcnow())
+                return None, arguments, result
+        return tool, arguments, None
+
+    def _finalize_call(
+        self, call: ToolCall, arguments: dict[str, Any], result: ToolResult
+    ) -> None:
+        """Audit + AFTER_TOOL_CALL hooks for an EXECUTED call (main thread)."""
         self.audit_logger.log_tool_result(call.name, result, _utcnow())
         self._trigger_hooks(
             HookPoint.AFTER_TOOL_CALL,
@@ -553,7 +808,30 @@ class Agent:
                 tool_result=result,
             ),
         )
-        return result
+
+    def _run_tool(self, tool: Tool, arguments: dict[str, Any]) -> ToolResult:
+        """Run ``tool.execute`` directly, or under a wall-clock timeout.
+
+        With ``tool_timeout`` set the call runs on a shared thread pool and
+        the loop only waits up to the timeout. A timed-out call returns an
+        error result so the model can react; the worker thread itself is NOT
+        killed (Python has no safe thread kill), so a tool that hangs forever
+        still leaks its thread - the timeout protects the loop, not the
+        process. Tools wrapping subprocesses/network should enforce their own
+        real timeout too (``GitTool`` already does).
+        """
+        if self.tool_timeout is None:
+            return tool.execute(**arguments)
+        future = self._get_executor().submit(tool.execute, **arguments)
+        try:
+            return future.result(timeout=self.tool_timeout)
+        except FutureTimeoutError:
+            return ToolResult(
+                error=(
+                    f"Tool {tool.name!r} timed out after {self.tool_timeout}s "
+                    "(the call may still be running in the background)"
+                )
+            )
 
     def _trigger_hooks(self, point: HookPoint, context: HookContext) -> list[HookResult]:
         """Run the hooks registered for *point*, or nothing when unconfigured."""

@@ -19,11 +19,10 @@ from kinetic_sdk.agent.classifier import (
     TaskComplexity,
 )
 from kinetic_sdk.agent.modes import AgentMode
-from kinetic_sdk.event.bus import EventBus, Event
-from kinetic_sdk.security.policy import PermissivePolicy
+from kinetic_sdk.event.bus import Event, EventBus
 from kinetic_sdk.llm.client import LLMResponse
+from kinetic_sdk.security.policy import PermissivePolicy
 from tests._helpers import EchoTool, FailingTool, MockLLM, text_response, tool_response
-
 
 # --- helpers --------------------------------------------------------
 
@@ -304,3 +303,93 @@ def test_user_override_of_max_iterations_respected_initially():
     # error in FLASH (no escalation).
     assert agent.mode is AgentMode.FLASH
     assert any(e.payload.get("reason") == "max_iterations" for e in events)
+
+
+class _SequentialClassifier:
+    """Classifier returning a different complexity per call, in order."""
+
+    alias = "kinetic-classifier-v1"
+
+    def __init__(self, complexities: list[TaskComplexity]) -> None:
+        self._complexities = list(complexities)
+        self.call_count = 0
+
+    def classify(self, task: str) -> Classification:
+        complexity = self._complexities[min(self.call_count, len(self._complexities) - 1)]
+        self.call_count += 1
+        return Classification(
+            complexity=complexity,
+            mode=complexity.to_mode(),
+            confidence=0.9,
+            rationale="seq",
+        )
+
+
+# --- cross-run stickiness (one conversation, multiple runs) -------------------
+
+
+def test_max_classification_sticks_across_runs():
+    """Run 1 classifies COMPLEX -> MAX; run 2 classifying SIMPLE must stay MAX."""
+    clf = _SequentialClassifier([TaskComplexity.COMPLEX, TaskComplexity.SIMPLE])
+    llm = MockLLM([text_response("one"), text_response("two")])
+    bus = EventBus()
+    classified: list[Event] = []
+    bus.subscribe("agent.classified", classified.append)
+    agent = Agent(llm=llm, tools=[], classifier=clf, event_bus=bus)
+
+    agent.run("first task")
+    assert agent.mode is AgentMode.MAX
+    agent.run("second task")
+
+    assert agent.mode is AgentMode.MAX
+    assert clf.call_count == 2  # classification still runs; its result is overridden
+    assert classified[-1].payload["mode"] == "flash"
+    assert classified[-1].payload["applied_mode"] == "max"
+    assert "sticky" in classified[-1].payload["rationale"]
+
+
+def test_flash_run_does_not_stick():
+    """FLASH runs leave routing free: a later COMPLEX classification applies."""
+    clf = _SequentialClassifier([TaskComplexity.SIMPLE, TaskComplexity.COMPLEX])
+    llm = MockLLM([text_response("one"), text_response("two")])
+    agent = Agent(llm=llm, tools=[], classifier=clf)
+
+    agent.run("easy")
+    assert agent.mode is AgentMode.FLASH
+    agent.run("hard")
+    assert agent.mode is AgentMode.MAX
+
+
+def test_escalation_makes_max_sticky_for_next_run():
+    """A run that escalated FLASH -> MAX pins MAX for the next run too."""
+    clf = _SequentialClassifier([TaskComplexity.SIMPLE, TaskComplexity.SIMPLE])
+    # Run 1: first tool call errors -> immediate escalation. Run 2: trivial.
+    llm = MockLLM(
+        [
+            tool_response("c1", "boom", {}),
+            text_response("recovered"),
+            text_response("two"),
+        ]
+    )
+    agent = Agent(
+        llm=llm, tools=[FailingTool()], classifier=clf, permission_policy=PermissivePolicy()
+    )
+
+    agent.run("first")
+    assert agent.mode is AgentMode.MAX  # escalated
+    agent.run("second")
+    assert agent.mode is AgentMode.MAX  # sticky, not FLASH again
+
+
+def test_classifier_exception_fallback_does_not_stick():
+    """A transient classifier failure routes MAX for that run only."""
+    clf = _ScriptedClassifier(TaskComplexity.SIMPLE, raise_on_call=RuntimeError("down"))
+    llm = MockLLM([text_response("one"), text_response("two")])
+    agent = Agent(llm=llm, tools=[], classifier=clf)
+
+    agent.run("first")
+    assert agent.mode is AgentMode.MAX
+
+    clf._raise = None  # classifier recovers
+    agent.run("second")
+    assert agent.mode is AgentMode.FLASH

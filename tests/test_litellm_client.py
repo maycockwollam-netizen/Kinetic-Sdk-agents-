@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from kinetic_sdk.llm.client import LLMClient, LiteLLMClient, LLMResponse, ToolCall
+from kinetic_sdk.llm.client import LiteLLMClient, LLMClient, LLMResponse, ToolCall
 
 
 def _make_text_response(text: str, finish: str = "stop") -> Any:
@@ -286,3 +286,155 @@ def test_invalid_tool_arguments_falls_back_to_raw(fake_completion):
     client = _new_client()
     resp = client.chat(messages=[{"role": "user", "content": "hi"}])
     assert resp.tool_calls[0].arguments == {"_raw": "not-json{"}
+
+
+# --- retry / timeout resilience ----------------------------------------------
+
+
+class _FakeRateLimitError(Exception):
+    status_code = 429
+
+
+class _FakeServerError(Exception):
+    status_code = 503
+
+
+class _FakeBadRequestError(Exception):
+    status_code = 400
+
+
+class _FakeTimeoutError(Exception):
+    """No status_code: classified purely by class name."""
+
+
+_FakeTimeoutError.__name__ = "APITimeoutError"
+
+
+@pytest.fixture()
+def no_sleep(monkeypatch):
+    """Make backoff instant and record the requested delays."""
+    import kinetic_sdk.llm.client as client_module
+
+    delays: list[float] = []
+    monkeypatch.setattr(client_module.time, "sleep", delays.append)
+    return delays
+
+
+def _flaky_completion(monkeypatch, failures: list[Exception], return_value):
+    import litellm
+
+    calls: list[dict[str, Any]] = []
+
+    def _completion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) <= len(failures):
+            raise failures[len(calls) - 1]
+        return return_value
+
+    _completion.calls = calls
+    monkeypatch.setattr(litellm, "completion", _completion)
+    return _completion
+
+
+def test_chat_retries_transient_error_then_succeeds(monkeypatch, no_sleep):
+    resp = _make_text_response("ok")
+    completion = _flaky_completion(monkeypatch, [_FakeRateLimitError("slow down")], resp)
+    client = _new_client()
+
+    out = client.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert out.content == "ok"
+    assert len(completion.calls) == 2
+    assert len(no_sleep) == 1
+
+
+def test_chat_does_not_retry_fatal_4xx(monkeypatch, no_sleep):
+    completion = _flaky_completion(monkeypatch, [_FakeBadRequestError("bad")], None)
+    client = _new_client()
+
+    with pytest.raises(_FakeBadRequestError):
+        client.chat(messages=[{"role": "user", "content": "hi"}])
+    assert len(completion.calls) == 1
+    assert no_sleep == []
+
+
+def test_chat_gives_up_after_max_retries(monkeypatch, no_sleep):
+    completion = _flaky_completion(
+        monkeypatch,
+        [_FakeServerError("a"), _FakeRateLimitError("b"), _FakeServerError("c")],
+        None,
+    )
+    client = _new_client(max_retries=2)
+
+    with pytest.raises(_FakeServerError):
+        client.chat(messages=[{"role": "user", "content": "hi"}])
+    assert len(completion.calls) == 3  # 1 initial + 2 retries
+    assert len(no_sleep) == 2
+
+
+def test_chat_max_retries_zero_is_single_attempt(monkeypatch, no_sleep):
+    completion = _flaky_completion(monkeypatch, [_FakeRateLimitError("boom")], None)
+    client = _new_client(max_retries=0)
+
+    with pytest.raises(_FakeRateLimitError):
+        client.chat(messages=[{"role": "user", "content": "hi"}])
+    assert len(completion.calls) == 1
+    assert no_sleep == []
+
+
+def test_retry_delays_grow_exponentially_and_are_capped(monkeypatch, no_sleep):
+    failures = [_FakeServerError("x")] * 11  # 1 initial + 10 retries, all fail
+    _flaky_completion(monkeypatch, failures, None)
+    client = _new_client(max_retries=10, retry_base_delay=1.0, retry_max_delay=4.0)
+
+    with pytest.raises(_FakeServerError):
+        client.chat(messages=[{"role": "user", "content": "hi"}])
+
+    # base delays: 1, 2, 4, 4, 4, ... each with up to +25% jitter.
+    assert no_sleep[0] <= 1.25
+    assert 2.0 <= no_sleep[1] <= 2.5
+    assert all(4.0 <= d <= 5.0 for d in no_sleep[2:])
+
+
+def test_retryable_classification_by_exception_name(monkeypatch, no_sleep):
+    resp = _make_text_response("ok")
+    completion = _flaky_completion(monkeypatch, [_FakeTimeoutError("timed out")], resp)
+    client = _new_client()
+
+    out = client.chat(messages=[{"role": "user", "content": "hi"}])
+    assert out.content == "ok"
+    assert len(completion.calls) == 2
+
+
+def test_chat_stream_retries_stream_creation(monkeypatch, no_sleep):
+    chunk = SimpleNamespace(
+        choices=[SimpleNamespace(delta=SimpleNamespace(content="hi"), finish_reason="stop")],
+        usage=None,
+    )
+    completion = _flaky_completion(monkeypatch, [_FakeRateLimitError("429")], iter([chunk]))
+    client = _new_client()
+
+    events = list(client.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+
+    assert any(e.type == "done" for e in events)
+    assert len(completion.calls) == 2
+
+
+def test_timeout_is_forwarded_to_litellm(fake_completion):
+    fake_completion.return_value = _make_text_response("ok")
+    client = _new_client(timeout=12.5)
+    client.chat(messages=[{"role": "user", "content": "hi"}])
+    assert fake_completion.calls[0]["timeout"] == 12.5
+
+
+def test_timeout_omitted_when_unset(fake_completion):
+    fake_completion.return_value = _make_text_response("ok")
+    client = _new_client()
+    client.chat(messages=[{"role": "user", "content": "hi"}])
+    assert "timeout" not in fake_completion.calls[0]
+
+
+def test_invalid_retry_config_rejected():
+    for kwargs in ({"timeout": 0}, {"max_retries": -1}, {"retry_base_delay": 0}):
+        with pytest.raises(ValueError):
+            _new_client(**kwargs)
