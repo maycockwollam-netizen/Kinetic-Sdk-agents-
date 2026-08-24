@@ -45,13 +45,13 @@ class TerminalTool(Tool):
             style. Larger outputs are cut in the middle with a marker.
     """
 
-    name: ClassVar[str] = "terminal"
-    description: ClassVar[str] = (
+    name: str = "terminal"
+    description: str = (
         "Run a shell command (bash semantics: pipes, redirects, globs work). "
         "Returns combined stdout/stderr, the exit code and duration. Use for "
         "building, testing, searching and inspecting the environment."
     )
-    parameters: ClassVar[dict[str, Any]] = {
+    parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
             "command": {
@@ -108,9 +108,12 @@ class TerminalTool(Tool):
         #: ``os.environ`` itself — callers decide what the shell may see.
         self.env = env
 
-    def execute(
+    def execute(  # type: ignore[override]
         self, command: str, timeout: float | None = None, **_: Any
     ) -> ToolResult:
+        # Named-parameter signature by design: the agent loop always invokes
+        # tools via execute(**model_arguments) after schema validation, so
+        # narrowing the base **params contract is safe here.
         if not isinstance(command, str) or not command.strip():
             return ToolResult(error="command must be a non-empty string")
         effective_timeout = (
@@ -136,7 +139,9 @@ class TerminalTool(Tool):
             return ToolResult(error=f"failed to start shell: {exc}")
 
         try:
-            output, _ = proc.communicate(timeout=effective_timeout)
+            # NOTE: don't unpack as `output, _` — `_` is this method's **kwargs
+            # name, and rebinding it confuses both readers and type checkers.
+            output, _err = proc.communicate(timeout=effective_timeout)
             timed_out = False
         except subprocess.TimeoutExpired:
             timed_out = True
@@ -144,7 +149,7 @@ class TerminalTool(Tool):
                 os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-            output, _ = proc.communicate()
+            output, _err = proc.communicate()
 
         duration = time.monotonic() - started
         output, truncated = self._truncate(output or "")

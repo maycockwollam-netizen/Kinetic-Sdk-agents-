@@ -160,7 +160,11 @@ class DelegateTool(Tool):
             llm_factory=self._llm_factory,
         )
 
-    def execute(self, subagent_name: str, task_prompt: str) -> ToolResult:
+    # Named-parameter signature by design: the agent loop always invokes
+    # tools via execute(**model_arguments), so narrowing **params is safe.
+    def execute(  # type: ignore[override]
+        self, subagent_name: str, task_prompt: str
+    ) -> ToolResult:
         """Spawn the named sub-agent and run it on *task_prompt*.
 
         Every failure mode — unknown name, unbound tool, exhausted budget,

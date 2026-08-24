@@ -13,9 +13,16 @@ authors = [{ name = "KINETIC" }]
 dependencies = []
 
 [project.optional-dependencies]
-llm = ["litellm>=1.50"]
+# litellm 1.98.0 broke Python 3.10: its new anthropic context_management
+# module does `from typing import NotRequired` (3.11+ only) at import time,
+# making `import litellm` fail entirely on 3.10. Cap below it on 3.10 until
+# upstream fixes; 3.11+ is unaffected.
+llm = [
+    "litellm>=1.50,<1.98.0; python_version < '3.11'",
+    "litellm>=1.50; python_version >= '3.11'",
+]
 tokens = ["tiktoken>=0.7"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
 
 [tool.ruff]
 target-version = "py310"
@@ -26,6 +33,27 @@ lint.select = ["F", "E9", "I"]
 [tool.setuptools.packages.find]
 include = ["kinetic_sdk*"]
 
+# Ship the PEP 561 marker so downstream mypy/pyright pick up the SDK's type
+# hints instead of treating the package as untyped.
+[tool.setuptools.package-data]
+kinetic_sdk = ["py.typed"]
+
+# Type checking runs at default (non-strict) strictness for now: the SDK is
+# fully annotated, but strict mode flags patterns we deliberately use
+# (kwargs-dispatched Tool.execute overrides, Any-typed JSON payloads).
+[tool.mypy]
+python_version = "3.10"
+packages = ["kinetic_sdk"]
+ignore_missing_imports = true
+warn_redundant_casts = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+# Integration tests (tests/integration/) hit a REAL LLM provider and need a
+# real API key, so they are deselected by default. Run them explicitly with
+# `pytest -m integration` (a CLI -m overrides this addopts filter).
+addopts = "-m 'not integration'"
+markers = [
+    "integration: tests that call a real LLM provider (need an API key; not run by default)",
+]

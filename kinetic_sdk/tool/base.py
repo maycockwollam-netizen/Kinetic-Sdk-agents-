@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any
 
 
 @dataclass
@@ -49,16 +49,19 @@ class Tool(ABC):
     """
 
     #: Stable identifier sent to the model. Must be unique across a single
-    #: agent's tool set.
-    name: ClassVar[str]
+    #: agent's tool set. Declared as a plain (instance) annotation, NOT
+    #: ``ClassVar``, so both declaration styles are valid: fixed tools set it
+    #: as a class attribute (``name: ClassVar[str] = "git"``) while dynamic
+    #: tools (``MockTool``, ``MCPToolAdapter``) assign it per instance.
+    name: str
 
     #: Human-readable description shown to the model to help it decide when
     #: the tool is appropriate.
-    description: ClassVar[str]
+    description: str
 
     #: JSON Schema describing the parameters object the model should supply.
     #: Use ``type: object`` with ``properties`` for the fields you expect.
-    parameters: ClassVar[dict[str, Any]]
+    parameters: dict[str, Any]
 
     @abstractmethod
     def execute(self, **params: Any) -> ToolResult:

@@ -49,7 +49,7 @@ class ConversationState:
         self._enforce_cap()
         return msg
 
-    def add_assistant(self, content: Message) -> Message:
+    def add_assistant(self, content: str | list[dict[str, Any]]) -> Message:
         """Append an assistant turn from a provider response.
 
         *content* is the raw ``content`` block(s) returned by the LLM

@@ -22,6 +22,22 @@ jobs:
       - name: Lint
         run: ruff check kinetic_sdk tests
 
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,llm,tokens]"
+
+      - name: Type check
+        run: mypy
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -41,3 +57,28 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+  # Integration tests against a REAL LLM provider (tests/integration/).
+  # Deliberately NON-BLOCKING: these can fail for reasons outside our control
+  # (rate limits, provider outages, expired keys), so `continue-on-error`
+  # keeps a red integration run from blocking a PR whose unit tests pass.
+  # Requires the OPENHANDS_API_KEY repository secret; without it the tests
+  # self-skip and the job goes green.
+  integration:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,llm]"
+
+      - name: Run integration tests (real LLM, non-blocking)
+        env:
+          OPENHANDS_API_KEY: ${{ secrets.OPENHANDS_API_KEY }}
+        run: pytest -m integration -q

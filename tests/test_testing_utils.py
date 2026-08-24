@@ -65,6 +65,22 @@ def test_response_builders():
     assert tool.tool_calls[0].arguments == {"x": 1}
 
 
+def test_tool_response_generates_call_id_when_omitted():
+    tool = tool_response(name="calc", arguments={"x": 1})
+    call = tool.tool_calls[0]
+    assert call.id, "expected an auto-generated call id"
+    assert call.name == "calc"
+    assert call.arguments == {"x": 1}
+    # two generated ids never collide
+    other = tool_response(name="calc", arguments={"x": 1})
+    assert other.tool_calls[0].id != call.id
+
+
+def test_tool_response_requires_a_name():
+    with pytest.raises(ValueError, match="name"):
+        tool_response()
+
+
 # --- MockTool --------------------------------------------------------------
 
 

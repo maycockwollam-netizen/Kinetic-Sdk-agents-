@@ -211,12 +211,16 @@ class PluginLoader:
                         f"plugin {manifest.name!r}: cannot locate module "
                         f"{manifest.module_spec!r} under {directory}"
                     )
+                if spec is None or spec.loader is None:
+                    raise PluginLoadError(
+                        f"plugin {manifest.name!r}: cannot load spec for "
+                        f"{full_name!r} ({module_file})"
+                    )
                 module = importlib.util.module_from_spec(spec)
                 sys.modules[full_name] = module
                 inserted.append(full_name)
                 if parent is not None:
                     setattr(parent, part, module)
-                assert spec is not None and spec.loader is not None
                 spec.loader.exec_module(module)
                 parent = module
         except Exception:

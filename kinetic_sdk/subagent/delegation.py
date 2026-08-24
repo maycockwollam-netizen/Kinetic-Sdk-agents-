@@ -131,10 +131,9 @@ class _GuardedLLMClient(LLMClient):
         self._budget = budget
         self._breaker = breaker
         self._agent_id = agent_id
-
-    @property
-    def model(self) -> str:
-        return getattr(self._inner, "model", "unknown")
+        # Plain attribute (not a property) so the guard stays assignment-
+        # compatible with the writeable ``model`` attribute on LLMClient.
+        self.model = getattr(inner, "model", "unknown")
 
     @property
     def inner(self) -> LLMClient:
