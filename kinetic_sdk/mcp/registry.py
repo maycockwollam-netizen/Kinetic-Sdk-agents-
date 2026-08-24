@@ -175,6 +175,19 @@ class MCPServerRegistry:
         self._clients[name] = client
         return client
 
+    def reconnect(self, name: str) -> MCPClient:
+        """Close the cached client (if any) and connect fresh.
+
+        Long-running agents hit dead pipes (server restarted, transport
+        crashed): ``connect`` deliberately returns the CACHED client, so a
+        retry loop cannot heal on its own. Reconnecting tears the old
+        transport down first — a half-open subprocess never lingers — then
+        runs the full handshake again. Raises for unknown servers like
+        :meth:`connect` does.
+        """
+        self.close(name)
+        return self.connect(name)
+
     def get_tools_as_kinetic_tools(self, name: str) -> list[Tool]:
         """Connect (if needed) and wrap every server tool in an adapter.
 

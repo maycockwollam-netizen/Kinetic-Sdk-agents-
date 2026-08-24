@@ -960,3 +960,83 @@ validation, cancellation, persistence, streaming). Khác biệt thuần cơ họ
 - NOT done (later): async subagent (DelegateTool vẫn sync — spawn từ
   AsyncAgent sẽ chạy sync loop trong thread qua execute_async bridge, chưa
   có AsyncAgent-native delegation), AsyncMCPClient, cost/token budget.
+
+
+## Stage 5 (Production readiness, 2026-08-24 — DONE)
+
+Gap-closing pass against OpenHands/OpenAI Agents/LangGraph/Pydantic AI/
+AutoGen/ADK. 12 khu vực, quyết định ĐÃ CHỐT như sau:
+
+- **Structured output** — `Agent.run(..., output_schema=..., structured_retries=2)`
+  (sync + async). Quyết định: return type của `run()` VẪN là `str`; giá trị
+  parse được nằm ở `agent.structured_output` (None khi thất bại/sai schema
+  sau hết retry). Correction = 1 user message liệt kê validation errors
+  (`agent/structured.py`, dùng chung engine `tool/validation.validate_value`
+  — hàm public MỚI, alias path `$`). Events: `agent.structured_output_parsed`
+  / `_retry` / `_invalid`. Không inject pseudo-tool như OpenAI — schema chỉ
+  đi qua natural-language instruction + validate local (provider-neutral).
+- **Usage/cost** — `llm/usage.py` `UsageAccumulator` (+ `UsageSnapshot`);
+  `agent.usage` tổng cộng qua mọi run; mỗi LLM turn emit `llm.usage` (delta);
+  `RunTrace.usage()` + `to_summary()["usage"]`. `LiteLLMClient._attach_cost`
+  gọi `litellm.completion_cost` best-effort (static, async client tái dùng).
+  `LLMResponse.usage` đổi sang `dict[str, Any]` (cost là float).
+- **OTel** — `observability/otel.py` `OTelObservabilityLogger` (extra
+  `[otel]`, lazy import như litellm): `agent.run_started` MỞ span
+  `kinetic.run` theo run_id; mọi event cùng run thành span event;
+  `run_finished`/`error`/`cancelled` ĐÓNG span (status ERROR khi fail);
+  event không có run_id thành standalone span. `flush_and_close()` kết thúc
+  span còn treo + shutdown provider.
+- **Metrics** — `observability/metrics.py` `MetricsCollector` (subscriber
+  wildcard, KHÔNG ship backend — snapshot dict cho StatsD/Prometheus).
+- **AskUserTool** (`ask_user/`): handler inject được; fallback `input()`;
+  empty question → error; handler raise → error ToolResult. Vẫn đi qua
+  permission_policy như mọi tool.
+- **Memory** (`memory/`): `MemoryProvider` ABC (add/search/all/clear),
+  `InMemoryMemory` (keyword-overlap `relevance()`, stopwords EN+VI, tie về
+  entry MỚI nhất, score 0 bị loại), `JsonFileMemory` (atomic write +
+  schema_version giống store; corrupt → MemoryError), `MemoryTool`
+  (store/search/list/clear, MAX_LIMIT=20). `Agent(memory=...)` recall TRƯỚC
+  user message (message riêng "[Recalled memories]", event
+  `agent.memory_recalled`), store Q/A SAU run (event `agent.memory_stored`);
+  CẢ HAI fail-soft (event `agent.memory_*_failed`, run không chết).
+  KHÔNG ship embedding provider — giữ core zero-dep.
+- **Server** (`server/`): `AgentServer(agent_factory, host, port, token)`
+  stdlib `ThreadingHTTPServer`; GET /health; POST /runs {message, stream?,
+  output_schema?} → {run_id, status, final, structured_output, usage}; GET
+  /runs/<id>. Bearer token optional; body cap 1MB; factory dựng agent MỚI
+  mỗi run. Deploy thật cần TLS/gateway bên ngoài — server này là dev/staging.
+- **Checkpointing** (`conversation/checkpoint.py`): `fork_store` (copy state
+  sang JsonFileConversationStore mới, destination tồn tại →
+  CheckpointError), `rewind_state` (cut lỡ dính dangling tool_use → raise;
+  boundary hợp lệ = user/assistant-text/tool_result).
+- **Eval** (`eval/`): `EvalCase`, scorers là callables `(case, trace,
+  output) -> EvalScore` (built-in: exact_match/contains_expected/
+  no_tool_failures/tool_called(name)), `EvalRunner(agent_factory)` chạy
+  TUẦN TỰ, mỗi case 1 agent MỚI + InMemoryObservabilityLogger riêng →
+  RunTrace. Report dict: total/passed/pass_rate/results. Factory raise =
+  case error, KHÔNG crash cả batch.
+- **Docker sandbox** (`terminal/docker.py`): `docker_exec_wrapper(container,
+  workdir, user)` / `docker_run_wrapper(image, network="none", volumes, env)`
+  build argv prefix; `TerminalTool(command_wrapper=[...])` →
+  `<wrapper> bash -c <cmd>`. Wrapper là argv thuần — timeout/killpg của
+  tool vẫn hoạt động ở lớp ngoài. Lưu ý: wrapper + workspace cùng lúc thì
+  `cwd` là path HOST (trách nhiệm của caller mount đúng).
+- **Async subagent** (`subagent/async_delegation.py` + `async_tool.py`):
+  `spawn_async_subagent` / `run_async_subagent` / `AsyncDelegateTool`
+  mirror 1-1 bản sync (unwrap `_GuardedAsyncLLMClient` trước khi wrap lại
+  — KHÔNG stack guard; budget CHIA SẺ cây; breaker per-agent; audit
+  `subagent_spawn`/`subagent_finished`; sync `execute` raise
+  NotImplementedError như AsyncMockTool). `async_agent_id_for` có
+  WeakKeyDictionary RIÊNG. GOTCHA test: sub-agent kế thừa client của cha →
+  CHUNG script của MockLLM/AsyncMockLLM; test cần child dùng llm_factory +
+  spec.model khác, hoặc script rỗng ở cha.
+- **MCP reconnect**: `MCPServerRegistry.reconnect(name)` = close cached +
+  connect lại (heal dead pipe khi server restart). `connect` vẫn cache —
+  không đổi.
+
+### Debt còn lại sau Stage 5
+- Memory embedding/vector provider (cần optional dep riêng).
+- Cost/token budget cho ROOT run (subagent đã có SpawnBudget).
+- AsyncMCPClient, MCP resources/prompts.
+- Server: SSE streaming endpoint, multi-conversation store, rate limiting.
+- Parallel async subagent (budget đã thread-safe, chưa có orchestrator).

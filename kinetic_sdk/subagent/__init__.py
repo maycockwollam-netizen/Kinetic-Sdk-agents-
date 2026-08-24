@@ -51,6 +51,13 @@ Minimal example::
     root.run("Compare the two designs and recommend one.")
 """
 
+from kinetic_sdk.subagent.async_delegation import (
+    AsyncLLMFactory,
+    async_agent_id_for,
+    run_async_subagent,
+    spawn_async_subagent,
+)
+from kinetic_sdk.subagent.async_tool import AsyncDelegateTool
 from kinetic_sdk.subagent.budget import (
     DEFAULT_MAX_CONSECUTIVE_REPEATS,
     DEFAULT_MAX_TOTAL_TOOL_CALLS,
@@ -81,6 +88,8 @@ __all__ = [
     "DEFAULT_MAX_CONSECUTIVE_REPEATS",
     "DEFAULT_MAX_TOTAL_TOOL_CALLS",
     "DELEGATE_TOOL_NAME",
+    "AsyncDelegateTool",
+    "AsyncLLMFactory",
     "BudgetExceededError",
     "DelegateTool",
     "DelegationResult",
@@ -94,6 +103,9 @@ __all__ = [
     "SUBAGENT_MAX_NAME_LENGTH",
     "SUBAGENT_NAME_PATTERN",
     "agent_id_for",
+    "async_agent_id_for",
+    "run_async_subagent",
     "run_subagent",
+    "spawn_async_subagent",
     "spawn_subagent",
 ]

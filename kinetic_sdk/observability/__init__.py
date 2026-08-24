@@ -5,11 +5,15 @@ from kinetic_sdk.observability.logger import (
     InMemoryObservabilityLogger,
     ObservabilityLogger,
 )
+from kinetic_sdk.observability.metrics import MetricsCollector
+from kinetic_sdk.observability.otel import OTelObservabilityLogger
 from kinetic_sdk.observability.trace import RunTrace
 
 __all__ = [
     "ConsoleObservabilityLogger",
     "InMemoryObservabilityLogger",
+    "MetricsCollector",
+    "OTelObservabilityLogger",
     "ObservabilityLogger",
     "RunTrace",
 ]

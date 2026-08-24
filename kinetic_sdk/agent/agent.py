@@ -32,6 +32,12 @@ from typing import Any, Iterable
 
 from kinetic_sdk.agent.classifier import DefaultClassifier, TaskClassifier
 from kinetic_sdk.agent.modes import AgentMode
+from kinetic_sdk.agent.structured import (
+    CORRECTION_TEMPLATE,
+    DEFAULT_STRUCTURED_RETRIES,
+    check_final_answer,
+    schema_instruction,
+)
 from kinetic_sdk.context.manager import (
     ContextManager,
     SimpleTruncateContextManager,
@@ -43,6 +49,8 @@ from kinetic_sdk.event.bus import Event, EventBus
 from kinetic_sdk.hooks.base import HookContext, HookPoint, HookResult
 from kinetic_sdk.hooks.registry import HookRegistry
 from kinetic_sdk.llm.client import LLMClient, LLMResponse, ToolCall
+from kinetic_sdk.llm.usage import UsageAccumulator
+from kinetic_sdk.memory.provider import MemoryProvider
 from kinetic_sdk.observability.logger import ObservabilityLogger
 from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
 from kinetic_sdk.security.policy import (
@@ -157,6 +165,8 @@ class Agent:
         state_store: ConversationStore | None = None,
         validate_tool_inputs: bool = True,
         parallel_tool_execution: bool = False,
+        memory: MemoryProvider | None = None,
+        memory_recall_limit: int = 3,
     ) -> None:
         self.llm = llm
         #: Optional persistence backend. When set (and no explicit ``state``
@@ -242,6 +252,17 @@ class Agent:
         #: classification and on escalation - NOT on the exception fallback,
         #: so a transient classifier outage does not pin MAX forever.
         self._sticky_max: bool = False
+        #: Running LLM usage totals across all runs of this agent (per-run
+        #: data is in the ``llm.usage`` events; see ``llm/usage.py``).
+        self.usage = UsageAccumulator()
+        #: Parsed final answer of the last ``run(output_schema=...)`` call
+        #: (None when no schema was requested or validation ultimately failed).
+        self.structured_output: Any = None
+        #: Optional long-term memory. When set, a run recalls relevant
+        #: entries BEFORE the user turn (emits ``agent.memory_recalled``) and
+        #: stores the Q/A pair AFTER it (emits ``agent.memory_stored``).
+        self.memory = memory
+        self.memory_recall_limit = memory_recall_limit
 
         tool_list = list(tools or [])
         self._tools: dict[str, Tool] = {}
@@ -265,7 +286,14 @@ class Agent:
         """Return the tool definitions to send to the model."""
         return [t.to_schema() for t in self._tools.values()]
 
-    def run(self, user_message: str | None = None, *, stream: bool = False) -> str:
+    def run(
+        self,
+        user_message: str | None = None,
+        *,
+        stream: bool = False,
+        output_schema: dict[str, Any] | None = None,
+        structured_retries: int | None = None,
+    ) -> str:
         """Run the agent loop until the model stops calling tools.
 
         Before the first turn the task is classified exactly once (see
@@ -294,6 +322,19 @@ class Agent:
                 tool calls. Clients without streaming support fall back to a
                 plain ``chat()`` call (logged, no deltas emitted). The return
                 value is the same either way.
+            output_schema: Optional JSON Schema (the same subset as
+                ``tool/validation.py``) the FINAL answer must match. The
+                schema is appended to the task as a natural-language
+                instruction; answers that fail to parse/validate are sent
+                back to the model as correction turns (up to
+                ``structured_retries``). On success the parsed value is on
+                :attr:`structured_output` (the return value stays the raw
+                final text). Emitting events: ``agent.structured_output_parsed``,
+                ``agent.structured_output_retry`` (per failed attempt),
+                ``agent.structured_output_invalid`` (retries exhausted).
+            structured_retries: Correction rounds for ``output_schema``
+                (default :data:`~kinetic_sdk.agent.structured.DEFAULT_STRUCTURED_RETRIES`
+                = 2).
 
         Returns:
             The final assistant text. If the loop hit ``max_iterations``
@@ -302,8 +343,14 @@ class Agent:
             run was cancelled via :meth:`cancel`, returns the best text seen
             so far (possibly empty) and publishes ``agent.cancelled``.
         """
-        if user_message is not None:
-            self.state.add_user_message(user_message)
+        self.structured_output = None
+        if user_message is not None and self.memory is not None:
+            self._recall_memory(user_message)
+        composed = user_message
+        if output_schema is not None:
+            composed = (user_message or "") + "\n\n" + schema_instruction(output_schema)
+        if composed is not None:
+            self.state.add_user_message(composed)
 
         self._cancel_event.clear()  # a new run starts un-cancelled
         self._run_id = str(uuid.uuid4())
@@ -322,7 +369,11 @@ class Agent:
 
         final_text = ""
         try:
-            final_text = self._run_loop(stream=stream)
+            final_text = self._run_loop(
+                stream=stream,
+                output_schema=output_schema,
+                structured_retries=structured_retries,
+            )
         except Exception as exc:
             self._trigger_hooks(
                 HookPoint.ON_ERROR,
@@ -342,6 +393,8 @@ class Agent:
             ),
         )
         self._emit("agent.run_finished", {"final_text": final_text, "mode": self.mode.value})
+        if user_message is not None and self.memory is not None:
+            self._store_memory(user_message, final_text)
         return final_text
 
     def escalate(self) -> bool:
@@ -432,11 +485,19 @@ class Agent:
         """True after :meth:`cancel` until the next :meth:`run` starts."""
         return self._cancel_event.is_set()
 
-    def _run_loop(self, stream: bool = False) -> str:
+    def _run_loop(
+        self,
+        stream: bool = False,
+        output_schema: dict[str, Any] | None = None,
+        structured_retries: int | None = None,
+    ) -> str:
         """The tool-calling loop, with mid-run FLASH -> MAX escalation."""
         final_text = ""
         iteration = 0
         escalated = False
+        retries_left = (
+            DEFAULT_STRUCTURED_RETRIES if structured_retries is None else structured_retries
+        )
         while iteration < self.max_iterations:
             if self._cancel_event.is_set():
                 logger.info("Agent run cancelled at iteration %d", iteration)
@@ -476,6 +537,12 @@ class Agent:
 
             if not response.tool_calls:
                 final_text = response.content
+                if output_schema is not None:
+                    decision = self._check_structured(output_schema, final_text, retries_left)
+                    if decision == "retry":
+                        retries_left -= 1
+                        iteration += 1
+                        continue
                 # Persist only at replay-valid boundaries: an assistant text
                 # turn (no dangling tool_use) or right after tool results.
                 self._persist_state()
@@ -546,7 +613,9 @@ class Agent:
         system, messages = self.state.for_llm()
         tools = self.tool_schemas() or None
         if not stream:
-            return self.llm.chat(messages=messages, tools=tools, system=system)
+            response = self.llm.chat(messages=messages, tools=tools, system=system)
+            self._record_usage(response)
+            return response
         try:
             final: LLMResponse | None = None
             for event in self.llm.chat_stream(messages=messages, tools=tools, system=system):
@@ -559,12 +628,88 @@ class Agent:
                 "%s does not support streaming; falling back to chat()",
                 type(self.llm).__name__,
             )
-            return self.llm.chat(messages=messages, tools=tools, system=system)
+            response = self.llm.chat(messages=messages, tools=tools, system=system)
+            self._record_usage(response)
+            return response
         if final is None:
             # Stream ended without a done event: treat as an empty end turn
             # rather than crashing the loop.
             final = LLMResponse(content="", stop_reason="end_turn")
+        self._record_usage(final)
         return final
+
+    def _check_structured(
+        self, schema: dict[str, Any], text: str, retries_left: int
+    ) -> str:
+        """Validate a final answer against *schema*; return "break" | "retry".
+
+        Success sets :attr:`structured_output` and emits
+        ``agent.structured_output_parsed``; failure with rounds left appends
+        a correction user message and emits ``agent.structured_output_retry``;
+        failure with no rounds left emits ``agent.structured_output_invalid``
+        (the raw text is still returned as the final answer).
+        """
+        ok, value, problems = check_final_answer(schema, text)
+        if ok:
+            self.structured_output = value
+            self._emit("agent.structured_output_parsed", {"schema": schema})
+            return "break"
+        if retries_left > 0:
+            self.state.add_user_message(
+                CORRECTION_TEMPLATE.format(problems="; ".join(problems))
+            )
+            self._emit("agent.structured_output_retry", {"problems": problems})
+            return "retry"
+        self._emit("agent.structured_output_invalid", {"problems": problems})
+        return "break"
+
+    def _recall_memory(self, query: str) -> None:
+        """Inject relevant memories as a user message before the real task.
+
+        The recall message lands in the history BEFORE the user's own
+        message, so the model sees context first. Fail-soft (a broken
+        provider never blocks the run): the failure is logged and the event
+        ``agent.memory_recall_failed`` is emitted.
+        """
+        assert self.memory is not None
+        try:
+            recalled = self.memory.search(query, limit=self.memory_recall_limit)
+        except Exception as exc:  # noqa: BLE001 - fail-soft
+            logger.warning("Memory recall failed: %s", exc)
+            self._emit(
+                "agent.memory_recall_failed",
+                {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+            )
+            return
+        if not recalled:
+            return
+        lines = "\n".join("- " + e.text for e in recalled)
+        self.state.add_user_message(f"[Recalled memories]\n{lines}")
+        self._emit("agent.memory_recalled", {"query": query, "count": len(recalled)})
+
+    def _store_memory(self, user_message: str, final_text: str) -> None:
+        """Remember the completed Q/A pair; fail-soft like recall."""
+        assert self.memory is not None
+        try:
+            entry = self.memory.add(
+                f"User: {user_message}\nAssistant: {final_text}",
+                metadata={"run_id": self._run_id},
+            )
+            self._emit("agent.memory_stored", {"id": entry.id})
+        except Exception as exc:  # noqa: BLE001 - fail-soft
+            logger.warning("Memory store failed: %s", exc)
+            self._emit(
+                "agent.memory_store_failed",
+                {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+            )
+
+    def _record_usage(self, response: LLMResponse) -> None:
+        """Fold one LLM turn's usage into the agent total + emit a delta."""
+        if not response.usage:
+            return
+        self.usage.record(response.usage)
+        # Delta only — totals live in ``agent.usage`` (cumulative across runs).
+        self._emit("llm.usage", {"usage": dict(response.usage)})
 
     def _persist_state(self) -> None:
         """Save the conversation to the configured store, never fatally.

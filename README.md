@@ -34,6 +34,15 @@ rewriting the agent loop.
   cooperative cancellation (`agent.cancel()`), tool-input schema validation,
   optional parallel tool execution, and the standard `terminal` +
   `file_editor` tools.
+- **Stage 5 — Production readiness: done.** Structured output
+  (`run(output_schema=...)`), usage/cost tracking, OpenTelemetry export
+  (`otel` extra), metrics aggregation, ask-user human-in-the-loop tool,
+  long-term memory (keyword-ranked, JSON-file durable), a stdlib REST
+  `AgentServer`, checkpoint fork/rewind helpers, an eval harness, docker
+  sandbox adapters for `TerminalTool`, async sub-agent delegation, and MCP
+  reconnect. See `CHANGELOG.md` for the full detail.
+- **Async layer — done.** `AsyncAgent` mirrors every sync capability
+  (routing, compaction, hooks, policy, structured output, memory, usage).
 
 ## Module map
 
@@ -84,6 +93,14 @@ rewriting the agent loop.
   tree-wide tool-call budget and per-agent repetition circuit breakers.
 - `kinetic_sdk/testing/` — public test utilities: `MockLLMClient`, `MockTool`,
   and trace assertions.
+- `kinetic_sdk/ask_user/` — `AskUserTool`: the agent asks the operator a
+  question mid-run through an injectable handler (human-in-the-loop).
+- `kinetic_sdk/eval/` — eval harness: cases, callable scorers, and an
+  `EvalRunner` with per-case `RunTrace` reporting.
+- `kinetic_sdk/memory/` — long-term memory providers (in-memory + JSON
+  file), `MemoryTool`, and the `Agent(memory=...)` auto recall/store wiring.
+- `kinetic_sdk/server/` — `AgentServer`: stdlib-only REST API for one-shot
+  agent runs (bearer-token auth optional).
 - `kinetic_sdk/tool/` — abstract tool interface and `ToolResult` dataclass.
 - `kinetic_sdk/workspace/` — `Workspace`: root-confined path resolution and
   file listing (path-traversal safe).

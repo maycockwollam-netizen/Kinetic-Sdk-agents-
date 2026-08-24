@@ -57,6 +57,17 @@ def validate_tool_input(schema: dict[str, Any], params: Any) -> list[str]:
     return errors
 
 
+def validate_value(schema: Any, value: Any, path: str = "") -> list[str]:
+    """Public generic-value validation (structured output, nested checks).
+
+    Same engine as :func:`validate_tool_input`'s per-value checks, but
+    callable directly on any JSON value (e.g. the parsed final answer when
+    ``Agent.run(output_schema=...)`` is in play). Returns problems; empty
+    means valid.
+    """
+    return _validate_value(value, schema, path or "$")
+
+
 def _validate_value(value: Any, schema: Any, path: str) -> list[str]:
     if not isinstance(schema, dict) or not schema:
         return []

@@ -92,6 +92,7 @@ class TerminalTool(Tool):
         max_timeout: float = MAX_TIMEOUT,
         max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
         env: dict[str, str] | None = None,
+        command_wrapper: list[str] | None = None,
     ) -> None:
         if timeout <= 0 or max_timeout <= 0:
             raise ValueError("timeout values must be positive")
@@ -103,6 +104,12 @@ class TerminalTool(Tool):
         self.timeout = timeout
         self.max_timeout = max_timeout
         self.max_output_chars = max_output_chars
+        #: Optional argv prefix placed before ``bash -c <command>`` — a
+        #: sandbox adapter (e.g. ``docker exec -i <container>`` from
+        #: ``terminal/docker.py``) turns itself into exactly this prefix,
+        #: so the tool executes ``<wrapper> bash -c <command>`` while its
+        #: own timeout/process-group kill keeps working on the outer layer.
+        self.command_wrapper = list(command_wrapper or [])
         #: Environment for the subprocess. ``None`` inherits the process env
         #: (the subprocess default); a dict REPLACES it. The tool never reads
         #: ``os.environ`` itself — callers decide what the shell may see.
@@ -126,7 +133,7 @@ class TerminalTool(Tool):
         started = time.monotonic()
         try:
             proc = subprocess.Popen(
-                ["bash", "-c", command],
+                [*self.command_wrapper, "bash", "-c", command],
                 cwd=cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

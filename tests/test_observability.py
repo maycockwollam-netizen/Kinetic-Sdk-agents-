@@ -203,6 +203,12 @@ def test_trace_summary_reflects_escalation_denial_and_compaction():
         "escalated": True,
         "permission_denied": True,
         "context_compacted": True,
+        "usage": {
+            "calls": 0,
+            "cost_usd": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        },
     }
 
 

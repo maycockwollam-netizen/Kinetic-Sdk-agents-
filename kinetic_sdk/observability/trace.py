@@ -101,6 +101,33 @@ class RunTrace:
         last = transitions[-1]
         return last.get("to") if last["event"] == "escalated" else last.get("mode")
 
+    def usage(self) -> dict[str, Any]:
+        """Aggregate token usage from the run's ``llm.usage`` events.
+
+        ``Agent`` emits one such event per LLM turn (payload: ``{"usage":
+        {...}}``). Totals across RUNS of the same agent live on
+        ``agent.usage`` (:class:`~kinetic_sdk.llm.usage.UsageAccumulator`).
+        """
+        input_tokens = 0
+        output_tokens = 0
+        cost_usd = 0.0
+        calls = 0
+        for e in self._of_type("llm.usage"):
+            usage = e["payload"].get("usage") or {}
+            calls += 1
+            if isinstance(usage.get("input_tokens"), int):
+                input_tokens += usage["input_tokens"]
+            if isinstance(usage.get("output_tokens"), int):
+                output_tokens += usage["output_tokens"]
+            if isinstance(usage.get("cost_usd"), (int, float)):
+                cost_usd += usage["cost_usd"]
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": round(cost_usd, 6),
+            "calls": calls,
+        }
+
     def to_summary(self) -> dict[str, Any]:
         """Compact one-run summary for quick inspection or aggregation later."""
         calls = self.tool_calls()
@@ -113,4 +140,5 @@ class RunTrace:
             "escalated": bool(self._of_type("agent.escalated")),
             "permission_denied": bool(self._of_type("security.permission_denied")),
             "context_compacted": bool(self._of_type("context.compacted")),
+            "usage": self.usage(),
         }

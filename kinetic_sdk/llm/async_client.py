@@ -101,7 +101,9 @@ class AsyncLiteLLMClient(AsyncLLMClient):
         """Non-streaming chat turn via ``litellm.acompletion``."""
         request = self._build_request(messages, tools, system, **kwargs)
         raw = await self._acompletion_with_retry(request)
-        return LiteLLMClient._parse_response(raw)
+        response = LiteLLMClient._parse_response(raw)
+        LiteLLMClient._attach_cost(self._litellm, raw, response)
+        return response
 
     async def chat_stream(
         self,

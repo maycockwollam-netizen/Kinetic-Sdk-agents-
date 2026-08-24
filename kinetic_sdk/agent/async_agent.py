@@ -47,6 +47,12 @@ from kinetic_sdk.agent.async_classifier import (
 )
 from kinetic_sdk.agent.classifier import TaskClassifier
 from kinetic_sdk.agent.modes import AgentMode
+from kinetic_sdk.agent.structured import (
+    CORRECTION_TEMPLATE,
+    DEFAULT_STRUCTURED_RETRIES,
+    check_final_answer,
+    schema_instruction,
+)
 from kinetic_sdk.context.manager import (
     ContextManager,
     SimpleTruncateContextManager,
@@ -64,6 +70,8 @@ from kinetic_sdk.llm.client import (
     LLMResponse,
     ToolCall,
 )
+from kinetic_sdk.llm.usage import UsageAccumulator
+from kinetic_sdk.memory.provider import MemoryProvider
 from kinetic_sdk.observability.logger import ObservabilityLogger
 from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
 from kinetic_sdk.security.policy import (
@@ -153,6 +161,8 @@ class AsyncAgent:
         state_store: ConversationStore | None = None,
         validate_tool_inputs: bool = True,
         parallel_tool_execution: bool = False,
+        memory: MemoryProvider | None = None,
+        memory_recall_limit: int = 3,
     ) -> None:
         if isinstance(llm, AsyncLLMClient):
             self.llm: AsyncLLMClient = llm
@@ -248,6 +258,15 @@ class AsyncAgent:
         #: it), later runs never route back to FLASH. Set on successful MAX
         #: classification and on escalation - NOT on the exception fallback.
         self._sticky_max: bool = False
+        #: Running LLM usage totals across all runs (per-run data is in the
+        #: ``llm.usage`` events; see ``llm/usage.py``).
+        self.usage = UsageAccumulator()
+        #: Parsed final answer of the last ``run(output_schema=...)`` (None
+        #: when no schema was requested or validation ultimately failed).
+        self.structured_output: Any = None
+        #: Optional long-term memory (recall before runs, store after).
+        self.memory = memory
+        self.memory_recall_limit = memory_recall_limit
 
         tool_list = list(tools or [])
         self._tools: dict[str, Tool] = {}
@@ -271,7 +290,14 @@ class AsyncAgent:
         """Return the tool definitions to send to the model."""
         return [t.to_schema() for t in self._tools.values()]
 
-    async def run(self, user_message: str | None = None, *, stream: bool = False) -> str:
+    async def run(
+        self,
+        user_message: str | None = None,
+        *,
+        stream: bool = False,
+        output_schema: dict[str, Any] | None = None,
+        structured_retries: int | None = None,
+    ) -> str:
         """Run the agent loop until the model stops calling tools.
 
         Semantics are identical to :meth:`Agent.run`: the task is classified
@@ -295,8 +321,14 @@ class AsyncAgent:
             published; on :meth:`cancel` the best text so far is returned
             and ``agent.cancelled`` is published.
         """
-        if user_message is not None:
-            self.state.add_user_message(user_message)
+        self.structured_output = None
+        if user_message is not None and self.memory is not None:
+            await self._recall_memory(user_message)
+        composed = user_message
+        if output_schema is not None:
+            composed = (user_message or "") + "\n\n" + schema_instruction(output_schema)
+        if composed is not None:
+            self.state.add_user_message(composed)
 
         self._cancel_event.clear()  # a new run starts un-cancelled
         self._run_id = str(uuid.uuid4())
@@ -315,7 +347,11 @@ class AsyncAgent:
 
         final_text = ""
         try:
-            final_text = await self._run_loop(stream=stream)
+            final_text = await self._run_loop(
+                stream=stream,
+                output_schema=output_schema,
+                structured_retries=structured_retries,
+            )
         except Exception as exc:
             await self._trigger_hooks(
                 HookPoint.ON_ERROR,
@@ -335,6 +371,8 @@ class AsyncAgent:
             ),
         )
         await self._emit("agent.run_finished", {"final_text": final_text, "mode": self.mode.value})
+        if user_message is not None and self.memory is not None:
+            await self._store_memory(user_message, final_text)
         return final_text
 
     def escalate(self) -> bool:
@@ -429,11 +467,19 @@ class AsyncAgent:
         else:
             self.max_iterations = self.MODE_MAX_ITERATIONS[mode]
 
-    async def _run_loop(self, stream: bool = False) -> str:
+    async def _run_loop(
+        self,
+        stream: bool = False,
+        output_schema: dict[str, Any] | None = None,
+        structured_retries: int | None = None,
+    ) -> str:
         """The tool-calling loop, with mid-run FLASH -> MAX escalation."""
         final_text = ""
         iteration = 0
         escalated = False
+        retries_left = (
+            DEFAULT_STRUCTURED_RETRIES if structured_retries is None else structured_retries
+        )
         while iteration < self.max_iterations:
             if self._cancel_event.is_set():
                 logger.info("Agent run cancelled at iteration %d", iteration)
@@ -473,6 +519,14 @@ class AsyncAgent:
 
             if not response.tool_calls:
                 final_text = response.content
+                if output_schema is not None:
+                    decision = await self._check_structured(
+                        output_schema, final_text, retries_left
+                    )
+                    if decision == "retry":
+                        retries_left -= 1
+                        iteration += 1
+                        continue
                 # Persist only at replay-valid boundaries: an assistant text
                 # turn (no dangling tool_use) or right after tool results.
                 await self._persist_state()
@@ -555,7 +609,9 @@ class AsyncAgent:
         system, messages = self.state.for_llm()
         tools = self.tool_schemas() or None
         if not stream:
-            return await self.llm.chat(messages=messages, tools=tools, system=system)
+            response = await self.llm.chat(messages=messages, tools=tools, system=system)
+            await self._record_usage(response)
+            return response
         try:
             final: LLMResponse | None = None
             async for event in self.llm.chat_stream(messages=messages, tools=tools, system=system):
@@ -568,12 +624,83 @@ class AsyncAgent:
                 "%s does not support streaming; falling back to chat()",
                 type(self.llm).__name__,
             )
-            return await self.llm.chat(messages=messages, tools=tools, system=system)
+            response = await self.llm.chat(messages=messages, tools=tools, system=system)
+            await self._record_usage(response)
+            return response
         if final is None:
             # Stream ended without a done event: treat as an empty end turn
             # rather than crashing the loop.
             final = LLMResponse(content="", stop_reason="end_turn")
+        await self._record_usage(final)
         return final
+
+    async def _check_structured(
+        self, schema: dict[str, Any], text: str, retries_left: int
+    ) -> str:
+        """Validate a final answer against *schema*; return "break" | "retry".
+
+        Mirrors the sync agent's check: success sets ``structured_output``
+        and emits ``agent.structured_output_parsed``; a failure with rounds
+        left appends a correction user turn and emits
+        ``agent.structured_output_retry``; the exhausted case emits
+        ``agent.structured_output_invalid`` and keeps the raw text.
+        """
+        ok, value, problems = check_final_answer(schema, text)
+        if ok:
+            self.structured_output = value
+            await self._emit("agent.structured_output_parsed", {"schema": schema})
+            return "break"
+        if retries_left > 0:
+            self.state.add_user_message(
+                CORRECTION_TEMPLATE.format(problems="; ".join(problems))
+            )
+            await self._emit("agent.structured_output_retry", {"problems": problems})
+            return "retry"
+        await self._emit("agent.structured_output_invalid", {"problems": problems})
+        return "break"
+
+    async def _recall_memory(self, query: str) -> None:
+        """Inject relevant memories before the task (fail-soft, like sync)."""
+        assert self.memory is not None
+        try:
+            recalled = self.memory.search(query, limit=self.memory_recall_limit)
+        except Exception as exc:  # noqa: BLE001 - fail-soft
+            logger.warning("Memory recall failed: %s", exc)
+            await self._emit(
+                "agent.memory_recall_failed",
+                {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+            )
+            return
+        if not recalled:
+            return
+        lines = "\n".join("- " + e.text for e in recalled)
+        self.state.add_user_message(f"[Recalled memories]\n{lines}")
+        await self._emit(
+            "agent.memory_recalled", {"query": query, "count": len(recalled)}
+        )
+
+    async def _store_memory(self, user_message: str, final_text: str) -> None:
+        """Remember the completed Q/A pair (fail-soft, like sync)."""
+        assert self.memory is not None
+        try:
+            entry = self.memory.add(
+                f"User: {user_message}\nAssistant: {final_text}",
+                metadata={"run_id": self._run_id},
+            )
+            await self._emit("agent.memory_stored", {"id": entry.id})
+        except Exception as exc:  # noqa: BLE001 - fail-soft
+            logger.warning("Memory store failed: %s", exc)
+            await self._emit(
+                "agent.memory_store_failed",
+                {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+            )
+
+    async def _record_usage(self, response: LLMResponse) -> None:
+        """Fold one LLM turn's usage into the agent total + emit a delta."""
+        if not response.usage:
+            return
+        self.usage.record(response.usage)
+        await self._emit("llm.usage", {"usage": dict(response.usage)})
 
     async def _persist_state(self) -> None:
         """Save the conversation to the configured store, never fatally.

@@ -8,6 +8,7 @@ from kinetic_sdk.llm.client import (
     LLMResponse,
     ToolCall,
 )
+from kinetic_sdk.llm.usage import UsageAccumulator, UsageSnapshot
 
 __all__ = [
     "AsyncLLMClient",
@@ -17,4 +18,6 @@ __all__ = [
     "LiteLLMClient",
     "SyncToAsyncLLMClient",
     "ToolCall",
+    "UsageAccumulator",
+    "UsageSnapshot",
 ]

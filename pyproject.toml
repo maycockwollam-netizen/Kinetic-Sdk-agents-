@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kinetic-agent-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "A modular agent SDK for the KINETIC coding agent."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,6 +22,7 @@ llm = [
     "litellm>=1.50; python_version >= '3.11'",
 ]
 tokens = ["tiktoken>=0.7"]
+otel = ["opentelemetry-sdk>=1.25"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
 
 [tool.ruff]

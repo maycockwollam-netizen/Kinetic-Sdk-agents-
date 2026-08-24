@@ -103,14 +103,16 @@ class LLMResponse:
         stop_reason: Provider-native stop reason (e.g. ``"end_turn"`` or
             ``"tool_use"``). Useful for debugging and tests.
         usage: Token usage info with at least ``input_tokens`` and
-            ``output_tokens`` when the provider reports it.
+            ``output_tokens`` when the provider reports it, optionally a
+            best-effort ``cost_usd`` float (see ``LiteLLMClient``).
         raw: The unprocessed provider response, for advanced use.
     """
 
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     stop_reason: str | None = None
-    usage: dict[str, int] = field(default_factory=dict)
+    # Values are ints for token counts, float for the optional cost.
+    usage: dict[str, Any] = field(default_factory=dict)
     raw: Any = None
 
 
@@ -456,7 +458,24 @@ class LiteLLMClient(LLMClient):
         """Non-streaming chat turn via ``litellm.completion``."""
         request = self._build_request(messages, tools, system, **kwargs)
         raw = self._completion_with_retry(request)
-        return self._parse_response(raw)
+        response = self._parse_response(raw)
+        self._attach_cost(self._litellm, raw, response)
+        return response
+
+    @staticmethod
+    def _attach_cost(litellm_module: Any, raw: Any, response: LLMResponse) -> None:
+        """Best-effort cost lookup via ``litellm.completion_cost``.
+
+        Fills ``response.usage["cost_usd"]`` when litellm can price the call.
+        Pricing tables are optional per provider: any failure or a falsy
+        value leaves the usage untouched (tokens still accumulate).
+        """
+        try:
+            cost = litellm_module.completion_cost(completion_response=raw)
+        except Exception:  # noqa: BLE001 - pricing must never break a call
+            return
+        if isinstance(cost, (int, float)) and cost > 0:
+            response.usage["cost_usd"] = float(cost)
 
     def chat_stream(
         self,
