@@ -28,6 +28,7 @@ Design notes:
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import time
@@ -476,7 +477,13 @@ class LiteLLMClient(LLMClient):
         request["stream"] = True
         stream = self._completion_with_retry(request)
         text_buf: list[str] = []
-        tool_calls: list[ToolCall] = []
+        # OpenAI-style streaming sends a tool call as FRAGMENTS spread over
+        # many chunks: the first chunk for a call carries ``index`` + ``id`` +
+        # function name, later chunks at the same index carry only argument
+        # text fragments. Accumulate per index and parse the concatenated
+        # arguments once, at the end. Providers that send a complete call in
+        # one chunk are the degenerate case (a single full fragment).
+        tool_fragments: dict[int, dict[str, Any]] = {}
         stop_reason: str | None = None
         usage: dict[str, int] = {}
         for chunk in stream:
@@ -492,28 +499,35 @@ class LiteLLMClient(LLMClient):
             if text:
                 text_buf.append(text)
                 yield StreamEvent(type="text", delta=text)
-            # Some providers surface completed tool calls on the delta.
             raw_calls = getattr(delta, "tool_calls", None) or []
             for rc in raw_calls:
                 fn = getattr(rc, "function", None)
                 if fn is None:
                     continue
-                import json
-
-                raw_args = getattr(fn, "arguments", "{}")
-                try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) and raw_args else (raw_args or {})
-                except json.JSONDecodeError:
-                    args = {"_raw": raw_args}
-                call = ToolCall(id=getattr(rc, "id", ""), name=getattr(fn, "name", ""), arguments=args)
-                if not any(t.id == call.id and t.name == call.name for t in tool_calls):
-                    tool_calls.append(call)
+                index = getattr(rc, "index", None)
+                slot = tool_fragments.setdefault(
+                    index if isinstance(index, int) else 0,
+                    {"id": "", "name": "", "args": []},
+                )
+                rid = getattr(rc, "id", None)
+                if rid:
+                    slot["id"] = rid
+                fname = getattr(fn, "name", None)
+                if fname:
+                    slot["name"] = fname
+                frag = getattr(fn, "arguments", None)
+                if frag:
+                    slot["args"].append(frag)
             fr = getattr(choice, "finish_reason", None)
             if fr:
                 stop_reason = self._map_stop_reason(fr)
             u = getattr(chunk, "usage", None)
             if u is not None:
                 usage.update(self._parse_usage(chunk))
+        tool_calls = [
+            self._tool_call_from_fragments(slot)
+            for _, slot in sorted(tool_fragments.items())
+        ]
         final = LLMResponse(
             content="".join(text_buf),
             tool_calls=tool_calls,
@@ -522,6 +536,20 @@ class LiteLLMClient(LLMClient):
             raw=None,
         )
         yield StreamEvent(type="done", delta=final)
+
+    @staticmethod
+    def _tool_call_from_fragments(slot: dict[str, Any]) -> ToolCall:
+        """Assemble one streamed tool call from its accumulated fragments."""
+        raw_args = "".join(slot["args"])
+        try:
+            args = (
+                json.loads(raw_args)
+                if isinstance(raw_args, str) and raw_args
+                else (raw_args or {})
+            )
+        except json.JSONDecodeError:
+            args = {"_raw": raw_args}
+        return ToolCall(id=slot["id"], name=slot["name"], arguments=args)
 
     # --- internals ----------------------------------------------------
 

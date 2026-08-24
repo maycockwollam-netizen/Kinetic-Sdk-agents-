@@ -257,6 +257,81 @@ def test_chat_stream_collects_tool_calls(fake_completion):
     assert final.stop_reason == "tool_use"
 
 
+def test_chat_stream_assembles_fragmented_tool_calls(fake_completion):
+    """Real OpenAI-style streaming splits one tool call over many chunks:
+    id+name first, argument text in later fragments at the same index."""
+    args = json.dumps({"message": "hello world"})
+    mid = len(args) // 2
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="c1",
+                                type="function",
+                                function=SimpleNamespace(name="echo", arguments=None),
+                            )
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                type="function",
+                                function=SimpleNamespace(name=None, arguments=args[:mid]),
+                            )
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                type="function",
+                                function=SimpleNamespace(name=None, arguments=args[mid:]),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=None,
+        ),
+    ]
+    fake_completion.return_value = chunks
+    client = _new_client()
+    events = list(client.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    final = [e for e in events if e.type == "done"][0].delta
+    assert len(final.tool_calls) == 1
+    assert final.tool_calls[0].id == "c1"
+    assert final.tool_calls[0].name == "echo"
+    assert final.tool_calls[0].arguments == {"message": "hello world"}
+    assert final.stop_reason == "tool_use"
+
+
 def test_map_stop_reason_unknown_passthrough():
     assert LiteLLMClient._map_stop_reason("length") == "max_tokens"
     assert LiteLLMClient._map_stop_reason("weird-finish") == "weird-finish"

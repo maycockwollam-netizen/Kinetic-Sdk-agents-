@@ -321,10 +321,13 @@ class SSETransport(Transport):
             raise MCPTransportError(
                 f"SSETransport only supports http(s) URLs, got {self._url!r}"
             )
+        hostname = parts.hostname
+        if not hostname:
+            raise MCPTransportError(f"SSE URL has no host: {self._url!r}")
         conn_cls = (
             http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
         )
-        conn = conn_cls(parts.hostname, parts.port, timeout=self._connect_timeout)
+        conn = conn_cls(hostname, parts.port, timeout=self._connect_timeout)
         path = parts.path or "/"
         if parts.query:
             path += "?" + parts.query
@@ -394,10 +397,13 @@ class SSETransport(Transport):
         self._open()
         assert self._post_url is not None
         parts = urlsplit(self._post_url)
+        hostname = parts.hostname
+        if not hostname:
+            raise MCPTransportError(f"SSE endpoint URL has no host: {self._post_url!r}")
         conn_cls = (
             http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
         )
-        conn = conn_cls(parts.hostname, parts.port, timeout=self._connect_timeout)
+        conn = conn_cls(hostname, parts.port, timeout=self._connect_timeout)
         path = parts.path or "/"
         if parts.query:
             path += "?" + parts.query

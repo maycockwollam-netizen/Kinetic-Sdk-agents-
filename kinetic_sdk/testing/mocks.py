@@ -9,9 +9,10 @@ so an agent built on them behaves exactly as it would against real backends.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Sequence
+import uuid
+from typing import Any, Callable, Iterator, Sequence
 
-from kinetic_sdk.llm.client import LLMClient, LLMResponse, ToolCall
+from kinetic_sdk.llm.client import LLMClient, LLMResponse, StreamEvent, ToolCall
 from kinetic_sdk.tool.base import Tool, ToolResult
 
 #: A scripted response entry: a ready-made LLMResponse, or a callable
@@ -40,12 +41,46 @@ class MockLLMClient(LLMClient):
         self._responses = list(responses)
         self.calls: list[dict[str, Any]] = []
 
+    #: Chunk size used by :meth:`chat_stream` when splitting a scripted
+    #: response's content into text deltas (small on purpose so tests observe
+    #: multiple deltas, like a real provider stream).
+    STREAM_CHUNK_SIZE = 8
+
     def chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
         **kwargs: Any,
+    ) -> LLMResponse:
+        return self._next_response(messages, tools, system, kwargs)
+
+    def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        system: str | None = None,
+        **kwargs: Any,
+    ) -> Iterator[StreamEvent]:
+        """Stream the next scripted response: text deltas, then ``done``.
+
+        Consumes the script exactly like :meth:`chat` (one entry per turn),
+        so the same script drives streaming and non-streaming agents. The
+        final ``done`` event carries the full scripted response, tool calls
+        included.
+        """
+        response = self._next_response(messages, tools, system, kwargs)
+        content = response.content
+        for i in range(0, len(content), self.STREAM_CHUNK_SIZE):
+            yield StreamEvent(type="text", delta=content[i : i + self.STREAM_CHUNK_SIZE])
+        yield StreamEvent(type="done", delta=response)
+
+    def _next_response(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        system: str | None,
+        kwargs: dict[str, Any],
     ) -> LLMResponse:
         self.calls.append(
             {"messages": messages, "tools": tools, "system": system, "kwargs": kwargs}
@@ -63,11 +98,29 @@ def text_response(text: str) -> LLMResponse:
     return LLMResponse(content=text, stop_reason="end_turn")
 
 
-def tool_response(call_id: str, name: str, arguments: dict[str, Any]) -> LLMResponse:
-    """Build a response requesting one tool call."""
+def tool_response(
+    call_id: str | None = None,
+    name: str = "",
+    arguments: dict[str, Any] | None = None,
+) -> LLMResponse:
+    """Build a response requesting one tool call.
+
+    ``call_id`` is optional: when omitted (or ``None``) a random UUID-based id
+    is generated, so tests that don't care about the id can write
+    ``tool_response(name="calc", arguments={...})``. The historical positional
+    order ``tool_response("call-1", "calc", {...})`` keeps working.
+    """
+    if not name:
+        raise ValueError("tool_response requires a tool name")
     return LLMResponse(
         content="",
-        tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)],
+        tool_calls=[
+            ToolCall(
+                id=call_id or f"call-{uuid.uuid4()}",
+                name=name,
+                arguments=arguments if arguments is not None else {},
+            )
+        ],
         stop_reason="tool_use",
     )
 

@@ -73,7 +73,8 @@ class Agent:
         event_bus: Optional event bus the loop publishes lifecycle events to.
             Events emitted (see module docstring for the full list):
               ``agent.run_started``, ``agent.turn_started``,
-              ``agent.llm_response``, ``agent.tool_call_started``,
+              ``agent.llm_response``, ``agent.text_delta`` (only when
+              ``run(stream=True)``), ``agent.tool_call_started``,
               ``agent.tool_call_finished``, ``agent.run_finished``,
               ``agent.escalated``, ``agent.classified``, ``agent.error``,
               ``context.compacted``, ``context.summarization_failed``,
@@ -264,7 +265,7 @@ class Agent:
         """Return the tool definitions to send to the model."""
         return [t.to_schema() for t in self._tools.values()]
 
-    def run(self, user_message: str | None = None) -> str:
+    def run(self, user_message: str | None = None, *, stream: bool = False) -> str:
         """Run the agent loop until the model stops calling tools.
 
         Before the first turn the task is classified exactly once (see
@@ -285,6 +286,14 @@ class Agent:
             user_message: Optional user turn to append before running. Pass
                 ``None`` to continue an existing conversation (e.g. after a
                 tool result injected externally - not used in Stage 1).
+            stream: When ``True``, LLM turns use ``chat_stream()`` and every
+                text chunk is published in real time as an ``agent.text_delta``
+                event (payload: ``{"delta": str}``) instead of observers
+                waiting for the whole response. Tool calling is unaffected —
+                the model may stream text first and still end the turn with
+                tool calls. Clients without streaming support fall back to a
+                plain ``chat()`` call (logged, no deltas emitted). The return
+                value is the same either way.
 
         Returns:
             The final assistant text. If the loop hit ``max_iterations``
@@ -313,7 +322,7 @@ class Agent:
 
         final_text = ""
         try:
-            final_text = self._run_loop()
+            final_text = self._run_loop(stream=stream)
         except Exception as exc:
             self._trigger_hooks(
                 HookPoint.ON_ERROR,
@@ -423,7 +432,7 @@ class Agent:
         """True after :meth:`cancel` until the next :meth:`run` starts."""
         return self._cancel_event.is_set()
 
-    def _run_loop(self) -> str:
+    def _run_loop(self, stream: bool = False) -> str:
         """The tool-calling loop, with mid-run FLASH -> MAX escalation."""
         final_text = ""
         iteration = 0
@@ -449,7 +458,7 @@ class Agent:
                 logger.info("Agent run cancelled at iteration %d", iteration)
                 self._emit("agent.cancelled", {"iteration": iteration})
                 return final_text
-            response = self._call_llm()
+            response = self._call_llm(stream=stream)
             self._trigger_hooks(
                 HookPoint.AFTER_LLM_CALL,
                 HookContext(
@@ -524,11 +533,38 @@ class Agent:
             },
         )
 
-    def _call_llm(self) -> LLMResponse:
-        """Ask the LLM for the next turn using the current history + tools."""
+    def _call_llm(self, stream: bool = False) -> LLMResponse:
+        """Ask the LLM for the next turn using the current history + tools.
+
+        With ``stream=True`` the client's ``chat_stream`` is consumed instead:
+        each text chunk is re-published as an ``agent.text_delta`` event as it
+        arrives, and the aggregated response from the final ``done`` event is
+        returned, so the rest of the loop (tool calling, escalation) works
+        unchanged. A client that does not implement streaming falls back to a
+        plain ``chat`` call.
+        """
         system, messages = self.state.for_llm()
         tools = self.tool_schemas() or None
-        return self.llm.chat(messages=messages, tools=tools, system=system)
+        if not stream:
+            return self.llm.chat(messages=messages, tools=tools, system=system)
+        try:
+            final: LLMResponse | None = None
+            for event in self.llm.chat_stream(messages=messages, tools=tools, system=system):
+                if event.type == "text" and isinstance(event.delta, str):
+                    self._emit("agent.text_delta", {"delta": event.delta})
+                elif event.type == "done" and isinstance(event.delta, LLMResponse):
+                    final = event.delta
+        except NotImplementedError:
+            logger.warning(
+                "%s does not support streaming; falling back to chat()",
+                type(self.llm).__name__,
+            )
+            return self.llm.chat(messages=messages, tools=tools, system=system)
+        if final is None:
+            # Stream ended without a done event: treat as an empty end turn
+            # rather than crashing the loop.
+            final = LLMResponse(content="", stop_reason="end_turn")
+        return final
 
     def _persist_state(self) -> None:
         """Save the conversation to the configured store, never fatally.

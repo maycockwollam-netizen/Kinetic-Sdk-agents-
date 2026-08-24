@@ -11,18 +11,46 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 - Install (dev): `pip install -e ".[dev]"`
 - Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
 - Install (real tokenizer, optional): `pip install -e ".[tokens]"` (tiktoken)
-- Run tests: `python -m pytest -q` (775 tests). NOTE: the litellm tests need
+- Run tests: `python -m pytest -q` (786 unit tests + 4 integration deselected
+  by default — see "Integration tests" below). NOTE: the litellm tests need
   the `[llm]` extra — install BOTH (`pip install -e ".[dev,llm]"`) or 11
   tests error. The tiktoken tests `importorskip` without `[tokens]`.
 - Lint: `ruff check kinetic_sdk tests` — rule set DELIBERATELY narrow
   (`F`, `E9`, `I` only, configured in `pyproject.toml`); broader style rules
   are a future decision, do not silently expand.
+- Type check: `mypy` (config in `pyproject.toml`, checks `kinetic_sdk` only).
+  Strictness level: DEFAULT (non-strict) mode — the SDK is fully annotated
+  and ships `py.typed` (PEP 561), but strict mode flags deliberate patterns
+  (kwargs-dispatched `Tool.execute` overrides carry targeted
+  `# type: ignore[override]`, JSON payloads are `Any`-typed). `warn_unused_ignores`
+  is intentionally OFF: a few pre-existing ignores are version-dependent
+  (needed on some typeshed/mypy combos, unused on others).
 - No build step beyond pip install.
-- CI: `.github/workflows/test.yml` — two jobs: `lint` (ruff) and `test`
-  (matrix Python 3.10/3.11/3.12, `pip install -e ".[dev,llm,tokens]"`,
-  `pytest -q`). No secrets needed: all tests run with mocked LLM/tool
+- CI: `.github/workflows/test.yml` — four jobs: `lint` (ruff), `typecheck`
+  (mypy), `test` (matrix Python 3.10/3.11/3.12,
+  `pip install -e ".[dev,llm,tokens]"`, `pytest -q`) and `integration`
+  (real LLM, `continue-on-error: true`, reads `OPENHANDS_API_KEY` from
+  GitHub Secrets — NON-BLOCKING by design, see "Integration tests" below).
+  Unit-test jobs need no secrets: all tests run with mocked LLM/tool
   (MCP tests use fake stdio/SSE servers, no real Unity/GitHub server).
   Deferred on purpose: dep cache, coverage gate, CD.
+
+## Integration tests (real LLM — added in the round-2 feedback pass)
+- `tests/integration/test_llm_integration.py` calls a REAL provider through
+  `LiteLLMClient` (no `litellm.completion` mock): simple chat round-trip,
+  real tool-call decision + Anthropic↔OpenAI translation round-trip with a
+  real `tool_result`, streaming round-trip, and a full `Agent.run` loop.
+- Marked `pytest.mark.integration` and DESELECTED by default via
+  `addopts = "-m 'not integration'"` in `pyproject.toml` — run explicitly
+  with `pytest -m integration` (a CLI `-m` overrides the addopts filter).
+  The module also self-skips when no API key is present.
+- Config via env: `KINETIC_INTEGRATION_API_KEY` (falls back to
+  `OPENHANDS_API_KEY`), `KINETIC_INTEGRATION_MODEL` (default
+  `openai/openhands/glm-5.2`), `KINETIC_INTEGRATION_API_BASE` (default the
+  OpenHands proxy). A key that is SET but INVALID fails the tests (correct
+  behaviour — only a MISSING key skips).
+- CI job `integration` is `continue-on-error: true`: rate limits / provider
+  outages / expired keys must not block a PR whose unit tests pass.
 
 ## Stage status
 - Stage 1 (Core): DONE — `tool`, `event`, `llm`, `conversation`, `agent` loop.
@@ -807,7 +835,65 @@ dưới đây là ĐÃ CHỐT, đừng "sửa" ngược trừ khi có lý do m�
   (F401 false positive) → tests sập hàng loạt. Re-export viết dạng
   `MockLLM = _mocks.MockLLMClient` (alias assignment) — ruff không đụng.
 - NOT done (later): async agent loop (AsyncLLMClient vẫn interface-only),
-  streaming vào loop (client có `chat_stream`, loop chưa dùng), cost/token
-  budget cho root run, metrics/OTel, policy theo resource, MCP
-  resources/prompts + reconnect, integration test với LLM thật (toàn mock
-  hiện tại), hot-reload plugin.
+  cost/token budget cho root run, metrics/OTel, policy theo resource, MCP
+  resources/prompts + reconnect, hot-reload plugin.
+
+## Round-2 feedback pass (2026-08, post-hardening — DONE)
+
+Xử lý feedback từ kỹ sư test thật, 4 ưu tiên. Quyết định đã chốt:
+
+### Streaming vào agent loop
+- `Agent.run(user_message, *, stream: bool = False)` — chọn tham số keyword
+  trên `run()` thay vì method `run_stream()` riêng vì ÍT PHÁ VỠ interface
+  nhất: signature cũ nguyên vẹn, return type vẫn `str` (final text), caller
+  nhận real-time qua event bus.
+- Khi `stream=True`: `_call_llm` consume `llm.chat_stream()`, mỗi text chunk
+  emit `agent.text_delta` (payload `{"delta": str}`) NGAY KHI NHẬN, response
+  tổng hợp từ event `done` đi tiếp vào loop như cũ → tool calling/escalation
+  không đổi (model stream text trước rồi gọi tool vẫn đúng thứ tự — có test).
+  Client không hỗ trợ streaming (`NotImplementedError`) → fallback `chat()`
+  kèm warning log, KHÔNG crash.
+- `LiteLLMClient.chat_stream` ĐÃ SỬA aggregation tool call: trước đây giữ
+  fragment đầu tiên rồi dedup → args bị cắt với provider stream thật. Giờ
+  accumulate theo `index` (id/name ở chunk đầu, arguments nối dần), parse
+  JSON MỘT LẦN ở cuối (`_tool_call_from_fragments`). Provider gửi call hoàn
+  chỉnh trong 1 chunk là trường hợp suy biến (1 fragment đầy đủ).
+- `MockLLMClient.chat_stream` mới: consume script Y HỆT `chat()` (1 entry/turn,
+  qua `_next_response` chung), yield text theo chunk `STREAM_CHUNK_SIZE=8`
+  rồi `done` mang nguyên response (tool calls included) — cùng 1 script test
+  được cả 2 chế độ.
+
+### py.typed + mypy
+- `kinetic_sdk/py.typed` (rỗng, PEP 561) + `[tool.setuptools.package-data]`
+  trong pyproject — đã verify file nằm trong wheel build thật.
+- `Tool.name/description/parameters` đổi từ `ClassVar[...]` sang instance
+  annotation thuần: cả pattern class-attr (GitTool/TerminalTool/FileTool gán
+  ở class level, bỏ `ClassVar` khỏi 3 trường này) lẫn pattern instance-attr
+  (MockTool/MCPToolAdapter/DelegateTool gán trong `__init__`) đều hợp lệ.
+  Trước đây base khai ClassVar → mypy "Cannot assign to class variable via
+  instance" ở mọi tool động.
+- GOTCHA mypy thật đã gặp: `def execute(self, command: str, **_: Any)` rồi
+  `output, _ = proc.communicate()` — `_` trong `**_` là biến `dict[str, Any]`,
+  unpack gán `str` vào `_` → lỗi tưởng như ở `output`. Fix: unpack thành
+  `output, _err`.
+- `_GuardedLLMClient.model` đổi từ read-only property sang plain instance
+  attribute (property override writeable attr của `LLMClient` là lỗi mypy).
+- `JSONLAuditLogger(path)` giờ nhận `str | os.PathLike[str]`.
+- Các lỗi mypy khác đã fix thật: hostname Optional trong SSETransport (raise
+  `MCPTransportError` khi URL không có host), `add_assistant` nhận
+  `str | list[dict]`, plugin loader check `spec is None` trước
+  `module_from_spec`, FileTool handler dict annotate `Callable[..., ToolResult]`.
+
+### Điểm nhỏ
+- `LICENSE` (MIT) ở root — khớp `license = "MIT"` trong pyproject.
+- `kinetic_sdk/__init__.py` re-export tối thiểu: `Agent`, `AgentMode`,
+  `Tool`, `ToolResult`, `PermissionPolicy`, `AllowListPolicy`,
+  `PermissivePolicy`, `PermissionDecision`, `ConversationState`, `Event`,
+  `EventBus`, `LLMClient`, `LLMResponse`, `ToolCall`, `StreamEvent` (+
+  `__version__`). CỐ Ý không re-export hết — tránh circular import và rối
+  API surface; mọi thứ khác import từ submodule như cũ.
+- `tool_response(call_id=None, name="", arguments=None)`: `call_id` tự sinh
+  `call-<uuid4>` khi bỏ trống (`tool_response(name="calc", arguments={...})`);
+  thứ tự positional cũ `tool_response("id-1", "calc", {...})` vẫn chạy —
+  KHÔNG đảo thứ tự tham số vì sẽ âm thầm phá mọi test hiện có. Thiếu `name`
+  → `ValueError`.

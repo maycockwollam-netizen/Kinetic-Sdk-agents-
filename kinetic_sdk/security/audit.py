@@ -10,6 +10,7 @@ append and trivial to parse back later).
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -135,7 +136,7 @@ class JSONLAuditLogger(AuditLogger):
     incrementally. Each write is flushed immediately for the same reason.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = Path(path)
         self._fh: TextIO = self.path.open("a", encoding="utf-8")
 

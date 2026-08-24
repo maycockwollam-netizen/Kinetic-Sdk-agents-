@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, Callable, ClassVar
 
 from kinetic_sdk.tool.base import Tool, ToolResult
 from kinetic_sdk.workspace.manager import PathTraversalError, Workspace
@@ -38,13 +38,13 @@ class FileTool(Tool):
             with a marker) so a huge file cannot flood the context.
     """
 
-    name: ClassVar[str] = "file_editor"
-    description: ClassVar[str] = (
+    name: str = "file_editor"
+    description: str = (
         "View and edit text files inside the workspace. Actions: view (with "
         "optional view_range), create, str_replace (unique match), insert "
         "after a line, undo_edit. Paths are workspace-relative."
     )
-    parameters: ClassVar[dict[str, Any]] = {
+    parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
             "action": {
@@ -86,19 +86,25 @@ class FileTool(Tool):
 
     # --- dispatch -----------------------------------------------------
 
-    def execute(self, action: str, path: str, **params: Any) -> ToolResult:
+    def execute(  # type: ignore[override]
+        self, action: str, path: str, **params: Any
+    ) -> ToolResult:
+        # Named-parameter signature by design: the agent loop always invokes
+        # tools via execute(**model_arguments) after schema validation, so
+        # narrowing the base **params contract is safe here.
         try:
             target = Path(self.workspace.resolve(path))
         except PathTraversalError as exc:
             return ToolResult(error=f"path rejected: {exc}")
 
-        handler = {
+        actions: dict[str, Callable[..., ToolResult]] = {
             "view": self._view,
             "create": self._create,
             "str_replace": self._str_replace,
             "insert": self._insert,
             "undo_edit": self._undo_edit,
-        }.get(action)
+        }
+        handler = actions.get(action)
         if handler is None:
             return ToolResult(
                 error=f"unknown action {action!r} (expected view/create/str_replace/insert/undo_edit)"

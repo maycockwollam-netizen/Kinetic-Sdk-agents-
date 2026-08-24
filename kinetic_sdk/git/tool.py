@@ -81,8 +81,8 @@ class GitTool(Tool):
     before a process is spawned.
     """
 
-    name: ClassVar[str] = "git"
-    description: ClassVar[str] = (
+    name: str = "git"
+    description: str = (
         "Run git operations in the project repository. Exactly one 'action' "
         "per call: 'status' (working-tree summary), 'diff' (unstaged changes, "
         "or staged=true for staged), 'add' (stage 'paths'), 'commit' (requires "
@@ -93,7 +93,7 @@ class GitTool(Tool):
         "('remote'/'branch' optional), 'log' (recent commits, 'max_count' "
         "capped)."
     )
-    parameters: ClassVar[dict[str, Any]] = {
+    parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
             "action": {
@@ -207,7 +207,7 @@ class GitTool(Tool):
 
     # -- Tool interface -----------------------------------------------------
 
-    def execute(self, action: str, **params: Any) -> ToolResult:
+    def execute(self, action: str, **params: Any) -> ToolResult:  # type: ignore[override]
         """Dispatch one git sub-action after validating its parameters."""
         handler = getattr(self, f"_action_{action}", None)
         if action not in self.ACTIONS or handler is None:
