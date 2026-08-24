@@ -70,6 +70,7 @@ from kinetic_sdk.testing.assertions import (
     assert_no_permission_denied,
     assert_tool_called,
 )
+from kinetic_sdk.testing.async_mocks import AsyncMockLLMClient, AsyncMockTool
 from kinetic_sdk.testing.mocks import (
     MockLLMClient,
     MockTool,
@@ -78,6 +79,8 @@ from kinetic_sdk.testing.mocks import (
 )
 
 __all__ = [
+    "AsyncMockLLMClient",
+    "AsyncMockTool",
     "MockLLMClient",
     "MockTool",
     "assert_mode",

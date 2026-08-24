@@ -837,9 +837,9 @@ dưới đây là ĐÃ CHỐT, đừng "sửa" ngược trừ khi có lý do m�
 - GOTCHA ruff: `--select F --fix` xóa re-export trong `tests/_helpers.py`
   (F401 false positive) → tests sập hàng loạt. Re-export viết dạng
   `MockLLM = _mocks.MockLLMClient` (alias assignment) — ruff không đụng.
-- NOT done (later): async agent loop (AsyncLLMClient vẫn interface-only),
-  cost/token budget cho root run, metrics/OTel, policy theo resource, MCP
-  resources/prompts + reconnect, hot-reload plugin.
+- NOT done (later): cost/token budget cho root run, metrics/OTel, policy
+  theo resource, MCP resources/prompts + reconnect, hot-reload plugin.
+  (Async agent loop đã DONE — xem "Async agent loop" bên dưới.)
 
 ## Round-2 feedback pass (2026-08, post-hardening — DONE)
 
@@ -900,3 +900,63 @@ Xử lý feedback từ kỹ sư test thật, 4 ưu tiên. Quyết định đã c
   thứ tự positional cũ `tool_response("id-1", "calc", {...})` vẫn chạy —
   KHÔNG đảo thứ tự tham số vì sẽ âm thầm phá mọi test hiện có. Thiếu `name`
   → `ValueError`.
+
+## Async agent loop (2026-08 — DONE)
+
+Full async layer, mirror 1-1 bản sync về MẶT SEMANTIC (routing, escalation,
+sticky MAX, compaction, hooks, permission/confirmation, audit, observability,
+validation, cancellation, persistence, streaming). Khác biệt thuần cơ học:
+
+- `agent/async_agent.py` — `AsyncAgent`: `await agent.run(...)`. Chấp nhận
+  CẢ `AsyncLLMClient` lẫn sync `LLMClient` (auto-wrap qua
+  `SyncToAsyncLLMClient`), CẢ `AsyncTaskClassifier` lẫn sync `TaskClassifier`
+  (auto-bridge qua `asyncio.to_thread` trong `_SyncClassifierBridge`).
+  `escalate()` giữ SYNC (chỉ mutate state) — event `agent.escalated` do loop
+  emit ngay sau (event publish là async), khác bản sync emit trong method.
+  KHÔNG re-entrant: 1 instance = 1 run tại 1 thời điểm; nhiều agent độc lập
+  chạy `asyncio.gather` song song tốt (có test).
+- `llm/async_client.py` — `AsyncLiteLLMClient` (dùng `litellm.acompletion`,
+  retry/backoff bằng `asyncio.sleep`, stream là async generator; translation
+  + parsing TÁI DÙNG static methods của `LiteLLMClient` để 2 backend không
+  drift) và `SyncToAsyncLLMClient` (thread-bridge; `chat_stream` buffer rồi
+  replay — mất incremental nhưng giữ đúng event sequence).
+- `agent/async_classifier.py` — `AsyncTaskClassifier` ABC +
+  `AsyncDefaultClassifier` + `AsyncLiteLLMClassifier` (alias
+  `kinetic-classifier-v1`, KHÔNG lộ model thật — `_build_prompt` tự implement
+  lại y hệt bản sync thay vì gọi unbound method của class sync, vì mypy
+  reject `LiteLLMClassifier._build_prompt(self)` khi self là async class).
+- `Tool.execute_async(**params)` — method MỚI trên ABC: default chạy sync
+  `execute` qua `asyncio.to_thread` (mọi sync tool dùng được ngay, không
+  block event loop); tool native-async override. `execute` vẫn abstract nên
+  tool async-only (vd `AsyncMockTool`) raise `NotImplementedError` ở sync
+  path — cố ý, tránh lẫn wiring.
+- `HookRegistry.trigger_async` — await coroutine hooks tuần tự theo thứ tự
+  đăng ký; sync `trigger()` giờ REJECT coroutine hook kèm warning (trước đây
+  awaitable bị collect lặng lẽ = bug tiềm ẩn), `.close()` để tránh warning
+  "never awaited".
+- Events: `AsyncAgent._emit` dùng `EventBus.publish_async` → coroutine
+  subscribers được await (sync Agent skip chúng).
+- Parallel tool execution: `asyncio.gather` thay thread pool; gating vẫn
+  tuần tự trước, finalize theo THỨ TỰ GỐC của model. `tool_timeout` dùng
+  `asyncio.wait_for` — native-async tool bị CANCEL THẬT (khác bản sync chỉ
+  abandon thread); thread-bridged sync tool vẫn chạy ngầm (Python không kill
+  được thread) — docstring ghi rõ.
+- `testing/async_mocks.py` — `AsyncMockLLMClient` (cùng script format với
+  `MockLLMClient` + chấp nhận coroutine callables, 1 entry/turn cho cả
+  `chat` lẫn `chat_stream`) và `AsyncMockTool` (handler sync hoặc async đều
+  được; sync `execute` raise).
+- Compaction + state persistence chạy qua `asyncio.to_thread` (manager/store
+  là sync, có thể blocking I/O hoặc LLM call trong SummarizingContextManager).
+- GOTCHA mypy đã gặp: `SyncToAsyncLLMClient.model` phải là plain instance
+  attribute (property override writeable attr của ABC = lỗi — cùng rule
+  `_GuardedLLMClient`).
+- Tests: `tests/test_async_agent.py` (56), `test_async_llm_client.py` (fake
+  litellm module qua monkeypatch sys.modules, không network),
+  `test_async_classifier.py`, `test_async_hooks_and_tools.py`. Tất cả dùng
+  `pytestmark = pytest.mark.asyncio` (strict mode của pytest-asyncio 1.x).
+  Test sync chạy trong file async-marked phải có mark tường minh hoặc đổi
+  thành async, nếu không PytestWarning.
+- Top-level `kinetic_sdk/__init__.py` thêm `AsyncAgent` + `AsyncLLMClient`.
+- NOT done (later): async subagent (DelegateTool vẫn sync — spawn từ
+  AsyncAgent sẽ chạy sync loop trong thread qua execute_async bridge, chưa
+  có AsyncAgent-native delegation), AsyncMCPClient, cost/token budget.

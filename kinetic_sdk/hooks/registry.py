@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 
 from kinetic_sdk.event.bus import Event, EventBus
@@ -51,11 +52,50 @@ class HookRegistry:
         Hooks returning ``None`` (pure observers) contribute no result.
         Exceptions are caught, logged and emitted as ``hooks.error``; the
         remaining hooks still run.
+
+        A coroutine hook's awaitable is NOT awaited here (there is no event
+        loop to await it on in the synchronous agent loop) — it is closed
+        immediately and treated as a misconfiguration, logged accordingly.
+        Async hooks must be used with :meth:`trigger_async` (the
+        :class:`~kinetic_sdk.agent.async_agent.AsyncAgent` path).
         """
         results: list[HookResult] = []
         for hook in self._hooks.get(point, []):
             try:
                 result = hook(context)
+                if inspect.isawaitable(result):
+                    logger.warning(
+                        "Coroutine hook %r at %s cannot be awaited by the "
+                        "synchronous trigger(); use trigger_async (AsyncAgent).",
+                        hook,
+                        point.value,
+                    )
+                    result.close()  # silence "never awaited" warnings
+                    continue
+            except Exception as exc:  # noqa: BLE001 - hooks must not break the loop
+                logger.exception("Hook %r failed at %s", hook, point.value)
+                self._emit_error(point, hook, exc)
+                continue
+            if result is not None:
+                results.append(result)
+        return results
+
+    async def trigger_async(
+        self, point: HookPoint, context: HookContext
+    ) -> list[HookResult]:
+        """Async variant of :meth:`trigger` used by the async agent loop.
+
+        Sync hooks are called directly; coroutine hooks are awaited in
+        registration order (sequential, like the sync path — ordering stays
+        predictable). The same safety rule applies: a raising hook is caught,
+        logged, emitted as ``hooks.error`` and never blocks the rest.
+        """
+        results: list[HookResult] = []
+        for hook in self._hooks.get(point, []):
+            try:
+                result = hook(context)
+                if inspect.isawaitable(result):
+                    result = await result
             except Exception as exc:  # noqa: BLE001 - hooks must not break the loop
                 logger.exception("Hook %r failed at %s", hook, point.value)
                 self._emit_error(point, hook, exc)

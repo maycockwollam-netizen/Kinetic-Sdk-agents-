@@ -604,11 +604,12 @@ class LiteLLMClient(LLMClient):
 
 
 class AsyncLLMClient(ABC):
-    """Async variant of :class:`LLMClient` for streaming-first providers.
+    """Async variant of :class:`LLMClient`, consumed by ``AsyncAgent``.
 
-    Stage 1 keeps the agent loop synchronous for determinism; this interface
-    is provided so future async providers can plug in without reshaping the
-    agent. It mirrors :class:`LLMClient` with awaitable methods.
+    It mirrors :class:`LLMClient` with awaitable methods. Two adapters ship
+    in :mod:`kinetic_sdk.llm.async_client`: :class:`AsyncLiteLLMClient`
+    (native async via ``litellm.acompletion``) and
+    :class:`SyncToAsyncLLMClient` (thread-bridge over any sync client).
     """
 
     model: str

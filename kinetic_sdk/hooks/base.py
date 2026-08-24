@@ -117,6 +117,10 @@ class Hook(Protocol):
 
     Any function ``(HookContext) -> HookResult | None`` satisfies this
     protocol — returning ``None`` means "just observing, no opinion".
+    Coroutine functions ``async (HookContext) -> HookResult | None`` are also
+    accepted; they are awaited by the async agent loop
+    (:meth:`HookRegistry.trigger_async`) and rejected with a warning by the
+    synchronous loop (:meth:`HookRegistry.trigger`).
     """
 
     def __call__(self, context: HookContext) -> HookResult | None: ...

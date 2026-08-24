@@ -8,6 +8,7 @@ touching the agent code.
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -77,6 +78,26 @@ class Tool(ABC):
             unexpected failures; recoverable errors should be returned via
             ``ToolResult(error=...)`` so the agent can react.
         """
+
+    async def execute_async(self, **params: Any) -> ToolResult:
+        """Async variant of :meth:`execute`, used by the async agent loop.
+
+        The default implementation runs the synchronous :meth:`execute` in a
+        worker thread (``asyncio.to_thread``) so existing sync tools work
+        under :class:`~kinetic_sdk.agent.async_agent.AsyncAgent` without
+        blocking the event loop. Tools with a natively async backend (async
+        HTTP client, async subprocess, ...) should override this method —
+        overriding ``execute`` is still required by the ABC, so a pure-async
+        tool typically implements ``execute`` as a thin
+        ``asyncio.run(self.execute_async(...))`` wrapper or raises
+        ``NotImplementedError`` when it must never run synchronously.
+
+        Note on cancellation: when the async loop abandons an ``await`` of
+        this method (e.g. a tool timeout), a native-async override is
+        cancelled for real, while the default thread bridge keeps running in
+        the background — Python cannot safely kill a running thread.
+        """
+        return await asyncio.to_thread(self.execute, **params)
 
     def to_schema(self) -> dict[str, Any]:
         """Return the tool definition in a provider-neutral shape.
