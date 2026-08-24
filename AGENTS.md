@@ -9,7 +9,10 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
 
 ## Build / Test commands
 - Install (dev): `pip install -e ".[dev]"`
-- Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`)
+- Install (llm backend, optional): `pip install -e ".[llm]"` (pulls in `litellm`).
+  GOTCHA upstream: litellm 1.98.0 is BROKEN on Python 3.10 (`from typing import
+  NotRequired` at import time) — the extra caps it to `<1.98.0` on
+  `python_version < '3.11'` until upstream fixes; revisit the cap later.
 - Install (real tokenizer, optional): `pip install -e ".[tokens]"` (tiktoken)
 - Run tests: `python -m pytest -q` (786 unit tests + 4 integration deselected
   by default — see "Integration tests" below). NOTE: the litellm tests need

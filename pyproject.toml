@@ -13,7 +13,14 @@ authors = [{ name = "KINETIC" }]
 dependencies = []
 
 [project.optional-dependencies]
-llm = ["litellm>=1.50"]
+# litellm 1.98.0 broke Python 3.10: its new anthropic context_management
+# module does `from typing import NotRequired` (3.11+ only) at import time,
+# making `import litellm` fail entirely on 3.10. Cap below it on 3.10 until
+# upstream fixes; 3.11+ is unaffected.
+llm = [
+    "litellm>=1.50,<1.98.0; python_version < '3.11'",
+    "litellm>=1.50; python_version >= '3.11'",
+]
 tokens = ["tiktoken>=0.7"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
 
