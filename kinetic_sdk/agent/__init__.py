@@ -7,6 +7,7 @@ from kinetic_sdk.agent.async_classifier import (
     AsyncLiteLLMClassifier,
     AsyncTaskClassifier,
 )
+from kinetic_sdk.agent.budget import RunBudget, RunBudgetExceeded
 from kinetic_sdk.agent.classifier import (
     Classification,
     DefaultClassifier,
@@ -26,6 +27,8 @@ __all__ = [
     "Classification",
     "DefaultClassifier",
     "LiteLLMClassifier",
+    "RunBudget",
+    "RunBudgetExceeded",
     "TaskClassifier",
     "TaskComplexity",
 ]

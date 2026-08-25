@@ -30,6 +30,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from kinetic_sdk.agent.budget import RunBudget, RunBudgetExceeded
 from kinetic_sdk.agent.classifier import DefaultClassifier, TaskClassifier
 from kinetic_sdk.agent.modes import AgentMode
 from kinetic_sdk.agent.structured import (
@@ -85,9 +86,9 @@ class Agent:
               ``run(stream=True)``), ``agent.tool_call_started``,
               ``agent.tool_call_finished``, ``agent.run_finished``,
               ``agent.escalated``, ``agent.classified``, ``agent.error``,
-              ``context.compacted``, ``context.summarization_failed``,
-              ``security.permission_denied``, ``hooks.error`` (via the
-              hook registry).
+              ``agent.budget_exceeded``, ``context.compacted``,
+              ``context.summarization_failed``, ``security.permission_denied``,
+              ``hooks.error`` (via the hook registry).
         classifier: Optional :class:`TaskClassifier`. When provided (or when
             the default is used) :meth:`run` classifies the task exactly once
             before the first turn and routes to FLASH or MAX. Pass ``None`` to
@@ -167,6 +168,7 @@ class Agent:
         parallel_tool_execution: bool = False,
         memory: MemoryProvider | None = None,
         memory_recall_limit: int = 3,
+        run_budget: RunBudget | None = None,
     ) -> None:
         self.llm = llm
         #: Optional persistence backend. When set (and no explicit ``state``
@@ -263,6 +265,11 @@ class Agent:
         #: stores the Q/A pair AFTER it (emits ``agent.memory_stored``).
         self.memory = memory
         self.memory_recall_limit = memory_recall_limit
+        #: Optional root-run cost guardrail (see ``agent/budget.py``). Checked
+        #: before every LLM call; on exhaustion the run stops gracefully with
+        #: an explanatory final text and an ``agent.budget_exceeded`` event —
+        #: no exception escapes the loop. ``None`` (default) = unlimited.
+        self.run_budget = run_budget
 
         tool_list = list(tools or [])
         self._tools: dict[str, Tool] = {}
@@ -341,7 +348,10 @@ class Agent:
             without a final answer, returns the last assistant text seen
             (possibly empty) and publishes an ``agent.error`` event. If the
             run was cancelled via :meth:`cancel`, returns the best text seen
-            so far (possibly empty) and publishes ``agent.cancelled``.
+            so far (possibly empty) and publishes ``agent.cancelled``. If a
+            :attr:`run_budget` was set and is exhausted, the loop stops before
+            the next LLM call, emits ``agent.budget_exceeded`` and returns a
+            final text starting with ``"Run stopped: budget exceeded"``.
         """
         self.structured_output = None
         if user_message is not None and self.memory is not None:
@@ -519,6 +529,10 @@ class Agent:
                 logger.info("Agent run cancelled at iteration %d", iteration)
                 self._emit("agent.cancelled", {"iteration": iteration})
                 return final_text
+            budget_stop = self._budget_stop_message()
+            if budget_stop is not None:
+                logger.warning("Run budget exceeded: %s", budget_stop)
+                return budget_stop
             response = self._call_llm(stream=stream)
             self._trigger_hooks(
                 HookPoint.AFTER_LLM_CALL,
@@ -703,8 +717,29 @@ class Agent:
                 {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
             )
 
+    def _budget_stop_message(self) -> str | None:
+        """Check the run budget before an LLM call.
+
+        Returns the graceful-stop final text when the budget is exhausted
+        (emitting ``agent.budget_exceeded`` with used/limit details), or
+        ``None`` when the next call may proceed. The exception raised by
+        :meth:`RunBudget.check` never escapes the loop.
+        """
+        if self.run_budget is None:
+            return None
+        try:
+            self.run_budget.check()
+            return None
+        except RunBudgetExceeded as exc:
+            self._emit("agent.budget_exceeded", self.run_budget.details())
+            return f"Run stopped: budget exceeded ({exc})."
+
     def _record_usage(self, response: LLMResponse) -> None:
         """Fold one LLM turn's usage into the agent total + emit a delta."""
+        if self.run_budget is not None:
+            # Count the call even when the provider reports no usage, so a
+            # call-limited budget cannot be bypassed by a usage-silent client.
+            self.run_budget.record(response.usage)
         if not response.usage:
             return
         self.usage.record(response.usage)

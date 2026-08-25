@@ -1036,7 +1036,13 @@ AutoGen/ADK. 12 khu vực, quyết định ĐÃ CHỐT như sau:
 
 ### Debt còn lại sau Stage 5
 - Memory embedding/vector provider (cần optional dep riêng).
-- Cost/token budget cho ROOT run (subagent đã có SpawnBudget).
+- ~~Cost/token budget cho ROOT run~~ DONE — `agent/budget.py` RunBudget
+  (max_llm_calls / max_total_tokens, cả hai optional), wired vào CẢ Agent
+  sync lẫn AsyncAgent; loop check trước mỗi LLM call, record usage sau
+  response, dừng graceful bằng event `agent.budget_exceeded` + final text
+  "Run stopped: budget exceeded (...)". Giống pattern SpawnBudget, có lock
+  sẵn cho parallel sau này. Đếm số lượng call/token thô — chưa quy đổi ra
+  tiền, chưa tích hợp billing console của provider.
 - AsyncMCPClient, MCP resources/prompts.
 - Server: SSE streaming endpoint, multi-conversation store, rate limiting.
 - Parallel async subagent (budget đã thread-safe, chưa có orchestrator).

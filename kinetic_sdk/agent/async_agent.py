@@ -45,6 +45,7 @@ from kinetic_sdk.agent.async_classifier import (
     AsyncDefaultClassifier,
     AsyncTaskClassifier,
 )
+from kinetic_sdk.agent.budget import RunBudget, RunBudgetExceeded
 from kinetic_sdk.agent.classifier import TaskClassifier
 from kinetic_sdk.agent.modes import AgentMode
 from kinetic_sdk.agent.structured import (
@@ -163,6 +164,7 @@ class AsyncAgent:
         parallel_tool_execution: bool = False,
         memory: MemoryProvider | None = None,
         memory_recall_limit: int = 3,
+        run_budget: RunBudget | None = None,
     ) -> None:
         if isinstance(llm, AsyncLLMClient):
             self.llm: AsyncLLMClient = llm
@@ -267,6 +269,11 @@ class AsyncAgent:
         #: Optional long-term memory (recall before runs, store after).
         self.memory = memory
         self.memory_recall_limit = memory_recall_limit
+        #: Optional root-run cost guardrail — same contract as the sync
+        #: Agent: checked before every LLM call; exhaustion stops the run
+        #: gracefully with ``agent.budget_exceeded`` and an explanatory
+        #: final text. ``None`` (default) = unlimited.
+        self.run_budget = run_budget
 
         tool_list = list(tools or [])
         self._tools: dict[str, Tool] = {}
@@ -501,6 +508,15 @@ class AsyncAgent:
                 logger.info("Agent run cancelled at iteration %d", iteration)
                 await self._emit("agent.cancelled", {"iteration": iteration})
                 return final_text
+            if self.run_budget is not None:
+                try:
+                    self.run_budget.check()
+                except RunBudgetExceeded as exc:
+                    logger.warning("Run budget exceeded: %s", exc)
+                    await self._emit(
+                        "agent.budget_exceeded", self.run_budget.details()
+                    )
+                    return f"Run stopped: budget exceeded ({exc})."
             response = await self._call_llm(stream=stream)
             await self._trigger_hooks(
                 HookPoint.AFTER_LLM_CALL,
@@ -697,6 +713,10 @@ class AsyncAgent:
 
     async def _record_usage(self, response: LLMResponse) -> None:
         """Fold one LLM turn's usage into the agent total + emit a delta."""
+        if self.run_budget is not None:
+            # Count the call even when the provider reports no usage, so a
+            # call-limited budget cannot be bypassed by a usage-silent client.
+            self.run_budget.record(response.usage)
         if not response.usage:
             return
         self.usage.record(response.usage)
