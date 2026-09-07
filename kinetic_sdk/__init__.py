@@ -30,7 +30,7 @@ from kinetic_sdk.security.policy import (
 )
 from kinetic_sdk.tool.base import Tool, ToolResult
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Agent",
