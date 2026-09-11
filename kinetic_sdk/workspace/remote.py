@@ -9,6 +9,9 @@ three JSON endpoints under its base URL:
 * ``POST {base_url}/workspace/run``   — ``{"command", "timeout", "cwd"}``
 * ``POST {base_url}/workspace/read``  — ``{"path"}``
 * ``POST {base_url}/workspace/write`` — ``{"path", "content"}``
+* ``POST {base_url}/workspace/delete`` — ``{"path"}``
+* ``POST {base_url}/workspace/list`` / ``list-directory`` — file and one-level
+  directory listings
 
 An agent using this workspace cannot tell the difference from
 :class:`~kinetic_sdk.workspace.manager.LocalWorkspace` — same
@@ -73,6 +76,8 @@ class RemoteAPIWorkspace(WorkspaceBase):
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 404:
+                raise FileNotFoundError(detail) from exc
             raise WorkspaceError(f"remote workspace error ({exc.code}): {detail}") from exc
         except urllib.error.URLError as exc:
             raise WorkspaceError(f"could not reach remote workspace: {exc.reason}") from exc
@@ -110,9 +115,18 @@ class RemoteAPIWorkspace(WorkspaceBase):
         if not data.get("ok", False):
             raise WorkspaceError(data.get("error", f"failed to write {relative_path!r}"))
 
+    def delete_file(self, relative_path: str) -> None:
+        data = self._post("/workspace/delete", {"path": relative_path})
+        if not data.get("ok", False):
+            raise WorkspaceError(data.get("error", f"failed to delete {relative_path!r}"))
+
     def list_files(self, pattern: str | None = None) -> list[str]:
         data = self._post("/workspace/list", {"pattern": pattern})
         return list(data.get("files", []))
+
+    def list_directory(self, relative_path: str = ".") -> list[str]:
+        data = self._post("/workspace/list-directory", {"path": relative_path})
+        return list(data.get("entries", []))
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<RemoteAPIWorkspace base_url={self._base_url!r} id={self._workspace_id!r}>"

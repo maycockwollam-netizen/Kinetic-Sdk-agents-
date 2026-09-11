@@ -151,6 +151,14 @@ class DockerWorkspace(WorkspaceBase):
         if write_result.exit_code != 0:
             raise WorkspaceError(f"failed to write {relative_path!r}: {write_result.output}")
 
+    def delete_file(self, relative_path: str) -> None:
+        if self._mode != "exec":
+            raise WorkspaceError("delete_file is not supported without a persistent container")
+        absolute = f"{self._workdir.rstrip('/')}/{relative_path.lstrip('/')}"
+        result = self.run_command(f"rm -- {quote(absolute)}")
+        if result.exit_code != 0:
+            raise WorkspaceError(f"failed to delete {relative_path!r}: {result.output}")
+
     def list_files(self, pattern: str | None = None) -> list[str]:
         find_cmd = f"cd {quote(self._workdir)} && find . -type f"
         result = self.run_command(find_cmd)
@@ -162,6 +170,16 @@ class DockerWorkspace(WorkspaceBase):
 
             files = [f for f in files if fnmatch.fnmatch(f, pattern)]
         return sorted(files)
+
+    def list_directory(self, relative_path: str = ".") -> list[str]:
+        directory = f"{self._workdir.rstrip('/')}/{relative_path.lstrip('./')}"
+        result = self.run_command(f"find {quote(directory)} -mindepth 1 -maxdepth 1 -printf '%f%y\\n'")
+        if result.exit_code != 0:
+            raise WorkspaceError(f"failed to list directory: {result.output}")
+        entries = []
+        for line in result.output.splitlines():
+            entries.append(line[:-1] + "/" if line.endswith("d") else line[:-1])
+        return sorted(entries)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<DockerWorkspace mode={self._mode!r} workdir={self._workdir!r}>"

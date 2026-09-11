@@ -13,6 +13,10 @@ API (JSON in/out):
     -> ``{"run_id": str, "status": "completed"|"error", "final": str,
     "structured_output": any|null, "usage": {...}, "error": str?}``
 * ``GET  /runs/<run_id>`` -> the recorded run result (404 when unknown)
+* ``POST /workspace/{run,read,write,delete,list,list-directory}`` -> managed
+  workspace operations when ``workspace_factory`` is configured. Every body
+  includes ``workspace_id``; the factory, not the HTTP client, selects the
+  actual server-side workspace.
 
 Every request spawns a fresh :class:`~kinetic_sdk.agent.agent.Agent` via
 the injected ``agent_factory`` (conversations are per-run by design — the
@@ -36,6 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
 from kinetic_sdk.agent.agent import Agent
+from kinetic_sdk.workspace.base import WorkspaceBase, WorkspaceError
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +63,10 @@ class AgentServer:
             :meth:`start_in_thread`).
         token: Optional bearer token; when set, every non-``/health``
             request must present it.
+        workspace_factory: Optional factory for the server-managed workspace
+            identified by a client-supplied ``workspace_id``. When omitted,
+            workspace endpoints are unavailable (404), rather than exposing
+            the server host filesystem by accident.
     """
 
     def __init__(
@@ -67,11 +76,13 @@ class AgentServer:
         host: str = "127.0.0.1",
         port: int = 8000,
         token: str | None = None,
+        workspace_factory: Callable[[str], WorkspaceBase] | None = None,
     ) -> None:
         if not callable(agent_factory):
             raise TypeError("agent_factory must be callable")
         self._agent_factory = agent_factory
         self._token = token
+        self._workspace_factory = workspace_factory
         self._runs: dict[str, RunRecord] = {}
         self._lock = threading.Lock()
         self._httpd = ThreadingHTTPServer((host, port), self._make_handler())
@@ -162,6 +173,83 @@ class AgentServer:
                     return {}
                 return data
 
+            def _workspace(self, body: dict[str, Any]) -> WorkspaceBase | None:
+                if server._workspace_factory is None:
+                    self._send_json(404, {"error": "workspace API is not configured"})
+                    return None
+                workspace_id = body.get("workspace_id", "default")
+                if not isinstance(workspace_id, str) or not workspace_id:
+                    self._send_json(400, {"error": "'workspace_id' must be a non-empty string"})
+                    return None
+                try:
+                    return server._workspace_factory(workspace_id)
+                except (ValueError, WorkspaceError) as exc:
+                    self._send_json(404, {"error": f"workspace not found: {exc}"})
+                    return None
+
+            def _workspace_post(self, path: str, body: dict[str, Any]) -> bool:
+                workspace = self._workspace(body)
+                if workspace is None:
+                    return False
+                try:
+                    if path == "/workspace/run":
+                        command = body.get("command")
+                        timeout = body.get("timeout")
+                        cwd = body.get("cwd")
+                        if not isinstance(command, str) or not command.strip():
+                            self._send_json(400, {"error": "'command' must be a non-empty string"})
+                            return True
+                        if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
+                            self._send_json(400, {"error": "'timeout' must be a positive number"})
+                            return True
+                        if cwd is not None and not isinstance(cwd, str):
+                            self._send_json(400, {"error": "'cwd' must be a string or null"})
+                            return True
+                        result = workspace.run_command(command, timeout=timeout, cwd=cwd)
+                        self._send_json(200, {
+                            "output": result.output, "exit_code": result.exit_code,
+                            "duration_seconds": result.duration_seconds,
+                            "timed_out": result.timed_out, "truncated": result.truncated,
+                            "error": result.error, "metadata": result.metadata,
+                        })
+                    elif path == "/workspace/read":
+                        file_path = body.get("path")
+                        if not isinstance(file_path, str) or not file_path:
+                            self._send_json(400, {"error": "'path' must be a non-empty string"})
+                            return True
+                        self._send_json(200, {"content": workspace.read_text(file_path)})
+                    elif path == "/workspace/write":
+                        file_path, content = body.get("path"), body.get("content")
+                        if not isinstance(file_path, str) or not file_path or not isinstance(content, str):
+                            self._send_json(400, {"error": "'path' and 'content' must be strings"})
+                            return True
+                        workspace.write_text(file_path, content)
+                        self._send_json(200, {"ok": True})
+                    elif path == "/workspace/delete":
+                        file_path = body.get("path")
+                        if not isinstance(file_path, str) or not file_path:
+                            self._send_json(400, {"error": "'path' must be a non-empty string"})
+                            return True
+                        workspace.delete_file(file_path)
+                        self._send_json(200, {"ok": True})
+                    elif path == "/workspace/list":
+                        pattern = body.get("pattern")
+                        if pattern is not None and not isinstance(pattern, str):
+                            self._send_json(400, {"error": "'pattern' must be a string or null"})
+                            return True
+                        self._send_json(200, {"files": workspace.list_files(pattern)})
+                    else:  # /workspace/list-directory
+                        file_path = body.get("path", ".")
+                        if not isinstance(file_path, str):
+                            self._send_json(400, {"error": "'path' must be a string"})
+                            return True
+                        self._send_json(200, {"entries": workspace.list_directory(file_path)})
+                except FileNotFoundError as exc:
+                    self._send_json(404, {"error": str(exc)})
+                except (OSError, ValueError, WorkspaceError) as exc:
+                    self._send_json(400, {"error": str(exc)})
+                return True
+
             def do_GET(self) -> None:  # noqa: N802
                 if self.path == "/health":
                     self._send_json(200, {"status": "ok"})
@@ -184,11 +272,18 @@ class AgentServer:
                 if not self._authed():
                     self._send_json(401, {"error": "unauthorized"})
                     return
-                if self.path != "/runs":
+                workspace_paths = {
+                    "/workspace/run", "/workspace/read", "/workspace/write",
+                    "/workspace/delete", "/workspace/list", "/workspace/list-directory",
+                }
+                if self.path != "/runs" and self.path not in workspace_paths:
                     self._send_json(404, {"error": "not found"})
                     return
                 body = self._read_body()
                 if not body:
+                    return
+                if self.path in workspace_paths:
+                    self._workspace_post(self.path, body)
                     return
                 message = body.get("message")
                 if not isinstance(message, str) or not message.strip():

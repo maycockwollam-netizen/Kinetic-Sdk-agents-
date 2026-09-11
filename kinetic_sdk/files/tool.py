@@ -1,8 +1,9 @@
-"""``FileTool``: view/create/edit files inside a :class:`Workspace`.
+"""``FileTool``: view/create/edit files through a ``WorkspaceBase``.
 
-Every path goes through :meth:`Workspace.resolve`, so ``../``, absolute paths
-outside the root and symlink escapes all fail before touching the disk — the
-tool can never reach outside its workspace, whatever the model asks for.
+Every operation is delegated to the workspace backend.  ``LocalWorkspace``
+enforces realpath containment, while Docker and remote backends enforce their
+own boundary at the execution site; the editor never reaches around a backend
+with direct host filesystem access.
 
 Actions (one ``action`` parameter, mirroring the curated ``GitTool`` design):
 
@@ -18,11 +19,10 @@ Actions (one ``action`` parameter, mirroring the curated ``GitTool`` design):
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any, Callable, ClassVar
 
 from kinetic_sdk.tool.base import Tool, ToolResult
-from kinetic_sdk.workspace.manager import PathTraversalError, Workspace
+from kinetic_sdk.workspace.base import WorkspaceBase, WorkspaceError
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class FileTool(Tool):
     """Workspace-scoped file editor with undo support.
 
     Args:
-        workspace: The :class:`Workspace` all paths are resolved against.
+        workspace: The :class:`WorkspaceBase` all paths are resolved against.
             Required — a file tool without a workspace boundary is a
             whole-filesystem tool, which this class refuses to be.
         max_view_lines: Cap on lines returned by ``view`` (the rest is cut
@@ -75,14 +75,14 @@ class FileTool(Tool):
     DEFAULT_MAX_VIEW_LINES: ClassVar[int] = 2_000
 
     def __init__(
-        self, workspace: Workspace, max_view_lines: int = DEFAULT_MAX_VIEW_LINES
+        self, workspace: WorkspaceBase, max_view_lines: int = DEFAULT_MAX_VIEW_LINES
     ) -> None:
         if max_view_lines < 10:
             raise ValueError("max_view_lines must be >= 10")
         self.workspace = workspace
         self.max_view_lines = max_view_lines
         # path -> previous content, for single-level undo_edit.
-        self._undo: dict[Path, str | None] = {}
+        self._undo: dict[str, str | None] = {}
 
     # --- dispatch -----------------------------------------------------
 
@@ -92,11 +92,6 @@ class FileTool(Tool):
         # Named-parameter signature by design: the agent loop always invokes
         # tools via execute(**model_arguments) after schema validation, so
         # narrowing the base **params contract is safe here.
-        try:
-            target = Path(self.workspace.resolve(path))
-        except PathTraversalError as exc:
-            return ToolResult(error=f"path rejected: {exc}")
-
         actions: dict[str, Callable[..., ToolResult]] = {
             "view": self._view,
             "create": self._create,
@@ -110,19 +105,20 @@ class FileTool(Tool):
                 error=f"unknown action {action!r} (expected view/create/str_replace/insert/undo_edit)"
             )
         try:
-            return handler(target, **params)
-        except OSError as exc:
+            return handler(path, **params)
+        except ValueError as exc:
+            return ToolResult(error=f"path rejected: {exc}")
+        except (OSError, WorkspaceError) as exc:
             return ToolResult(error=f"filesystem error: {exc}")
 
     # --- actions --------------------------------------------------------
 
-    def _view(self, target: Path, view_range: list[int] | None = None, **_: Any) -> ToolResult:
-        if target.is_dir():
-            entries = sorted(p.name + ("/" if p.is_dir() else "") for p in target.iterdir())
-            return ToolResult(output="\n".join(entries) or "(empty directory)")
-        if not target.is_file():
-            return ToolResult(error=f"no such file: {target.name}")
-        lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    def _view(self, path: str, view_range: list[int] | None = None, **_: Any) -> ToolResult:
+        try:
+            content = self.workspace.read_text(path)
+        except (FileNotFoundError, IsADirectoryError):
+            return self._view_directory(path)
+        lines = content.splitlines()
         start, end = 1, len(lines)
         if view_range is not None:
             if len(view_range) != 2:
@@ -147,28 +143,40 @@ class FileTool(Tool):
             metadata={"total_lines": len(lines), "truncated": truncated},
         )
 
-    def _create(self, target: Path, file_text: str | None = None, **_: Any) -> ToolResult:
+    def _view_directory(self, path: str) -> ToolResult:
+        """View one portable workspace directory level."""
+        try:
+            entries = self.workspace.list_directory(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return ToolResult(error=f"no such file or directory: {path}")
+        return ToolResult(output="\n".join(entries) or "(empty directory)")
+
+    def _create(self, path: str, file_text: str | None = None, **_: Any) -> ToolResult:
         if file_text is None:
             return ToolResult(error="create requires file_text")
-        if target.exists():
-            return ToolResult(error=f"file already exists: {target.name} (use str_replace to edit)")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        self._undo[target] = None  # undo of a create = delete
-        target.write_text(file_text, encoding="utf-8")
-        return ToolResult(output=f"created {target.name}", metadata={"path": str(target)})
+        try:
+            self.workspace.read_text(path)
+        except FileNotFoundError:
+            pass
+        else:
+            return ToolResult(error=f"file already exists: {path} (use str_replace to edit)")
+        self._undo[path] = None  # undo of a create = delete
+        self.workspace.write_text(path, file_text)
+        return ToolResult(output=f"created {path}", metadata={"path": path})
 
     def _str_replace(
         self,
-        target: Path,
+        path: str,
         old_str: str | None = None,
         new_str: str | None = None,
         **_: Any,
     ) -> ToolResult:
         if old_str is None or new_str is None:
             return ToolResult(error="str_replace requires old_str and new_str")
-        if not target.is_file():
-            return ToolResult(error=f"no such file: {target.name}")
-        content = target.read_text(encoding="utf-8", errors="replace")
+        try:
+            content = self.workspace.read_text(path)
+        except FileNotFoundError:
+            return ToolResult(error=f"no such file: {path}")
         occurrences = content.count(old_str)
         if occurrences == 0:
             return ToolResult(error="old_str not found in the file")
@@ -176,44 +184,48 @@ class FileTool(Tool):
             return ToolResult(
                 error=f"old_str matches {occurrences} times; it must match exactly once"
             )
-        self._undo[target] = content
-        target.write_text(content.replace(old_str, new_str, 1), encoding="utf-8")
-        return ToolResult(output=f"edited {target.name}", metadata={"path": str(target)})
+        self._undo[path] = content
+        self.workspace.write_text(path, content.replace(old_str, new_str, 1))
+        return ToolResult(output=f"edited {path}", metadata={"path": path})
 
     def _insert(
         self,
-        target: Path,
+        path: str,
         insert_line: int | None = None,
         new_str: str | None = None,
         **_: Any,
     ) -> ToolResult:
         if insert_line is None or new_str is None:
             return ToolResult(error="insert requires insert_line and new_str")
-        if not target.is_file():
-            return ToolResult(error=f"no such file: {target.name}")
-        content = target.read_text(encoding="utf-8", errors="replace")
+        try:
+            content = self.workspace.read_text(path)
+        except FileNotFoundError:
+            return ToolResult(error=f"no such file: {path}")
         lines = content.splitlines(keepends=True)
         if not 0 <= insert_line <= len(lines):
             return ToolResult(error=f"insert_line {insert_line} out of range 0..{len(lines)}")
-        self._undo[target] = content
+        self._undo[path] = content
         new_lines = new_str.splitlines(keepends=True)
         if new_str and not new_str.endswith("\n"):
             new_lines[-1] += "\n"
         lines[insert_line:insert_line] = new_lines
-        target.write_text("".join(lines), encoding="utf-8")
+        self.workspace.write_text(path, "".join(lines))
         return ToolResult(
-            output=f"inserted into {target.name} after line {insert_line}",
-            metadata={"path": str(target)},
+            output=f"inserted into {path} after line {insert_line}",
+            metadata={"path": path},
         )
 
-    def _undo_edit(self, target: Path, **_: Any) -> ToolResult:
-        if target not in self._undo:
-            return ToolResult(error=f"nothing to undo for {target.name}")
-        previous = self._undo.pop(target)
+    def _undo_edit(self, path: str, **_: Any) -> ToolResult:
+        if path not in self._undo:
+            return ToolResult(error=f"nothing to undo for {path}")
+        previous = self._undo.pop(path)
         if previous is None:
-            target.unlink(missing_ok=True)
-            return ToolResult(output=f"undid create of {target.name}")
-        current = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
-        target.write_text(previous, encoding="utf-8")
-        self._undo[target] = current  # undo is itself undoable (redo)
-        return ToolResult(output=f"reverted {target.name} to its previous content")
+            self.workspace.delete_file(path)
+            return ToolResult(output=f"undid create of {path}")
+        try:
+            current = self.workspace.read_text(path)
+        except FileNotFoundError:
+            current = ""
+        self.workspace.write_text(path, previous)
+        self._undo[path] = current  # undo is itself undoable (redo)
+        return ToolResult(output=f"reverted {path} to its previous content")

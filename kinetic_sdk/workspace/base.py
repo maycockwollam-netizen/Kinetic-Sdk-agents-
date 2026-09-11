@@ -103,5 +103,18 @@ class WorkspaceBase(ABC):
         """
 
     @abstractmethod
+    def delete_file(self, relative_path: str) -> None:
+        """Delete one file inside the workspace.
+
+        Backends must reject paths outside their own boundary.  This narrow
+        operation exists so editor undo never needs to access the host
+        filesystem behind a Docker or remote workspace's back.
+        """
+
+    @abstractmethod
     def list_files(self, pattern: str | None = None) -> list[str]:
         """List files inside the workspace as sorted root-relative POSIX paths."""
+
+    @abstractmethod
+    def list_directory(self, relative_path: str = ".") -> list[str]:
+        """List immediate directory entries, appending ``/`` to directories."""

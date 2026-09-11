@@ -25,7 +25,7 @@ import time
 from typing import Any, ClassVar
 
 from kinetic_sdk.tool.base import Tool, ToolResult
-from kinetic_sdk.workspace.manager import Workspace
+from kinetic_sdk.workspace.base import WorkspaceBase, WorkspaceError
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +34,9 @@ class TerminalTool(Tool):
     """Execute a shell command and return its combined output.
 
     Args:
-        workspace: Optional :class:`Workspace`; the command runs with
-            ``cwd`` set to the workspace root. Without one, commands run in
-            the current working directory.
+        workspace: Optional :class:`WorkspaceBase`; the command runs through
+            that backend. Without one, commands run on the local host in the
+            current working directory.
         timeout: Default wall-clock seconds per command (the model may lower
             it per call via the ``timeout`` parameter, never raise it above
             ``max_timeout``).
@@ -87,7 +87,7 @@ class TerminalTool(Tool):
 
     def __init__(
         self,
-        workspace: Workspace | None = None,
+        workspace: WorkspaceBase | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         max_timeout: float = MAX_TIMEOUT,
         max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
@@ -129,7 +129,36 @@ class TerminalTool(Tool):
         if effective_timeout <= 0:
             return ToolResult(error="timeout must be positive")
 
-        cwd = self.workspace.root_path if self.workspace is not None else None
+        if self.workspace is not None:
+            try:
+                result = self.workspace.run_command(command, timeout=effective_timeout)
+            except WorkspaceError as exc:
+                return ToolResult(error=f"workspace command failed: {exc}")
+            output, truncated_here = self._truncate(result.output)
+            workspace_metadata: dict[str, Any] = {
+                "exit_code": result.exit_code,
+                "duration_seconds": result.duration_seconds,
+                "timed_out": result.timed_out,
+                "truncated": result.truncated or truncated_here,
+                **result.metadata,
+            }
+            if result.error is not None:
+                return ToolResult(output=output, error=result.error, metadata=workspace_metadata)
+            if result.timed_out:
+                return ToolResult(
+                    output=output,
+                    error=f"command timed out after {effective_timeout}s",
+                    metadata=workspace_metadata,
+                )
+            if result.exit_code != 0:
+                return ToolResult(
+                    output=output,
+                    error=f"command exited with code {result.exit_code}",
+                    metadata=workspace_metadata,
+                )
+            return ToolResult(output=output, metadata=workspace_metadata)
+
+        cwd = None
         started = time.monotonic()
         try:
             proc = subprocess.Popen(
