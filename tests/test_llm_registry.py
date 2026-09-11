@@ -58,3 +58,17 @@ def test_routed_client_falls_back_only_for_transient_errors():
     registry.register(LLMProfile("safe", "safe-model"))
     assert registry.routed("fast").chat([]).content == "safe"
     assert created["fast"].calls == created["safe"].calls == 1
+
+
+def test_route_uses_dynamic_candidates_after_declared_chain():
+    clients = {}
+    def factory(profile):
+        client = Client(profile.model, TimeoutError("retry") if profile.name != "last" else LLMResponse(content="ok"))
+        clients[profile.name] = client
+        return client
+    registry = LLMRegistry(factory)
+    registry.register(LLMProfile("first", "one", fallback_profiles=("second",)))
+    registry.register(LLMProfile("second", "two"))
+    registry.register(LLMProfile("last", "three"))
+    assert registry.route(["first", "last"]).chat([]).content == "ok"
+    assert set(clients) == {"first", "second", "last"}

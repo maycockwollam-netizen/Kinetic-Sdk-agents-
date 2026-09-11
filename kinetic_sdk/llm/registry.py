@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from kinetic_sdk.llm.client import LLMClient, LLMResponse, Message, _is_retryable
 
@@ -104,24 +104,43 @@ class LLMRegistry:
     def routed(self, name: str) -> "FallbackLLMClient":
         return FallbackLLMClient(self, name)
 
+    def route(self, candidates: Iterable[str]) -> "FallbackLLMClient":
+        """Create a client that selects the first available profile.
+
+        This supports application-level dynamic routing: choose aliases from
+        task policy/tenant configuration at call time, while still using each
+        profile's declared fallback graph for transient provider failures.
+        """
+        names = tuple(candidates)
+        if not names:
+            raise ValueError("route requires at least one candidate profile")
+        for name in names:
+            self.get(name)
+        return FallbackLLMClient(self, names[0], additional_profiles=names[1:])
+
 
 class FallbackLLMClient(LLMClient):
     """Try a profile's transient-failure fallback chain in declaration order."""
 
-    def __init__(self, registry: LLMRegistry, profile_name: str) -> None:
+    def __init__(
+        self, registry: LLMRegistry, profile_name: str,
+        *, additional_profiles: tuple[str, ...] = (),
+    ) -> None:
         self._registry = registry
         self._profile_name = profile_name
+        self._additional_profiles = additional_profiles
         self.model = profile_name  # public alias; avoid exposing provider choice.
 
     def _names(self) -> list[str]:
         names: list[str] = []
-        current = self._profile_name
-        while current not in names:
+        pending = [self._profile_name, *self._additional_profiles]
+        while pending:
+            current = pending.pop(0)
+            if current in names:
+                continue
             names.append(current)
-            fallbacks = self._registry.get(current).fallback_profiles
-            if not fallbacks:
-                break
-            current = fallbacks[0]
+            # Explicit fallbacks take precedence over later dynamic choices.
+            pending[0:0] = list(self._registry.get(current).fallback_profiles)
         return names
 
     def chat(
