@@ -27,7 +27,11 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import subprocess
+import time
 from pathlib import Path
+
+from kinetic_sdk.workspace.base import CommandResult, WorkspaceBase
 
 
 class PathTraversalError(ValueError):
@@ -38,7 +42,7 @@ class PathTraversalError(ValueError):
     """
 
 
-class Workspace:
+class LocalWorkspace(WorkspaceBase):
     """A single working directory an agent operates inside.
 
     Args:
@@ -111,5 +115,66 @@ class Workspace:
                     matches.append(posix)
         return sorted(matches)
 
+    def run_command(
+        self, command: str, *, timeout: float | None = None, cwd: str | None = None
+    ) -> CommandResult:
+        """Run *command* via ``bash -c`` with cwd set inside this workspace.
+
+        Behaviour mirrors :class:`~kinetic_sdk.terminal.tool.TerminalTool`
+        (same process-group kill on timeout) so this can back that tool
+        directly in a later wiring step.
+        """
+        effective_cwd = self.resolve(cwd) if cwd is not None else self._root
+        started = time.monotonic()
+        try:
+            proc = subprocess.Popen(
+                ["bash", "-c", command],
+                cwd=effective_cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                start_new_session=True,
+            )
+        except OSError as exc:
+            return CommandResult(
+                output="", exit_code=-1, duration_seconds=0.0, error=f"failed to start shell: {exc}"
+            )
+        timed_out = False
+        try:
+            output, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            import signal
+
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            output, _ = proc.communicate()
+        duration = time.monotonic() - started
+        return CommandResult(
+            output=output or "",
+            exit_code=proc.returncode if proc.returncode is not None else -1,
+            duration_seconds=round(duration, 3),
+            timed_out=timed_out,
+            error=(f"command timed out after {timeout}s" if timed_out else None),
+        )
+
+    def read_text(self, relative_path: str) -> str:
+        """Read a text file inside the workspace root."""
+        return Path(self.resolve(relative_path)).read_text()
+
+    def write_text(self, relative_path: str, content: str) -> None:
+        """Write a text file inside the workspace root, creating parents as needed."""
+        target = Path(self.resolve(relative_path))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"<Workspace root={self._root!r}>"
+        return f"<LocalWorkspace root={self._root!r}>"
+
+
+#: Backward-compatible alias — existing imports of ``Workspace`` keep working
+#: unchanged; it is exactly ``LocalWorkspace`` under a familiar name.
+Workspace = LocalWorkspace
