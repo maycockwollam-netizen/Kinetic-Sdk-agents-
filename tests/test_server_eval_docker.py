@@ -16,6 +16,7 @@ from kinetic_sdk.eval import (
     no_tool_failures,
     tool_called,
 )
+from kinetic_sdk.files import FileTool
 from kinetic_sdk.security.policy import PermissivePolicy
 from kinetic_sdk.server import AgentServer
 from kinetic_sdk.terminal.docker import (
@@ -25,6 +26,7 @@ from kinetic_sdk.terminal.docker import (
 )
 from kinetic_sdk.terminal.tool import TerminalTool
 from kinetic_sdk.testing import MockLLMClient, text_response, tool_response
+from kinetic_sdk.workspace import RemoteAPIWorkspace, Workspace
 from tests._helpers import EchoTool
 
 # --- Server -------------------------------------------------------------
@@ -111,6 +113,39 @@ def test_server_token_enforced():
         assert err.value.code == 401
         ok = _post(url + "/runs", {"message": "ping"}, token="s3cret")
         assert ok["status"] == "completed"
+    finally:
+        srv.shutdown()
+
+
+def test_remote_workspace_round_trip_through_agent_server(tmp_path):
+    root = tmp_path / "remote-root"
+    root.mkdir()
+    (root / "seed.txt").write_text("seed")
+
+    def workspace_factory(workspace_id: str) -> Workspace:
+        if workspace_id != "project-a":
+            raise ValueError(workspace_id)
+        return Workspace(root)
+
+    srv = AgentServer(_factory, port=0, token="workspace-token", workspace_factory=workspace_factory)
+    srv.start_in_thread()
+    try:
+        remote = RemoteAPIWorkspace(
+            f"{BASE}:{srv.port}", workspace_id="project-a", token="workspace-token"
+        )
+        command = TerminalTool(workspace=remote).execute(command="pwd && echo remote-ok")
+        assert not command.is_error
+        assert "remote-ok" in command.output
+
+        editor = FileTool(remote)
+        created = editor.execute(action="create", path="nested/note.txt", file_text="hello")
+        assert not created.is_error
+        assert (root / "nested" / "note.txt").read_text() == "hello"
+        assert "nested/note.txt" in remote.list_files()
+
+        undone = editor.execute(action="undo_edit", path="nested/note.txt")
+        assert not undone.is_error
+        assert not (root / "nested" / "note.txt").exists()
     finally:
         srv.shutdown()
 

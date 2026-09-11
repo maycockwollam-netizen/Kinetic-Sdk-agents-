@@ -115,6 +115,12 @@ class LocalWorkspace(WorkspaceBase):
                     matches.append(posix)
         return sorted(matches)
 
+    def list_directory(self, relative_path: str = ".") -> list[str]:
+        directory = Path(self.resolve(relative_path))
+        if not directory.is_dir():
+            raise NotADirectoryError(relative_path)
+        return sorted(entry.name + ("/" if entry.is_dir() else "") for entry in directory.iterdir())
+
     def run_command(
         self, command: str, *, timeout: float | None = None, cwd: str | None = None
     ) -> CommandResult:
@@ -170,6 +176,13 @@ class LocalWorkspace(WorkspaceBase):
         target = Path(self.resolve(relative_path))
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
+
+    def delete_file(self, relative_path: str) -> None:
+        """Delete a file in the workspace, rejecting directories."""
+        target = Path(self.resolve(relative_path))
+        if target.is_dir():
+            raise IsADirectoryError(relative_path)
+        target.unlink()
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<LocalWorkspace root={self._root!r}>"

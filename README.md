@@ -100,10 +100,11 @@ rewriting the agent loop.
 - `kinetic_sdk/memory/` — long-term memory providers (in-memory + JSON
   file), `MemoryTool`, and the `Agent(memory=...)` auto recall/store wiring.
 - `kinetic_sdk/server/` — `AgentServer`: stdlib-only REST API for one-shot
-  agent runs (bearer-token auth optional).
+  agent runs plus optional server-managed workspace endpoints (bearer-token
+  auth optional).
 - `kinetic_sdk/tool/` — abstract tool interface and `ToolResult` dataclass.
-- `kinetic_sdk/workspace/` — `Workspace`: root-confined path resolution and
-  file listing (path-traversal safe).
+- `kinetic_sdk/workspace/` — `WorkspaceBase` with local, Docker and remote
+  backends; `Workspace` remains the root-confined local implementation.
 
 ## Install (editable)
 
