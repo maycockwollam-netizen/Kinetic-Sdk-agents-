@@ -16,9 +16,11 @@ from kinetic_sdk.agent.classifier import (
     TaskComplexity,
 )
 from kinetic_sdk.agent.modes import AgentMode
+from kinetic_sdk.agent.settings import AgentSettings
 
 __all__ = [
     "Agent",
+    "AgentSettings",
     "AgentMode",
     "AsyncAgent",
     "AsyncDefaultClassifier",
