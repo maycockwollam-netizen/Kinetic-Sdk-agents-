@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -123,9 +124,11 @@ class InMemoryAuditLogger(AuditLogger):
 
     def __init__(self) -> None:
         self.entries: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
 
     def _record(self, entry: dict[str, Any]) -> None:
-        self.entries.append(entry)
+        with self._lock:
+            self.entries.append(entry)
 
 
 class JSONLAuditLogger(AuditLogger):
@@ -134,18 +137,23 @@ class JSONLAuditLogger(AuditLogger):
     JSON Lines (rather than a JSON array) keeps every completed entry intact
     if the process crashes mid-write, and lets the file be tailed/parsed
     incrementally. Each write is flushed immediately for the same reason.
+    The write and flush share one lock, so concurrent sub-agents cannot
+    interleave bytes and corrupt a JSON line.
     """
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = Path(path)
         self._fh: TextIO = self.path.open("a", encoding="utf-8")
+        self._lock = threading.Lock()
 
     def _record(self, entry: dict[str, Any]) -> None:
-        self._fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
-        self._fh.flush()
+        with self._lock:
+            self._fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+            self._fh.flush()
 
     def close(self) -> None:
-        self._fh.close()
+        with self._lock:
+            self._fh.close()
 
     def __enter__(self) -> "JSONLAuditLogger":
         return self

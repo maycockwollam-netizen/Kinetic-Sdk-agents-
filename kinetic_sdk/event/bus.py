@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Union
 
@@ -49,13 +50,20 @@ class Event:
 class EventBus:
     """A minimal in-memory pub/sub bus.
 
-    The bus is not thread-safe; it is meant to be used within a single
-    asyncio event loop / thread. Cross-process distribution is a Stage 4
-    concern.
+    Subscriber registration and snapshotting are protected by a lock, so one
+    shared bus can safely serve parallel tool and sub-agent executions.
+    ``publish`` and ``publish_async`` take a matching-subscriber snapshot
+    while holding that lock, then invoke subscribers after releasing it:
+    slow or re-entrant listeners therefore do not block unrelated publishes
+    or subscription changes. A subscription change may consequently affect
+    the next publish rather than one already snapshotted. ``publish_async``
+    otherwise retains its single-event-loop semantics. Cross-process
+    distribution remains out of scope.
     """
 
     def __init__(self) -> None:
         self._subscribers: dict[str, list[Subscriber]] = {}
+        self._lock = threading.Lock()
 
     def subscribe(self, event_type: str, subscriber: Subscriber) -> None:
         """Register *subscriber* to be called for events of *event_type*.
@@ -76,19 +84,25 @@ class EventBus:
                 subscriber,
                 event_type,
             )
-        self._subscribers.setdefault(event_type, [])
-        if subscriber not in self._subscribers[event_type]:
-            self._subscribers[event_type].append(subscriber)
+        with self._lock:
+            self._subscribers.setdefault(event_type, [])
+            if subscriber not in self._subscribers[event_type]:
+                self._subscribers[event_type].append(subscriber)
 
     def unsubscribe(self, event_type: str, subscriber: Subscriber) -> None:
         """Remove a previously registered subscriber. No-op if absent."""
-        subs = self._subscribers.get(event_type)
-        if subs and subscriber in subs:
-            subs.remove(subscriber)
+        with self._lock:
+            subs = self._subscribers.get(event_type)
+            if subs and subscriber in subs:
+                subs.remove(subscriber)
 
     def _gather(self, event_type: str) -> list[Subscriber]:
         """Return subscribers for a type plus the wildcard subscribers."""
-        return [*self._subscribers.get("*", []), *self._subscribers.get(event_type, [])]
+        with self._lock:
+            return [
+                *self._subscribers.get("*", []),
+                *self._subscribers.get(event_type, []),
+            ]
 
     def publish(self, event: Event) -> None:
         """Dispatch *event* to all matching sync subscribers.
@@ -122,4 +136,5 @@ class EventBus:
 
     def clear(self) -> None:
         """Remove all subscribers. Mainly useful in tests."""
-        self._subscribers.clear()
+        with self._lock:
+            self._subscribers.clear()

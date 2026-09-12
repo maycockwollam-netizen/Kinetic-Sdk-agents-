@@ -3,6 +3,16 @@
 All notable changes to `kinetic-agent-sdk`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Parallel sub-agent safety** — shared event, audit, observability and
+  metrics sinks now synchronise concurrent writes. Multiple `delegate` tool
+  calls in one parallel tool batch can safely run sub-agents at the same time
+  without racing subscribers, losing metric updates, or corrupting JSONL
+  audit records.
+
 ## [0.2.0] — 2026-08-24
 
 Stage 5 — Production readiness: closes the main feature gaps against the

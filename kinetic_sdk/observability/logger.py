@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any, TextIO
@@ -89,12 +90,16 @@ class InMemoryObservabilityLogger(ObservabilityLogger):
 
     def __init__(self) -> None:
         self.entries: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
 
     def handle(self, event: Event) -> None:
-        self.entries.append(self.build_entry(event))
+        entry = self.build_entry(event)
+        with self._lock:
+            self.entries.append(entry)
 
     def get_events(self, event_type: str | None = None) -> list[dict[str, Any]]:
         """Return recorded entries, optionally filtered by event type."""
-        if event_type is None:
-            return list(self.entries)
-        return [e for e in self.entries if e["event_type"] == event_type]
+        with self._lock:
+            if event_type is None:
+                return list(self.entries)
+            return [e for e in self.entries if e["event_type"] == event_type]
