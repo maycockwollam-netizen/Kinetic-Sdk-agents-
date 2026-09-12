@@ -14,6 +14,8 @@ Concrete implementations live alongside this file:
 * :class:`kinetic_sdk.workspace.docker_workspace.DockerWorkspace` — runs
   everything inside a container, reusing ``docker_exec_wrapper`` /
   ``docker_run_wrapper`` from ``terminal/docker.py``.
+* :class:`kinetic_sdk.workspace.k8s_workspace.KubernetesWorkspace` — connects
+  to an existing coding-agent pod through timeout-bound ``kubectl exec``.
 * :class:`kinetic_sdk.workspace.remote.RemoteAPIWorkspace` — forwards
   everything over HTTP to a remote ``AgentServer``.
 

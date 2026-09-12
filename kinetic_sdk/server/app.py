@@ -49,6 +49,7 @@ import struct
 import threading
 import time
 import uuid
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
@@ -83,6 +84,8 @@ class AgentServer:
             the server host filesystem by accident.
         session_ttl: Idle seconds after which cached session agents are
             discarded. ``None`` keeps sessions until server shutdown.
+        max_requests_per_minute: Optional per-client-IP sliding-window limit.
+            ``None`` keeps the existing unlimited behaviour.
     """
 
     def __init__(
@@ -94,6 +97,7 @@ class AgentServer:
         token: str | None = None,
         workspace_factory: Callable[[str], WorkspaceBase] | None = None,
         session_ttl: float | None = None,
+        max_requests_per_minute: int | None = None,
     ) -> None:
         if not callable(agent_factory):
             raise TypeError("agent_factory must be callable")
@@ -102,11 +106,18 @@ class AgentServer:
         self._workspace_factory = workspace_factory
         if session_ttl is not None and session_ttl <= 0:
             raise ValueError("session_ttl must be positive or None")
+        if max_requests_per_minute is not None and max_requests_per_minute <= 0:
+            raise ValueError("max_requests_per_minute must be positive or None")
         self._session_ttl = session_ttl
         self._runs: dict[str, RunRecord] = {}
         self._sessions: dict[str, Agent] = {}
         self._session_activity: dict[str, float] = {}
         self._lock = threading.Lock()
+        self._drain_condition = threading.Condition(self._lock)
+        self._in_flight_requests = 0
+        self._stopping = False
+        self._max_requests_per_minute = max_requests_per_minute
+        self._request_times: dict[str, deque[float]] = {}
         self._httpd = ThreadingHTTPServer((host, port), self._make_handler())
         self.host, self.port = self._httpd.server_address[:2]
 
@@ -122,10 +133,61 @@ class AgentServer:
         thread.start()
         return thread
 
-    def shutdown(self) -> None:
-        """Stop serving and close the socket."""
+    def stop(self, timeout: float = 10.0) -> None:
+        """Drain active handlers for up to *timeout* seconds before stopping.
+
+        Handlers accepted before the drain marker finish normally; later
+        requests receive ``503`` instead of extending shutdown indefinitely.
+        Python cannot safely preempt an agent, so timeout is best-effort.
+        """
+        if timeout < 0:
+            raise ValueError("timeout must be non-negative")
+        deadline = time.monotonic() + timeout
+        with self._drain_condition:
+            self._stopping = True
+            while self._in_flight_requests:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning("AgentServer shutdown drain timed out with %d in-flight request(s)", self._in_flight_requests)
+                    break
+                self._drain_condition.wait(remaining)
         self._httpd.shutdown()
         self._httpd.server_close()
+
+    def shutdown(self) -> None:
+        """Backward-compatible alias for :meth:`stop`."""
+        self.stop()
+
+    def _begin_request(self) -> bool:
+        with self._drain_condition:
+            if self._stopping:
+                return False
+            self._in_flight_requests += 1
+            return True
+
+    def _finish_request(self) -> None:
+        with self._drain_condition:
+            self._in_flight_requests -= 1
+            self._drain_condition.notify_all()
+
+    def _health_snapshot(self) -> tuple[int, int]:
+        with self._lock:
+            self._purge_expired_sessions()
+            return len(self._sessions), self._in_flight_requests
+
+    def _allow_request(self, client_ip: str) -> tuple[bool, int]:
+        """Apply the optional in-memory per-IP sliding-window limiter."""
+        if self._max_requests_per_minute is None:
+            return True, 0
+        now = time.monotonic()
+        with self._lock:
+            times = self._request_times.setdefault(client_ip, deque())
+            while times and times[0] <= now - 60.0:
+                times.popleft()
+            if len(times) >= self._max_requests_per_minute:
+                return False, max(1, int(60.0 - (now - times[0])) + 1)
+            times.append(now)
+            return True, 0
 
     # --- run execution --------------------------------------------------
 
@@ -203,16 +265,51 @@ class AgentServer:
         server = self
 
         class Handler(BaseHTTPRequestHandler):
+            _response_status: int | None = None
+
             def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
                 logger.debug("%s - %s", self.address_string(), format % args)
 
-            def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+            def _send_json(
+                self, status: int, payload: dict[str, Any], headers: dict[str, str] | None = None
+            ) -> None:
+                self._response_status = status
                 body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
+                for name, value in (headers or {}).items():
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _handle_request(self, operation: Callable[[], None]) -> None:
+                """Count, limit and log one parsed HTTP request."""
+                started = time.monotonic()
+                self._response_status = None
+                if not server._begin_request():
+                    self._send_json(503, {"error": "server is shutting down"})
+                    self._log_request(started)
+                    return
+                try:
+                    allowed, retry_after = server._allow_request(self.client_address[0])
+                    if not allowed:
+                        logger.warning("AgentServer rate limited request from %s to %s", self.client_address[0], self.path)
+                        self._send_json(429, {"error": "rate_limited"}, {"Retry-After": str(retry_after)})
+                        return
+                    operation()
+                finally:
+                    server._finish_request()
+                    self._log_request(started)
+
+            def _log_request(self, started: float) -> None:
+                logger.info(
+                    "agent_server_request method=%s path=%s status=%s duration_seconds=%.3f",
+                    self.command,
+                    self.path,
+                    self._response_status if self._response_status is not None else 500,
+                    time.monotonic() - started,
+                )
 
             def _authed(self) -> bool:
                 if server._token is None:
@@ -317,8 +414,12 @@ class AgentServer:
                 return True
 
             def do_GET(self) -> None:  # noqa: N802
+                self._handle_request(self._do_get)
+
+            def _do_get(self) -> None:
                 if self.path == "/health":
-                    self._send_json(200, {"status": "ok"})
+                    sessions, in_flight = server._health_snapshot()
+                    self._send_json(200, {"status": "ok", "active_sessions": sessions, "in_flight_requests": in_flight})
                     return
                 if not self._authed():
                     self._send_json(401, {"error": "unauthorized"})
@@ -338,6 +439,9 @@ class AgentServer:
                 self._send_json(404, {"error": "not found"})
 
             def do_POST(self) -> None:  # noqa: N802
+                self._handle_request(self._do_post)
+
+            def _do_post(self) -> None:
                 if not self._authed():
                     self._send_json(401, {"error": "unauthorized"})
                     return
@@ -430,6 +534,7 @@ class AgentServer:
                 accept = base64.b64encode(hashlib.sha1(
                     (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
                 ).digest()).decode("ascii")
+                self._response_status = 101
                 self.send_response(101, "Switching Protocols")
                 self.send_header("Upgrade", "websocket")
                 self.send_header("Connection", "Upgrade")

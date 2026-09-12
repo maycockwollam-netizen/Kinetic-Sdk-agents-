@@ -6,6 +6,12 @@ All notable changes to `kinetic-agent-sdk`. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **Kubernetes workspace** — `KubernetesWorkspace` executes against an
+  existing sidecar pod via injected, timeout-bound `kubectl` calls, providing
+  the same workspace contract as Docker without a Kubernetes client dependency.
+- **Agent server operations** — `AgentServer` now supports graceful in-flight
+  request draining, structured request logs, operational health counters, and
+  opt-in per-IP rate limiting while remaining stdlib-only.
 - **Vector memory** — `VectorMemory` cosine-ranks vectors through injectable
   `EmbeddingClient`; `LiteLLMEmbeddingClient` is lazy and available through
   the optional `memory` extra. Embedding backend faults preserve stored text

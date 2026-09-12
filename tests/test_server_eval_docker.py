@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -73,6 +75,8 @@ def _get(url, token=None):
 def test_server_health(server):
     data = _get(f"{BASE}:{server.port}/health")
     assert data["status"] == "ok"
+    assert data["active_sessions"] == 0
+    assert data["in_flight_requests"] >= 1
 
 
 def test_server_runs_roundtrip(server):
@@ -115,6 +119,70 @@ def test_server_token_enforced():
         assert ok["status"] == "completed"
     finally:
         srv.shutdown()
+
+
+def test_server_rate_limits_one_client() -> None:
+    srv = AgentServer(_factory, port=0, max_requests_per_minute=2)
+    srv.start_in_thread()
+    try:
+        url = f"{BASE}:{srv.port}/runs"
+        assert _post(url, {"message": "one"})["status"] == "completed"
+        assert _post(url, {"message": "two"})["status"] == "completed"
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _post(url, {"message": "three"})
+        assert error.value.code == 429
+        assert error.value.headers["Retry-After"]
+        assert json.loads(error.value.read()) == {"error": "rate_limited"}
+    finally:
+        srv.shutdown()
+
+
+def test_server_health_and_stop_drain_in_flight_run() -> None:
+    started, release, stopped = threading.Event(), threading.Event(), threading.Event()
+
+    class _Snapshot:
+        def to_dict(self):
+            return {"input_tokens": 0, "output_tokens": 0}
+
+    class _Usage:
+        def snapshot(self):
+            return _Snapshot()
+
+    class SlowAgent:
+        structured_output = None
+        usage = _Usage()
+
+        def run(self, *_args, **_kwargs):
+            started.set()
+            assert release.wait(3)
+            return "done"
+
+    srv = AgentServer(lambda: SlowAgent(), port=0)
+    srv.start_in_thread()
+    result: dict[str, object] = {}
+
+    def request() -> None:
+        result.update(_post(f"{BASE}:{srv.port}/runs", {"message": "slow"}))
+
+    client = threading.Thread(target=request)
+    client.start()
+    assert started.wait(2)
+    health = _get(f"{BASE}:{srv.port}/health")
+    assert health["in_flight_requests"] >= 2
+
+    def stop() -> None:
+        srv.stop(timeout=3)
+        stopped.set()
+
+    stopper = threading.Thread(target=stop)
+    stopper.start()
+    time.sleep(0.1)
+    assert not stopped.is_set()
+    release.set()
+    client.join(3)
+    stopper.join(3)
+    assert stopped.is_set()
+    assert result["final"] == "done"
 
 
 def test_remote_workspace_round_trip_through_agent_server(tmp_path):
