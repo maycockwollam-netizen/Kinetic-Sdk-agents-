@@ -101,6 +101,7 @@ class PluginManifest:
     network: str | None = "none"
     memory_limit: str = "512m"
     cpu_limit: float = 1.0
+    pids_limit: int = 128
 
     def __post_init__(self) -> None:
         if len(self.name) > MAX_NAME_LENGTH or not SKILL_NAME_PATTERN.match(self.name):
@@ -132,7 +133,11 @@ class PluginManifest:
             raise PluginManifestError(
                 f"plugin {self.name!r}: docker isolation requires a directory plugin"
             )
-        if self.memory_limit.strip() == "" or self.cpu_limit <= 0:
+        if (
+            self.memory_limit.strip() == ""
+            or self.cpu_limit <= 0
+            or self.pids_limit <= 0
+        ):
             raise PluginManifestError(
                 f"plugin {self.name!r}: docker resource limits must be positive"
             )
@@ -226,6 +231,7 @@ class PluginManifest:
             network=None if network == "host" else network,
             memory_limit=frontmatter.get("memory_limit", "512m"),
             cpu_limit=float(frontmatter.get("cpu_limit", "1.0")),
+            pids_limit=int(frontmatter.get("pids_limit", "128")),
         )
 
     @classmethod

@@ -133,6 +133,23 @@ class TestFromDirectory:
         manifest = PluginManifest.from_directory(directory)
         assert manifest.declared_capabilities == frozenset({"tool", "hook"})
 
+    def test_docker_pids_limit_is_parsed_from_frontmatter(self, tmp_path):
+        directory = write_plugin(tmp_path, "demo")
+        plugin_file = directory / "PLUGIN.md"
+        plugin_file.write_text(
+            plugin_file.read_text(encoding="utf-8").replace(
+                "entry_point: plugin:make_tools", "entry_point: plugin:make_tools\npids_limit: 42"
+            ),
+            encoding="utf-8",
+        )
+        assert PluginManifest.from_directory(directory).pids_limit == 42
+
+
+@pytest.mark.parametrize("pids_limit", [0, -1])
+def test_pids_limit_must_be_positive(pids_limit: int):
+    with pytest.raises(PluginManifestError, match="resource limits must be positive"):
+        make_manifest(pids_limit=pids_limit)
+
 
 class TestFromEntryPoint:
     def test_builds_manifest(self):

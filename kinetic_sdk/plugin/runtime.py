@@ -11,5 +11,6 @@ from kinetic_sdk.security import PermissivePolicy
 def main() -> None:
     module_name, factory_name = sys.argv[1].split(":", 1)
     tools = getattr(importlib.import_module(module_name), factory_name)()
+    # The hardened container is the boundary; host MCP adapters enforce host policy.
     MCPServer.serve_stdio(tools=tools, permission_policy=PermissivePolicy())
 if __name__ == "__main__": main()

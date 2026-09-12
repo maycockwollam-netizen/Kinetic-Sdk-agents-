@@ -21,6 +21,14 @@ All notable changes to `kinetic-agent-sdk`. Format loosely follows
 
 ### Fixed
 
+- **Docker plugin sandbox hardening** — Docker-isolated plugins now cap PIDs,
+  drop all Linux capabilities, prohibit privilege escalation, run as an
+  unprivileged image user, pin the in-container SDK to the host version, and
+  bound Docker build operations with a timeout.
+- **Async MCP concurrency** — `AsyncMCPClient` now serializes concurrent
+  initialize, tool-list, tool-call and close operations so a shared sync
+  transport cannot deliver one request's response to another caller.
+
 - **Parallel sub-agent safety** — shared event, audit, observability and
   metrics sinks now synchronise concurrent writes. Multiple `delegate` tool
   calls in one parallel tool batch can safely run sub-agents at the same time
