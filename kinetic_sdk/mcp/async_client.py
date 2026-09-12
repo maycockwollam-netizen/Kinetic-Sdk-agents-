@@ -18,7 +18,14 @@ from kinetic_sdk.mcp.transport import Transport
 
 
 class AsyncMCPClient:
-    """Awaitable façade over :class:`MCPClient` with identical semantics."""
+    """Awaitable façade over :class:`MCPClient` with identical semantics.
+
+    One instance serializes concurrent callers: each request/response cycle
+    queues behind the previous one because the synchronous client correlates
+    replies by reading the next matching message. Callers needing true
+    parallel MCP calls must use separate clients and transports (or server
+    subprocesses), rather than sharing one instance.
+    """
 
     def __init__(self, transport: Transport, init_timeout: float = 10.0,
                  request_timeout: float = 30.0, client_name: str = "kinetic-agent-sdk",
@@ -26,6 +33,7 @@ class AsyncMCPClient:
                  on_notification: Callable[[JsonRpcNotification], None] | None = None) -> None:
         self._sync = MCPClient(transport, init_timeout, request_timeout, client_name,
                                client_version, on_notification)
+        self._lock = asyncio.Lock()
 
     @property
     def initialized(self) -> bool:
@@ -40,17 +48,21 @@ class AsyncMCPClient:
         return self._sync.server_info
 
     async def initialize(self, timeout: float | None = None) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.initialize, timeout)
+        async with self._lock:
+            return await asyncio.to_thread(self._sync.initialize, timeout)
 
     async def list_tools(self, timeout: float | None = None) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._sync.list_tools, timeout)
+        async with self._lock:
+            return await asyncio.to_thread(self._sync.list_tools, timeout)
 
     async def call_tool(self, name: str, arguments: dict[str, Any],
                         timeout: float | None = None) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.call_tool, name, arguments, timeout)
+        async with self._lock:
+            return await asyncio.to_thread(self._sync.call_tool, name, arguments, timeout)
 
     async def close(self) -> None:
-        await asyncio.to_thread(self._sync.close)
+        async with self._lock:
+            await asyncio.to_thread(self._sync.close)
 
     async def __aenter__(self) -> "AsyncMCPClient": return self
     async def __aexit__(self, *exc_info: object) -> None: await self.close()
