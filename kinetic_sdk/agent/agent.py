@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -240,6 +241,12 @@ class Agent:
         #: Cooperative cancellation flag, set via :meth:`cancel` from any
         #: thread. Checked between iterations and between tool calls.
         self._cancel_event = threading.Event()
+        #: Cooperative pause gate. Set means the loop may continue; clearing it
+        #: pauses only at safe boundaries between completed tool-call rounds.
+        self._pause_event = threading.Event()
+        self._pause_event.set()
+        #: Cross-thread user messages to add at the next replay-valid boundary.
+        self._inbox: queue.Queue[str] = queue.Queue()
         #: UUID of the in-flight (or most recent) :meth:`run`; ``None`` before
         #: the first run. Every event emitted during a run carries it.
         self._run_id: str | None = None
@@ -489,6 +496,29 @@ class Agent:
         interrupted — cooperative cancellation cannot preempt running work.
         """
         self._cancel_event.set()
+        self._pause_event.set()
+
+    def pause(self) -> None:
+        """Pause an in-flight run at its next safe loop boundary.
+
+        A currently executing tool is deliberately allowed to finish, keeping
+        the conversation free of dangling ``tool_use`` blocks.
+        """
+        self._pause_event.clear()
+
+    def resume(self) -> None:
+        """Resume a run paused by :meth:`pause` without resetting its state."""
+        self._pause_event.set()
+
+    def send_message_while_running(self, text: str) -> None:
+        """Queue a user message for the next tool-call-round boundary.
+
+        The method is non-blocking and thread-safe. Messages are appended by
+        the run thread, immediately before its next LLM request.
+        """
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text must be a non-empty string")
+        self._inbox.put(text)
 
     @property
     def cancelled(self) -> bool:
@@ -509,6 +539,7 @@ class Agent:
             DEFAULT_STRUCTURED_RETRIES if structured_retries is None else structured_retries
         )
         while iteration < self.max_iterations:
+            self._pause_event.wait()
             if self._cancel_event.is_set():
                 logger.info("Agent run cancelled at iteration %d", iteration)
                 self._emit("agent.cancelled", {"iteration": iteration})
@@ -565,6 +596,15 @@ class Agent:
             any_error = self._execute_tool_calls(response.tool_calls)
             self._persist_state()
 
+            # A tool-call round is complete, so this is both replay-valid and
+            # the earliest point at which injected user input can be acted on.
+            self._drain_inbox()
+            self._pause_event.wait()
+            if self._cancel_event.is_set():
+                logger.info("Agent run cancelled after tool calls at iteration %d", iteration)
+                self._emit("agent.cancelled", {"iteration": iteration})
+                return final_text
+
             if not escalated and self.mode is AgentMode.FLASH:
                 should_escalate = False
                 if iteration == 0 and any_error:
@@ -581,6 +621,16 @@ class Agent:
                 {"reason": "max_iterations", "iterations": self.max_iterations},
             )
         return final_text
+
+    def _drain_inbox(self) -> None:
+        """Append queued cross-thread user messages and notify observers."""
+        while True:
+            try:
+                message = self._inbox.get_nowait()
+            except queue.Empty:
+                return
+            self.state.add_user_message(message)
+            self._emit("agent.message_injected", {"message": message})
 
     def _first_user_message(self) -> str | None:
         """Return the most recent user text message, if any (for re-runs)."""
