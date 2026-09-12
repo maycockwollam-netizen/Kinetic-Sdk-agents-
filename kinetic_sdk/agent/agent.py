@@ -40,6 +40,7 @@ from kinetic_sdk.agent.structured import (
     check_final_answer,
     schema_instruction,
 )
+from kinetic_sdk.agent.stuck_detector import StuckDetector
 from kinetic_sdk.context.manager import (
     ContextManager,
     SimpleTruncateContextManager,
@@ -89,7 +90,7 @@ class Agent:
               ``agent.escalated``, ``agent.classified``, ``agent.error``,
               ``agent.budget_exceeded``, ``context.compacted``,
               ``context.summarization_failed``, ``security.permission_denied``,
-              ``hooks.error`` (via the hook registry).
+              ``agent.stuck_detected``, ``hooks.error`` (via the hook registry).
         classifier: Optional :class:`TaskClassifier`. When provided (or when
             the default is used) :meth:`run` classifies the task exactly once
             before the first turn and routes to FLASH or MAX. Pass ``None`` to
@@ -127,6 +128,10 @@ class Agent:
             policy flags a call ``requires_confirmation=True``, the agent
             asks the ``ON_PERMISSION_CHECK`` hooks instead of denying
             outright — see :meth:`_execute_one`.
+        stuck_detector: Optional sliding-window guard for repeated tool calls.
+            When it detects repetition, the run is cooperatively cancelled
+            after emitting ``agent.stuck_detected``. ``None`` preserves the
+            historical behavior with no detection.
 
     Attributes:
         mode: Current :class:`AgentMode`. Set once by the classifier at the
@@ -170,6 +175,7 @@ class Agent:
         memory: MemoryProvider | None = None,
         memory_recall_limit: int = 3,
         run_budget: RunBudget | None = None,
+        stuck_detector: StuckDetector | None = None,
     ) -> None:
         self.llm = llm
         #: Optional persistence backend. When set (and no explicit ``state``
@@ -277,6 +283,8 @@ class Agent:
         #: an explanatory final text and an ``agent.budget_exceeded`` event —
         #: no exception escapes the loop. ``None`` (default) = unlimited.
         self.run_budget = run_budget
+        #: Optional sliding-window repeated-tool-call guard. Disabled by default.
+        self.stuck_detector = stuck_detector
 
         tool_list = list(tools or [])
         self._tools: dict[str, Tool] = {}
@@ -546,12 +554,13 @@ class Agent:
                 return final_text
             self._emit("agent.turn_started", {"iteration": iteration, "mode": self.mode.value})
             self._maybe_compact_context()
-            self._trigger_hooks(
+            hook_results = self._trigger_hooks(
                 HookPoint.BEFORE_LLM_CALL,
                 HookContext(
                     point=HookPoint.BEFORE_LLM_CALL,
                     run_id=self._run_id,
                     iteration=iteration,
+                    user_message=self._first_user_message(),
                 ),
             )
             # Re-check after hooks: a hook is a common place for UI-driven
@@ -564,7 +573,8 @@ class Agent:
             if budget_stop is not None:
                 logger.warning("Run budget exceeded: %s", budget_stop)
                 return budget_stop
-            response = self._call_llm(stream=stream)
+            system_append = self._system_prompt_append(hook_results)
+            response = self._call_llm(stream=stream, system_append=system_append)
             self._trigger_hooks(
                 HookPoint.AFTER_LLM_CALL,
                 HookContext(
@@ -664,7 +674,9 @@ class Agent:
             },
         )
 
-    def _call_llm(self, stream: bool = False) -> LLMResponse:
+    def _call_llm(
+        self, stream: bool = False, system_append: str | None = None
+    ) -> LLMResponse:
         """Ask the LLM for the next turn using the current history + tools.
 
         With ``stream=True`` the client's ``chat_stream`` is consumed instead:
@@ -675,6 +687,8 @@ class Agent:
         plain ``chat`` call.
         """
         system, messages = self.state.for_llm()
+        if system_append:
+            system = f"{system}\n\n{system_append}" if system else system_append
         tools = self.tool_schemas() or None
         if not stream:
             response = self.llm.chat(messages=messages, tools=tools, system=system)
@@ -962,6 +976,27 @@ class Agent:
                 "output_preview": redact_secrets(self._preview(result.output)),
             },
         )
+        if self.stuck_detector is not None and self.stuck_detector.observe(
+            call.name, call.arguments
+        ):
+            self._emit(
+                "agent.stuck_detected",
+                {"tool_name": call.name, "window": self.stuck_detector.window},
+            )
+            self.cancel()
+
+    @staticmethod
+    def _system_prompt_append(results: list[HookResult]) -> str | None:
+        """Collect request-local system-prompt additions from LLM hooks."""
+        additions = [
+            result.modified_context["system_prompt"]
+            for result in results
+            if isinstance(result, HookResult)
+            and result.modified_context
+            and isinstance(result.modified_context.get("system_prompt"), str)
+            and result.modified_context["system_prompt"].strip()
+        ]
+        return "\n\n".join(additions) or None
 
     def _execute_one(self, call: ToolCall) -> ToolResult:
         """Dispatch a single tool call, gated by hooks + permission policy.

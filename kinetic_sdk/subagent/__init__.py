@@ -81,6 +81,7 @@ from kinetic_sdk.subagent.manifest import (
     SUBAGENT_MAX_NAME_LENGTH,
     SUBAGENT_NAME_PATTERN,
     SubagentSpec,
+    load_subagent_spec,
 )
 from kinetic_sdk.subagent.tool import DELEGATE_TOOL_NAME, DelegateTool
 
@@ -100,6 +101,7 @@ __all__ = [
     "SubagentError",
     "SubagentSpec",
     "SubagentSpecError",
+    "load_subagent_spec",
     "SUBAGENT_MAX_NAME_LENGTH",
     "SUBAGENT_NAME_PATTERN",
     "agent_id_for",
