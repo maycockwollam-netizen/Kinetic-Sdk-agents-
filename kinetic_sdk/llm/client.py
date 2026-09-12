@@ -343,15 +343,46 @@ class LiteLLMClient(LLMClient):
                     if extras:
                         out.append({"role": "user", "content": LiteLLMClient._flatten_text(extras)})
                 else:
-                    # Multimodal content blocks are already understood by
-                    # LiteLLM/providers; preserve them rather than flattening
-                    # images into nothing.
-                    out.append({"role": "user", "content": content})
+                    out.append(
+                        {
+                            "role": "user",
+                            "content": LiteLLMClient._translate_content_blocks(content),
+                        }
+                    )
             else:
                 # Plain text turn (user/assistant string content) or any other
                 # role: pass through with stringified content.
                 out.append({"role": role, "content": content if isinstance(content, str) else LiteLLMClient._flatten_text(content) if isinstance(content, list) else content})
         return out
+
+    @staticmethod
+    def _translate_content_blocks(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Translate Anthropic multimodal user blocks to OpenAI wire format.
+
+        Conversation state deliberately retains Anthropic's expressive block
+        format.  LiteLLM receives OpenAI-compatible messages, where base64
+        images are represented by an ``image_url`` data URL instead.
+        Unrecognised blocks pass through unchanged to preserve compatibility
+        with future provider-supported content types.
+        """
+        translated: list[dict[str, Any]] = []
+        for block in content:
+            if block.get("type") != "image":
+                translated.append(block)
+                continue
+
+            source = block.get("source", {})
+            if not isinstance(source, dict):
+                source = {}
+            media_type = source.get("media_type", "image/png")
+            data = source.get("data", "")
+            translated.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{data}"},
+                }
+            )
+        return translated
 
     @staticmethod
     def _translate_assistant(content: Any) -> dict[str, Any]:
