@@ -18,7 +18,8 @@ relevant entries before a run (injected as a separate user message) and
 stores the Q/A pair after it. Explicit mid-run memory management goes
 through :class:`~kinetic_sdk.memory.tool.MemoryTool` like any tool call.
 Embedding/vector providers plug into the same ABC when keyword overlap is
-not enough — the SDK ships no embedding client (optional-dependency rule).
+not enough. ``VectorMemory`` has an injectable backend; its LiteLLM wrapper
+is lazy-imported and remains optional.
 """
 
 from kinetic_sdk.memory.inmemory import InMemoryMemory
@@ -31,6 +32,11 @@ from kinetic_sdk.memory.provider import (
     tokens,
 )
 from kinetic_sdk.memory.tool import MemoryTool
+from kinetic_sdk.memory.vector import (
+    EmbeddingClient,
+    LiteLLMEmbeddingClient,
+    VectorMemory,
+)
 
 __all__ = [
     "InMemoryMemory",
@@ -39,6 +45,9 @@ __all__ = [
     "MemoryError",
     "MemoryProvider",
     "MemoryTool",
+    "EmbeddingClient",
+    "LiteLLMEmbeddingClient",
+    "VectorMemory",
     "relevance",
     "tokens",
 ]

@@ -645,6 +645,29 @@ behind alias `kinetic-classifier-v1` — never leak the real model name.
   (subprocess/container — hạn chế đã biết trước, ghi rõ trong docs, không
   phải việc "khắc phục ngay").
 
+## Plugin Docker sandbox (Stage 6 — DONE)
+- `PluginManifest.isolation` mặc định là `"in-process"` để tương thích ngược;
+  `"docker"` chỉ nhận directory plugin. `DockerPluginLoader` là opt-in và tái
+  dùng MCP-over-stdio, không dựng RPC riêng: adapter trả về vẫn là Tool bình
+  thường nên policy/audit HOST luôn chạy trước call container.
+- Docker mặc định `--network none`, `--read-only`, 512m và 1 CPU; manifest có
+  thể điều chỉnh network/resource. cidfile + `docker rm -f` là cleanup
+  best-effort; host/daemon crash vẫn không thể bảo đảm dọn 100%.
+
+## Async MCP client (Stage 6 — DONE)
+- `mcp/async_client.py` có `AsyncMCPClient` mirror toàn bộ surface tools của
+  `MCPClient`. Quyết định đã chốt: bridge `Transport` sync bằng
+  `asyncio.to_thread`, giống default async Tool, thay vì thêm HTTP dependency
+  hay copy protocol/correlation logic. Registry vẫn sync-only vì nó sở hữu
+  lifecycle transport sync; resources/prompts vẫn ngoài phạm vi.
+
+## Vector memory (Stage 6 — DONE)
+- `memory/vector.py` có `EmbeddingClient` ABC và `VectorMemory` cosine index
+  in-memory; LiteLLM wrapper lazy-import và extra `memory`, core vẫn zero-dep.
+  Quyết định đã chốt: lỗi embedding fail-soft (entry text vẫn lưu, search trả
+  rỗng), phù hợp Agent memory integration không làm run chết; vector DB/persist
+  là extension sau qua cùng provider boundary.
+
 ## Subagent (Stage 4 — DONE)
 - `subagent/` = agent TỰ SINH agent khác dùng chính tool/credential của
   mình — module duy nhất của Stage 4 có rủi ro runaway recursion đốt tiền

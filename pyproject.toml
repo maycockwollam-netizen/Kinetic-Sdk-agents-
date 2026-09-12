@@ -21,6 +21,10 @@ llm = [
     "litellm>=1.50,<1.98.0; python_version < '3.11'",
     "litellm>=1.50; python_version >= '3.11'",
 ]
+memory = [
+    "litellm>=1.50,<1.98.0; python_version < '3.11'",
+    "litellm>=1.50; python_version >= '3.11'",
+]
 tokens = ["tiktoken>=0.7"]
 browser = ["playwright>=1.40"]
 otel = ["opentelemetry-sdk>=1.25"]
