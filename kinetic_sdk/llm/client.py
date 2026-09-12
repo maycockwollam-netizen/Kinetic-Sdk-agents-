@@ -115,6 +115,44 @@ class LLMResponse:
     usage: dict[str, Any] = field(default_factory=dict)
     raw: Any = None
 
+    @property
+    def reasoning_text(self) -> str | None:
+        """Best-effort provider-neutral extraction of hidden reasoning text.
+
+        Providers expose this in several incompatible shapes.  This helper is
+        deliberately defensive because ``raw`` is provider-owned data.
+        """
+        def get(value: Any, key: str) -> Any:
+            return value.get(key) if isinstance(value, dict) else getattr(value, key, None)
+
+        def extract(value: Any) -> str | None:
+            if isinstance(value, str):
+                return value or None
+            if isinstance(value, list):
+                parts = [part for item in value if (part := extract(item))]
+                return "\n".join(parts) or None
+            if isinstance(value, dict) or value is not None:
+                kind = get(value, "type")
+                if kind in {"thinking", "reasoning"}:
+                    for key in ("thinking", "text", "summary", "content"):
+                        found = extract(get(value, key))
+                        if found:
+                            return found
+                for key in ("reasoning", "reasoning_content", "thinking", "content"):
+                    found = extract(get(value, key))
+                    if found:
+                        return found
+            return None
+
+        raw = self.raw
+        direct = extract(raw)
+        if direct:
+            return direct
+        choices = get(raw, "choices")
+        if isinstance(choices, list) and choices:
+            return extract(get(choices[0], "message"))
+        return None
+
 
 @dataclass
 class StreamEvent:
@@ -305,7 +343,10 @@ class LiteLLMClient(LLMClient):
                     if extras:
                         out.append({"role": "user", "content": LiteLLMClient._flatten_text(extras)})
                 else:
-                    out.append({"role": "user", "content": LiteLLMClient._flatten_text(content)})
+                    # Multimodal content blocks are already understood by
+                    # LiteLLM/providers; preserve them rather than flattening
+                    # images into nothing.
+                    out.append({"role": "user", "content": content})
             else:
                 # Plain text turn (user/assistant string content) or any other
                 # role: pass through with stringified content.

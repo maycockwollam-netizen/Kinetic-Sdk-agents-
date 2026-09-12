@@ -46,10 +46,11 @@ ENTRY_POINT_GROUP = "kinetic_sdk.plugins"
 
 PluginSource = Literal["entry_point", "directory"]
 
-#: Capabilities a plugin may declare. Only ``"tool"`` is acted on in this
-#: version; ``"hook"`` is reserved so manifests can already declare intent
-#: for a future loader without a format change.
-KNOWN_CAPABILITIES: frozenset[str] = frozenset({"tool", "hook"})
+#: Capabilities a plugin may declare. This is a declaration rather than an
+#: enforcement boundary; currently only tool loading is acted on by the SDK.
+KNOWN_CAPABILITIES: frozenset[str] = frozenset(
+    {"tool", "hook", "mcp", "skill", "agent", "command"}
+)
 
 _ENTRY_POINT_RE = re.compile(
     r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*:[A-Za-z_]\w*$"

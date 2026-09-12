@@ -59,13 +59,17 @@ class TestCapabilitiesValidation:
         manifest = make_manifest(declared_capabilities=frozenset({"tool", "hook"}))
         assert manifest.declared_capabilities == frozenset({"tool", "hook"})
 
+    def test_skill_capability_is_allowed(self):
+        manifest = make_manifest(declared_capabilities=frozenset({"tool", "skill"}))
+        assert manifest.declared_capabilities == frozenset({"tool", "skill"})
+
     def test_empty_capabilities_raise(self):
         with pytest.raises(PluginManifestError):
             make_manifest(declared_capabilities=frozenset())
 
     def test_unknown_capability_raises(self):
         with pytest.raises(PluginManifestError):
-            make_manifest(declared_capabilities=frozenset({"tool", "filesystem"}))
+            make_manifest(declared_capabilities=frozenset({"tool", "invalid"}))
 
 
 class TestSourceAndDirectory:
