@@ -49,6 +49,29 @@ class ConversationState:
         self._enforce_cap()
         return msg
 
+    def add_user_message_with_image(
+        self, text: str, image_base64: str, media_type: str = "image/png"
+    ) -> Message:
+        """Append a multimodal user turn in Anthropic content-block form.
+
+        ``image_base64`` is intentionally kept out of a text field: provider
+        clients can forward the structured block without corrupting binary
+        data or needlessly stringifying it.
+        """
+        msg: Message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": text},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": image_base64},
+                },
+            ],
+        }
+        self.messages.append(msg)
+        self._enforce_cap()
+        return msg
+
     def add_assistant(self, content: str | list[dict[str, Any]]) -> Message:
         """Append an assistant turn from a provider response.
 

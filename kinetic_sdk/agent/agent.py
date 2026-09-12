@@ -585,6 +585,11 @@ class Agent:
                 ),
             )
             self.state.add_assistant(self._assistant_content(response))
+            if response.reasoning_text:
+                self._emit(
+                    "agent.reasoning_trace",
+                    {"text": response.reasoning_text, "iteration": iteration},
+                )
             self._emit(
                 "agent.llm_response",
                 {"tool_calls": len(response.tool_calls), "stop_reason": response.stop_reason},
