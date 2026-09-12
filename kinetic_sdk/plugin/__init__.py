@@ -41,6 +41,7 @@ from kinetic_sdk.plugin.discovery import (
     discover_entry_point_plugins,
     discover_plugins,
 )
+from kinetic_sdk.plugin.docker_loader import DockerPluginLoader
 from kinetic_sdk.plugin.exceptions import (
     PluginLoadError,
     PluginManifestError,
@@ -65,6 +66,7 @@ __all__ = [
     "KNOWN_CAPABILITIES",
     "PLUGIN_FILE_NAME",
     "PluginLoader",
+    "DockerPluginLoader",
     "PluginLoadError",
     "PluginManifest",
     "PluginManifestError",

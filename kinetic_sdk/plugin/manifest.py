@@ -45,6 +45,7 @@ PLUGIN_FILE_NAME = "PLUGIN.md"
 ENTRY_POINT_GROUP = "kinetic_sdk.plugins"
 
 PluginSource = Literal["entry_point", "directory"]
+PluginIsolation = Literal["in-process", "docker"]
 
 #: Capabilities a plugin may declare. This is a declaration rather than an
 #: enforcement boundary; currently only tool loading is acted on by the SDK.
@@ -94,6 +95,12 @@ class PluginManifest:
         default_factory=lambda: frozenset({"tool"})
     )
     directory: str | None = None
+    #: Explicit execution boundary.  Existing plugins remain in-process.
+    isolation: PluginIsolation = "in-process"
+    #: Docker opt-ins; ignored for the default in-process loader.
+    network: str | None = "none"
+    memory_limit: str = "512m"
+    cpu_limit: float = 1.0
 
     def __post_init__(self) -> None:
         if len(self.name) > MAX_NAME_LENGTH or not SKILL_NAME_PATTERN.match(self.name):
@@ -116,6 +123,18 @@ class PluginManifest:
             raise PluginManifestError(
                 f"plugin {self.name!r}: invalid source {self.source!r} "
                 "(expected 'entry_point' or 'directory')"
+            )
+        if self.isolation not in ("in-process", "docker"):
+            raise PluginManifestError(
+                f"plugin {self.name!r}: isolation must be 'in-process' or 'docker'"
+            )
+        if self.isolation == "docker" and self.source != "directory":
+            raise PluginManifestError(
+                f"plugin {self.name!r}: docker isolation requires a directory plugin"
+            )
+        if self.memory_limit.strip() == "" or self.cpu_limit <= 0:
+            raise PluginManifestError(
+                f"plugin {self.name!r}: docker resource limits must be positive"
             )
         capabilities = frozenset(self.declared_capabilities)
         if not capabilities:
@@ -192,6 +211,8 @@ class PluginManifest:
                 f"{plugin_md}: missing required 'entry_point' key"
             )
         capabilities = frontmatter.get("capabilities", "tool")
+        isolation = frontmatter.get("isolation", "in-process")
+        network = frontmatter.get("network", "none")
         return cls(
             name=name,
             version=frontmatter.get("version") or None,
@@ -201,6 +222,10 @@ class PluginManifest:
                 part.strip() for part in capabilities.split(",") if part.strip()
             ),
             directory=directory,
+            isolation=isolation,  # type: ignore[arg-type]
+            network=None if network == "host" else network,
+            memory_limit=frontmatter.get("memory_limit", "512m"),
+            cpu_limit=float(frontmatter.get("cpu_limit", "1.0")),
         )
 
     @classmethod

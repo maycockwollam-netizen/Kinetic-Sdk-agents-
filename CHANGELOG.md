@@ -5,6 +5,20 @@ All notable changes to `kinetic-agent-sdk`. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+- **Vector memory** — `VectorMemory` cosine-ranks vectors through injectable
+  `EmbeddingClient`; `LiteLLMEmbeddingClient` is lazy and available through
+  the optional `memory` extra. Embedding backend faults preserve stored text
+  and make recall empty rather than interrupting an Agent run.
+- **Async MCP client** — `AsyncMCPClient` mirrors the synchronous tools-only
+  client through the SDK-standard `asyncio.to_thread` transport bridge, so
+  handshake, correlation and exception semantics cannot drift.
+- **Docker plugin isolation** — directory plugins can explicitly declare
+  `isolation: docker`; `DockerPluginLoader` builds/runs them as MCP servers
+  with read-only root, disabled network by default, CPU/memory caps, and
+  best-effort cidfile cleanup. Host-side Agent permission/audit gates remain
+  authoritative because returned tools are MCP adapters.
+
 ### Fixed
 
 - **Parallel sub-agent safety** — shared event, audit, observability and

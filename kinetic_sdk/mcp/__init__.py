@@ -34,6 +34,7 @@ audit log as the internal agent loop — no security shortcut for MCP traffic.
 """
 
 from kinetic_sdk.mcp.adapter import MCPToolAdapter
+from kinetic_sdk.mcp.async_client import AsyncMCPClient
 from kinetic_sdk.mcp.client import (
     MCP_PROTOCOL_VERSION,
     MCPClient,
@@ -65,6 +66,7 @@ from kinetic_sdk.mcp.transport import (
 __all__ = [
     "MCP_PROTOCOL_VERSION",
     "MCPClient",
+    "AsyncMCPClient",
     "MCPClientError",
     "MCPHandshakeError",
     "MCPServerError",
