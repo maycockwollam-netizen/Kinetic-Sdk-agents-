@@ -16,8 +16,14 @@ module encodes:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
-from kinetic_sdk.skills.skill import MAX_NAME_LENGTH, SKILL_NAME_PATTERN
+from kinetic_sdk.skills.exceptions import SkillParseError
+from kinetic_sdk.skills.skill import (
+    MAX_NAME_LENGTH,
+    SKILL_NAME_PATTERN,
+    _split_frontmatter,
+)
 from kinetic_sdk.subagent.exceptions import SubagentSpecError
 
 #: Sub-agent names follow the exact same shape as skill/plugin names
@@ -68,3 +74,25 @@ class SubagentSpec:
                 f"Sub-agent {self.name!r} must declare a non-empty system_prompt "
                 "(sub-agents never inherit the parent's system message)"
             )
+
+
+def load_subagent_spec(path: str | Path) -> SubagentSpec:
+    """Load a :class:`SubagentSpec` from flat-frontmatter Markdown.
+
+    The parser is shared with skills so Markdown agent manifests have exactly
+    the same deliberately small YAML-flat subset. Dataclass validation remains
+    the single authority for required name and non-empty system prompt.
+    """
+    file_path = Path(path)
+    try:
+        frontmatter, body = _split_frontmatter(
+            file_path.read_text(encoding="utf-8"), str(file_path)
+        )
+    except (OSError, SkillParseError) as exc:
+        raise SubagentSpecError(str(exc)) from exc
+    return SubagentSpec(
+        name=frontmatter.get("name", ""),
+        description=frontmatter.get("description", ""),
+        model=frontmatter.get("model") or None,
+        system_prompt=body,
+    )

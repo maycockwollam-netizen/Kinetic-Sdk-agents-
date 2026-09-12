@@ -39,7 +39,10 @@ class HookPoint(Enum):
     #: Context: ``final_text``, ``run_id``.
     AFTER_RUN = "after_run"
 
-    #: Right before each LLM call. Context: ``iteration``, ``run_id``.
+    #: Right before each LLM call. Context: ``iteration``, ``run_id``,
+    #: ``user_message`` (the most recent plain-text user message). A hook may
+    #: append request-local text to the system prompt via
+    #: ``modified_context={"system_prompt": ...}``.
     BEFORE_LLM_CALL = "before_llm_call"
 
     #: Right after each LLM call. Context: ``iteration``, ``llm_response``,
@@ -101,10 +104,11 @@ class HookResult:
             stops it: at ``BEFORE_TOOL_CALL`` the call is cancelled, at
             ``ON_PERMISSION_CHECK`` the call stays denied. At other points the
             value is collected but does not change control flow.
-        modified_context: Optional light mutation. Currently only
-            ``{"tool_input": {...}}`` at ``BEFORE_TOOL_CALL`` is honoured —
-            the replacement input is what gets permission-checked, audited
-            and executed. Hooks are not required to use this field.
+        modified_context: Optional light mutation. ``{"tool_input": {...}}``
+            at ``BEFORE_TOOL_CALL`` replaces the input that is checked and
+            executed. ``{"system_prompt": "..."}`` at ``BEFORE_LLM_CALL``
+            appends request-local text to the base system prompt. Hooks are
+            not required to use this field.
     """
 
     should_continue: bool = True

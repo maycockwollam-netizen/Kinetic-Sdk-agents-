@@ -135,6 +135,9 @@ class Skill:
             from user frontmatter, so a skill cannot lie about its provenance.
         root_path: Canonical absolute path of the skill directory.
         version: Optional free-form version string from frontmatter.
+        type: ``"repo"`` skills are always catalogued; ``"knowledge"``
+            skills require a matching trigger.
+        triggers: Comma-separated trigger keywords for knowledge skills.
     """
 
     name: str
@@ -142,6 +145,8 @@ class Skill:
     source: str
     root_path: str
     version: str | None = None
+    type: Literal["repo", "knowledge"] = "repo"
+    triggers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.name) > MAX_NAME_LENGTH or not SKILL_NAME_PATTERN.match(self.name):
@@ -162,6 +167,10 @@ class Skill:
             description = description[: MAX_DESCRIPTION_LENGTH - len(notice)] + notice
             object.__setattr__(self, "description", description)
         object.__setattr__(self, "root_path", os.path.realpath(os.fspath(self.root_path)))
+        if self.type not in {"repo", "knowledge"}:
+            raise SkillParseError(
+                f"skill {self.name!r}: type must be 'repo' or 'knowledge'"
+            )
 
     # --- construction --------------------------------------------------
 
@@ -206,6 +215,12 @@ class Skill:
             source=source,
             root_path=directory,
             version=frontmatter.get("version") or None,
+            type=frontmatter.get("type", "repo"),  # type: ignore[arg-type]
+            triggers=tuple(
+                trigger.strip()
+                for trigger in frontmatter.get("triggers", "").split(",")
+                if trigger.strip()
+            ),
         )
 
     # --- lazy content accessors -----------------------------------------
