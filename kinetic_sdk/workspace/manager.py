@@ -27,11 +27,9 @@ from __future__ import annotations
 
 import fnmatch
 import os
-import subprocess
-import time
 from pathlib import Path
 
-from kinetic_sdk.workspace.base import CommandResult, WorkspaceBase
+from kinetic_sdk.workspace.base import CommandResult, WorkspaceBase, WorkspaceError
 
 
 class PathTraversalError(ValueError):
@@ -124,47 +122,19 @@ class LocalWorkspace(WorkspaceBase):
     def run_command(
         self, command: str, *, timeout: float | None = None, cwd: str | None = None
     ) -> CommandResult:
-        """Run *command* via ``bash -c`` with cwd set inside this workspace.
+        """Refuse shell execution on the SDK host.
 
-        Behaviour mirrors :class:`~kinetic_sdk.terminal.tool.TerminalTool`
-        (same process-group kill on timeout) so this can back that tool
-        directly in a later wiring step.
+        ``cwd`` confines only a process's initial directory; it cannot stop
+        shell text from using absolute paths, ``cd ..``, redirects, or child
+        processes to access the host.  Therefore a local workspace is a
+        path-safe *file* abstraction, not a command sandbox.  Use
+        :class:`DockerWorkspace` (or a Kubernetes/remote workspace supplied
+        by the platform) when untrusted command text must be executed.
         """
-        effective_cwd = self.resolve(cwd) if cwd is not None else self._root
-        started = time.monotonic()
-        try:
-            proc = subprocess.Popen(
-                ["bash", "-c", command],
-                cwd=effective_cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-                start_new_session=True,
-            )
-        except OSError as exc:
-            return CommandResult(
-                output="", exit_code=-1, duration_seconds=0.0, error=f"failed to start shell: {exc}"
-            )
-        timed_out = False
-        try:
-            output, _ = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            import signal
-
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            output, _ = proc.communicate()
-        duration = time.monotonic() - started
-        return CommandResult(
-            output=output or "",
-            exit_code=proc.returncode if proc.returncode is not None else -1,
-            duration_seconds=round(duration, 3),
-            timed_out=timed_out,
-            error=(f"command timed out after {timeout}s" if timed_out else None),
+        del command, timeout, cwd
+        raise WorkspaceError(
+            "LocalWorkspace does not execute shell commands because it is not a sandbox; "
+            "use DockerWorkspace, KubernetesWorkspace, or RemoteAPIWorkspace"
         )
 
     def read_text(self, relative_path: str) -> str:

@@ -15,12 +15,14 @@ create parent directories atomically in the same shell invocation.
 from __future__ import annotations
 
 import fnmatch
+import posixpath
 import subprocess
 import time
 from shlex import quote
 from typing import Callable, cast
 
 from kinetic_sdk.workspace.base import CommandResult, WorkspaceBase, WorkspaceError
+from kinetic_sdk.workspace.manager import PathTraversalError
 
 
 class KubernetesWorkspace(WorkspaceBase):
@@ -54,7 +56,9 @@ class KubernetesWorkspace(WorkspaceBase):
         self._pod_name = pod_name
         self._namespace = namespace
         self._container = container
-        self._workdir = workdir
+        if not workdir.startswith("/"):
+            raise ValueError("workdir must be an absolute POSIX path")
+        self._workdir = posixpath.normpath(workdir)
         self._timeout = timeout
         self._runner = runner
 
@@ -96,13 +100,26 @@ class KubernetesWorkspace(WorkspaceBase):
         return stdout + stderr
 
     def _absolute_path(self, relative_path: str) -> str:
-        return f"{self._workdir.rstrip('/')}/{relative_path.lstrip('/')}"
+        candidate = posixpath.normpath(
+            relative_path
+            if posixpath.isabs(relative_path)
+            else posixpath.join(self._workdir, relative_path)
+        )
+        try:
+            inside = posixpath.commonpath([self._workdir, candidate]) == self._workdir
+        except ValueError:
+            inside = False
+        if not inside:
+            raise PathTraversalError(
+                f"path {relative_path!r} resolves outside the workspace root {self._workdir!r}"
+            )
+        return candidate
 
     def run_command(
         self, command: str, *, timeout: float | None = None, cwd: str | None = None
     ) -> CommandResult:
         """Execute shell text through ``kubectl exec`` in the selected pod."""
-        effective = command if cwd is None else f"cd {quote(cwd)} && {command}"
+        effective = command if cwd is None else f"cd {quote(self._absolute_path(cwd))} && {command}"
         started = time.monotonic()
         if timeout is not None:
             if timeout <= 0:

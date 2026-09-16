@@ -10,7 +10,8 @@ back the same shapes regardless of where the work actually happens.
 Concrete implementations live alongside this file:
 
 * :class:`kinetic_sdk.workspace.manager.LocalWorkspace` (formerly the only
-  ``Workspace`` — path containment + subprocess, unchanged behaviour).
+  ``Workspace`` — path-safe local file operations; it refuses host shell
+  execution because it is not a sandbox).
 * :class:`kinetic_sdk.workspace.docker_workspace.DockerWorkspace` — runs
   everything inside a container, reusing ``docker_exec_wrapper`` /
   ``docker_run_wrapper`` from ``terminal/docker.py``.
@@ -81,7 +82,9 @@ class WorkspaceBase(ABC):
         """Run *command* (shell semantics) and return its result.
 
         Args:
-            command: Shell command, executed via ``bash -c``.
+            command: Shell command. Backends that execute commands use
+                ``bash -c``; ``LocalWorkspace`` refuses it because a host
+                working directory is not a security boundary.
             timeout: Wall-clock seconds before the command is killed.
             cwd: Optional working directory *inside* the workspace, relative
                 to the root. ``None`` uses the workspace root itself.

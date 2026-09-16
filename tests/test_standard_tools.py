@@ -46,11 +46,11 @@ def test_terminal_timeout_kills_process_group():
     assert result.metadata["timed_out"] is True
 
 
-def test_terminal_runs_in_workspace_root(workspace):
+def test_terminal_refuses_local_workspace_that_is_not_a_sandbox(workspace):
     tool = TerminalTool(workspace=workspace)
     result = tool.execute(command="pwd")
-    assert not result.is_error
-    assert result.output.strip() == workspace.root_path
+    assert result.is_error
+    assert "not a sandbox" in str(result.error)
 
 
 def test_terminal_output_truncation():

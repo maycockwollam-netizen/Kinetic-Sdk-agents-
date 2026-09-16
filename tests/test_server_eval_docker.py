@@ -202,8 +202,8 @@ def test_remote_workspace_round_trip_through_agent_server(tmp_path):
             f"{BASE}:{srv.port}", workspace_id="project-a", token="workspace-token"
         )
         command = TerminalTool(workspace=remote).execute(command="pwd && echo remote-ok")
-        assert not command.is_error
-        assert "remote-ok" in command.output
+        assert command.is_error
+        assert "not a sandbox" in str(command.error)
 
         editor = FileTool(remote)
         created = editor.execute(action="create", path="nested/note.txt", file_text="hello")

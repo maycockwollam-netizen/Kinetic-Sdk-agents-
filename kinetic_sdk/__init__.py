@@ -1,8 +1,8 @@
 """Kinetic Agent SDK.
 
-A modular SDK for building AI coding agents. Stage 1 provides the core
-tool-calling loop: ``agent``, ``conversation``, ``event``, ``llm`` and ``tool``
-together with light stubs for later stages.
+A modular SDK for building AI coding agents. It includes the core agent loop,
+context and memory, security and observability, extensions, and the Stage 5
+production-readiness features described in the changelog.
 
 The most commonly used names are re-exported here so newcomers can write
 ``from kinetic_sdk import Agent`` instead of reaching into submodules. The

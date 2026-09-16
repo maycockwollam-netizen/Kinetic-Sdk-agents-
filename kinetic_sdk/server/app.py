@@ -35,6 +35,11 @@ Optional bearer-token auth (``token=...``) checks ``Authorization: Bearer
 <token>`` — a single shared secret for dev/staging; put a real auth layer
 in front for anything exposed. Request bodies are capped (1 MB) so a
 malicious client cannot memory-bomb the process.
+
+This is intentionally a small embedded HTTP server, not an Internet-facing
+gateway: TLS and identity verification belong at a reverse proxy.  Its
+in-memory run history and concurrent handlers are bounded to avoid turning
+normal production traffic into unbounded process resource use.
 """
 
 from __future__ import annotations
@@ -86,6 +91,10 @@ class AgentServer:
             discarded. ``None`` keeps sessions until server shutdown.
         max_requests_per_minute: Optional per-client-IP sliding-window limit.
             ``None`` keeps the existing unlimited behaviour.
+        max_runs: Maximum completed/running run records retained in memory.
+            The oldest records are evicted when the bound is reached.
+        max_concurrent_requests: Maximum active HTTP handlers. Excess
+            requests receive ``503`` rather than creating unbounded threads.
     """
 
     def __init__(
@@ -98,6 +107,8 @@ class AgentServer:
         workspace_factory: Callable[[str], WorkspaceBase] | None = None,
         session_ttl: float | None = None,
         max_requests_per_minute: int | None = None,
+        max_runs: int = 1_000,
+        max_concurrent_requests: int = 64,
     ) -> None:
         if not callable(agent_factory):
             raise TypeError("agent_factory must be callable")
@@ -108,13 +119,20 @@ class AgentServer:
             raise ValueError("session_ttl must be positive or None")
         if max_requests_per_minute is not None and max_requests_per_minute <= 0:
             raise ValueError("max_requests_per_minute must be positive or None")
+        if max_runs <= 0:
+            raise ValueError("max_runs must be positive")
+        if max_concurrent_requests <= 0:
+            raise ValueError("max_concurrent_requests must be positive")
         self._session_ttl = session_ttl
         self._runs: dict[str, RunRecord] = {}
+        self._run_order: deque[str] = deque()
+        self._max_runs = max_runs
         self._sessions: dict[str, Agent] = {}
         self._session_activity: dict[str, float] = {}
         self._lock = threading.Lock()
         self._drain_condition = threading.Condition(self._lock)
         self._in_flight_requests = 0
+        self._request_slots = threading.BoundedSemaphore(max_concurrent_requests)
         self._stopping = False
         self._max_requests_per_minute = max_requests_per_minute
         self._request_times: dict[str, deque[float]] = {}
@@ -158,16 +176,19 @@ class AgentServer:
         """Backward-compatible alias for :meth:`stop`."""
         self.stop()
 
-    def _begin_request(self) -> bool:
+    def _begin_request(self) -> tuple[bool, str | None]:
         with self._drain_condition:
             if self._stopping:
-                return False
+                return False, "server is shutting down"
+            if not self._request_slots.acquire(blocking=False):
+                return False, "server is at concurrent request capacity"
             self._in_flight_requests += 1
-            return True
+            return True, None
 
     def _finish_request(self) -> None:
         with self._drain_condition:
             self._in_flight_requests -= 1
+            self._request_slots.release()
             self._drain_condition.notify_all()
 
     def _health_snapshot(self) -> tuple[int, int]:
@@ -231,7 +252,10 @@ class AgentServer:
         run_id = uuid.uuid4().hex
         record = RunRecord(run_id=run_id, status="running", final="")
         with self._lock:
+            while len(self._run_order) >= self._max_runs:
+                self._runs.pop(self._run_order.popleft(), None)
             self._runs[run_id] = record
+            self._run_order.append(run_id)
         try:
             agent = self._make_agent(session_id)
             # ConversationState is mutable; serialise session runs with the
@@ -287,8 +311,9 @@ class AgentServer:
                 """Count, limit and log one parsed HTTP request."""
                 started = time.monotonic()
                 self._response_status = None
-                if not server._begin_request():
-                    self._send_json(503, {"error": "server is shutting down"})
+                accepted, reason = server._begin_request()
+                if not accepted:
+                    self._send_json(503, {"error": reason})
                     self._log_request(started)
                     return
                 try:

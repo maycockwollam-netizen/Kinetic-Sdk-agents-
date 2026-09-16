@@ -26,7 +26,7 @@ import logging
 import queue
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -225,9 +225,9 @@ class Agent:
             raise ValueError("tool_timeout must be positive")
         #: Per-call wall-clock limit for ``tool.execute``. ``None`` disables
         #: the guard (historical behaviour). On expiry the loop receives an
-        #: error ToolResult and continues; Python cannot safely kill a running
-        #: thread, so the timed-out call keeps running in the background -
-        #: the timeout unblocks the agent, it does not cancel the work.
+        #: error ToolResult and continues. Python cannot safely kill a running
+        #: thread, so timed-out calls retain one of the bounded execution
+        #: slots until they finish; this prevents unbounded queued work.
         self.tool_timeout = tool_timeout
         #: When True, a batch of tool calls in one model turn is fanned out to
         #: a thread pool instead of running strictly in order. Gating (hooks,
@@ -239,6 +239,7 @@ class Agent:
         #: op), but a custom tool sharing mutable state is not.
         self.parallel_tool_execution = parallel_tool_execution
         self._executor: ThreadPoolExecutor | None = None
+        self._tool_slots = threading.BoundedSemaphore(8)
         #: Validate model-supplied arguments against each tool's declared
         #: JSON schema before executing (see ``tool/validation.py``). Invalid
         #: input becomes an error ToolResult with an actionable message
@@ -921,10 +922,13 @@ class Agent:
         executed_args: dict[int, dict[str, Any]] = {}
         if pending:
             executor = self._get_executor()
-            futures = {
-                executor.submit(tool.execute, **arguments): (i, call, arguments)
-                for (i, call, tool, arguments) in pending
-            }
+            futures = {}
+            for i, call, tool, arguments in pending:
+                future = self._submit_timed_tool(executor, tool, arguments)
+                if future is None:
+                    executed[i] = ToolResult(error="tool execution capacity exhausted")
+                else:
+                    futures[future] = (i, call, arguments)
             for future, (i, call, arguments) in futures.items():
                 executed_args[i] = arguments
                 try:
@@ -934,6 +938,7 @@ class Agent:
                         else future.result()
                     )
                 except FutureTimeoutError:
+                    future.cancel()
                     executed[i] = ToolResult(
                         error=(
                             f"Tool {call.name!r} timed out after {self.tool_timeout}s "
@@ -970,6 +975,21 @@ class Agent:
                 max_workers=8, thread_name_prefix="kinetic-tool"
             )
         return self._executor
+
+    def _submit_timed_tool(
+        self, executor: ThreadPoolExecutor, tool: Tool, arguments: dict[str, Any]
+    ) -> Future[ToolResult] | None:
+        """Submit a timeout-managed tool without allowing an unbounded queue.
+
+        Python cannot safely kill a running thread.  The bounded slot is held
+        until the tool actually returns, including after a caller times out,
+        so permanently hung tools cannot accumulate threads or queued work.
+        """
+        if not self._tool_slots.acquire(blocking=False):
+            return None
+        future = executor.submit(tool.execute, **arguments)
+        future.add_done_callback(lambda _future: self._tool_slots.release())
+        return future
 
     def _emit_tool_call_finished(self, call: ToolCall, result: ToolResult) -> None:
         self._emit(
@@ -1122,20 +1142,23 @@ class Agent:
         the loop only waits up to the timeout. A timed-out call returns an
         error result so the model can react; the worker thread itself is NOT
         killed (Python has no safe thread kill), so a tool that hangs forever
-        still leaks its thread - the timeout protects the loop, not the
-        process. Tools wrapping subprocesses/network should enforce their own
-        real timeout too (``GitTool`` already does).
+        retains one bounded execution slot — the timeout protects the loop,
+        not the tool process. Tools wrapping subprocesses/network should
+        enforce their own real timeout too (``GitTool`` already does).
         """
         if self.tool_timeout is None:
             return tool.execute(**arguments)
-        future = self._get_executor().submit(tool.execute, **arguments)
+        future = self._submit_timed_tool(self._get_executor(), tool, arguments)
+        if future is None:
+            return ToolResult(error="tool execution capacity exhausted")
         try:
             return future.result(timeout=self.tool_timeout)
         except FutureTimeoutError:
+            future.cancel()
             return ToolResult(
                 error=(
                     f"Tool {tool.name!r} timed out after {self.tool_timeout}s "
-                    "(the call may still be running in the background)"
+                    "(the call may still be running in the background; capacity is bounded)"
                 )
             )
 

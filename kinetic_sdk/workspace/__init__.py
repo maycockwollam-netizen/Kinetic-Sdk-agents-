@@ -1,8 +1,9 @@
 """Workspace package: scoped working-directory management for agents.
 
 ``Workspace`` (kept as a backward-compatible alias for
-:class:`LocalWorkspace`) remains the default: path containment + subprocess
-on the local filesystem. :class:`DockerWorkspace`, :class:`RemoteAPIWorkspace`,
+:class:`LocalWorkspace`) remains the default: path-safe local file operations.
+It deliberately refuses shell execution because a host ``cwd`` is not a
+sandbox. :class:`DockerWorkspace`, :class:`RemoteAPIWorkspace`,
 and :class:`KubernetesWorkspace` implement the same :class:`WorkspaceBase`
 contract for containerised and remote execution — swap one for another without
 touching agent code.

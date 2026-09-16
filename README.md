@@ -206,8 +206,8 @@ before being persisted or published.
 ## Roadmap
 
 - Add richer policy presets for filesystem, terminal, git, and network tools.
-- Add metrics aggregation and external tracing exporters such as OpenTelemetry
-  or Jaeger.
+- Add external tracing exporters beyond the included OpenTelemetry support,
+  such as Jaeger.
 - Subagent follow-ups: parallel sub-agent execution (the shared budget is
   already thread-safe), optional tool-narrowing overrides on `SubagentSpec`.
 - MCP follow-ups: tool-list caching, server-initiated requests (sampling),
