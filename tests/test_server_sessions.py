@@ -54,6 +54,25 @@ def test_runs_reuse_session_conversation(server):
     assert [message["content"] for message in server._sessions["chat-a"].state.messages if message["role"] == "user"] == ["third"]
 
 
+def test_server_evicts_old_run_records_at_configured_bound():
+    value = AgentServer(_factory, port=0, max_runs=2)
+    try:
+        first = value._run_agent("one", stream=False, output_schema=None)
+        second = value._run_agent("two", stream=False, output_schema=None)
+        third = value._run_agent("three", stream=False, output_schema=None)
+        assert first["run_id"] not in value._runs
+        assert list(value._runs) == [second["run_id"], third["run_id"]]
+    finally:
+        value._httpd.server_close()
+
+
+def test_server_rejects_nonpositive_resource_bounds():
+    with pytest.raises(ValueError, match="max_runs"):
+        AgentServer(_factory, port=0, max_runs=0)
+    with pytest.raises(ValueError, match="max_concurrent_requests"):
+        AgentServer(_factory, port=0, max_concurrent_requests=0)
+
+
 def test_openai_completion_uses_model_as_session_id(server):
     root = f"http://127.0.0.1:{server.port}"
     result = _post(root + "/v1/chat/completions", {"model": "openai-session", "messages": [{"role": "user", "content": "hello"}], "stream": False})

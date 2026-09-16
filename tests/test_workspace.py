@@ -9,7 +9,7 @@ import os
 
 import pytest
 
-from kinetic_sdk.workspace import PathTraversalError, Workspace
+from kinetic_sdk.workspace import PathTraversalError, Workspace, WorkspaceError
 
 
 @pytest.fixture
@@ -112,6 +112,11 @@ def test_resolve_allows_symlink_staying_inside_root(workspace):
 def test_traversal_error_names_the_offending_path(workspace):
     with pytest.raises(PathTraversalError, match=r"\.\./\.\./etc/passwd"):
         workspace.resolve("../../etc/passwd")
+
+
+def test_local_workspace_refuses_shell_execution(workspace):
+    with pytest.raises(WorkspaceError, match="not a sandbox"):
+        workspace.run_command("cd .. && cat /etc/passwd")
 
 
 # --- list_files() -----------------------------------------------------------------

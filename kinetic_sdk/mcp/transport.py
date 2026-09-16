@@ -224,6 +224,15 @@ class StdioTransport(Transport):
         if self._proc is None:
             return "attached streams"
         code = self._proc.poll()
+        if code is None:
+            # EOF means the child has closed stdout.  Give the OS a brief
+            # chance to publish its exit status before reporting diagnostics;
+            # without this, a reader-thread/``poll`` race says "running" for
+            # a process that has already exited.
+            try:
+                code = self._proc.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
         return "process running" if code is None else f"process exited with code {code}"
 
     def _death_detail(self, end: _StreamEnd) -> str:

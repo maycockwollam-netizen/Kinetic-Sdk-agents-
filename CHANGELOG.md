@@ -27,6 +27,19 @@ All notable changes to `kinetic-agent-sdk`. Format loosely follows
 
 ### Fixed
 
+- **Workspace execution boundaries** — `LocalWorkspace` now refuses host
+  shell execution rather than presenting a `cwd` restriction as a sandbox;
+  use Docker, Kubernetes, or a remote platform workspace for command text.
+  `KubernetesWorkspace` now rejects lexical path traversal for all direct
+  file operations and command working directories.
+- **Resource bounds** — `Agent` timeout-managed tools now hold one of a
+  bounded set of execution slots until they actually finish, preventing hung
+  synchronous tools from accumulating queued work. `AgentServer` now bounds
+  retained run records and active HTTP handlers.
+- **MCP subprocess diagnostics** — `StdioTransport` briefly waits for a
+  child exit status after stdout EOF, avoiding a race that reported a dead
+  subprocess as still running.
+
 - **Docker plugin sandbox hardening** — Docker-isolated plugins now cap PIDs,
   drop all Linux capabilities, prohibit privilege escalation, run as an
   unprivileged image user, pin the in-container SDK to the host version, and
