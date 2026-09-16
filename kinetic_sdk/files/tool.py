@@ -19,10 +19,15 @@ Actions (one ``action`` parameter, mirroring the curated ``GitTool`` design):
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, ClassVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
+from kinetic_sdk.subagent.exceptions import FileLockTimeoutError
+from kinetic_sdk.subagent.filelock import FileLockRegistry
 from kinetic_sdk.tool.base import Tool, ToolResult
 from kinetic_sdk.workspace.base import WorkspaceBase, WorkspaceError
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from kinetic_sdk.agent.agent import Agent
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +41,11 @@ class FileTool(Tool):
             whole-filesystem tool, which this class refuses to be.
         max_view_lines: Cap on lines returned by ``view`` (the rest is cut
             with a marker) so a huge file cannot flood the context.
+        lock_registry: Optional shared sub-agent file-lock registry. When
+            supplied, write actions acquire a short-lived per-file lease.
+            Call :meth:`bind` after constructing the owning agent so the
+            lease owner uses its stable delegation audit id.
+        lock_timeout: Seconds to wait for another agent's write lease.
     """
 
     name: str = "file_editor"
@@ -75,14 +85,46 @@ class FileTool(Tool):
     DEFAULT_MAX_VIEW_LINES: ClassVar[int] = 2_000
 
     def __init__(
-        self, workspace: WorkspaceBase, max_view_lines: int = DEFAULT_MAX_VIEW_LINES
+        self,
+        workspace: WorkspaceBase,
+        max_view_lines: int = DEFAULT_MAX_VIEW_LINES,
+        *,
+        lock_registry: FileLockRegistry | None = None,
+        lock_timeout: float = 5.0,
     ) -> None:
         if max_view_lines < 10:
             raise ValueError("max_view_lines must be >= 10")
+        if lock_timeout < 0:
+            raise ValueError("lock_timeout must be non-negative")
         self.workspace = workspace
         self.max_view_lines = max_view_lines
+        self._lock_registry = lock_registry
+        self.lock_timeout = lock_timeout
+        self._owner_id: str | None = None
         # path -> previous content, for single-level undo_edit.
         self._undo: dict[str, str | None] = {}
+
+    def bind(self, agent: "Agent", *, owner_id: str | None = None) -> None:
+        """Bind lock ownership to *agent*'s stable delegation audit id.
+
+        Binding is only needed when ``lock_registry`` is configured. It is
+        intentionally separate from construction, matching ``DelegateTool``
+        and allowing the agent to be created with this tool in its set.
+        """
+        if owner_id is None:
+            from kinetic_sdk.subagent.delegation import agent_id_for
+
+            owner_id = agent_id_for(agent)
+        self._owner_id = owner_id
+
+    def _clone_for(self) -> "FileTool":
+        """Return an unbound child tool sharing this registry and workspace."""
+        return FileTool(
+            self.workspace,
+            self.max_view_lines,
+            lock_registry=self._lock_registry,
+            lock_timeout=self.lock_timeout,
+        )
 
     # --- dispatch -----------------------------------------------------
 
@@ -106,12 +148,30 @@ class FileTool(Tool):
             )
         try:
             return handler(path, **params)
+        except FileLockTimeoutError as exc:
+            logger.warning("Write lock unavailable for %r: %s", path, exc)
+            return ToolResult(error=f"file is locked for writing: {exc}")
         except ValueError as exc:
             return ToolResult(error=f"path rejected: {exc}")
         except (OSError, WorkspaceError) as exc:
             return ToolResult(error=f"filesystem error: {exc}")
 
     # --- actions --------------------------------------------------------
+
+    def _write_locked(self, path: str, operation: Callable[[], None]) -> None:
+        """Run one backend write under this call's short-lived file lease."""
+        if self._lock_registry is None:
+            operation()
+            return
+        if self._owner_id is None:
+            raise ValueError(
+                "FileTool with lock_registry is not bound to an agent; "
+                "call file_tool.bind(agent) after constructing the agent"
+            )
+        with self._lock_registry.acquire(
+            path, self._owner_id, timeout=self.lock_timeout
+        ):
+            operation()
 
     def _view(self, path: str, view_range: list[int] | None = None, **_: Any) -> ToolResult:
         try:
@@ -160,8 +220,8 @@ class FileTool(Tool):
             pass
         else:
             return ToolResult(error=f"file already exists: {path} (use str_replace to edit)")
+        self._write_locked(path, lambda: self.workspace.write_text(path, file_text))
         self._undo[path] = None  # undo of a create = delete
-        self.workspace.write_text(path, file_text)
         return ToolResult(output=f"created {path}", metadata={"path": path})
 
     def _str_replace(
@@ -184,8 +244,11 @@ class FileTool(Tool):
             return ToolResult(
                 error=f"old_str matches {occurrences} times; it must match exactly once"
             )
+        self._write_locked(
+            path,
+            lambda: self.workspace.write_text(path, content.replace(old_str, new_str, 1)),
+        )
         self._undo[path] = content
-        self.workspace.write_text(path, content.replace(old_str, new_str, 1))
         return ToolResult(output=f"edited {path}", metadata={"path": path})
 
     def _insert(
@@ -204,12 +267,12 @@ class FileTool(Tool):
         lines = content.splitlines(keepends=True)
         if not 0 <= insert_line <= len(lines):
             return ToolResult(error=f"insert_line {insert_line} out of range 0..{len(lines)}")
-        self._undo[path] = content
         new_lines = new_str.splitlines(keepends=True)
         if new_str and not new_str.endswith("\n"):
             new_lines[-1] += "\n"
         lines[insert_line:insert_line] = new_lines
-        self.workspace.write_text(path, "".join(lines))
+        self._write_locked(path, lambda: self.workspace.write_text(path, "".join(lines)))
+        self._undo[path] = content
         return ToolResult(
             output=f"inserted into {path} after line {insert_line}",
             metadata={"path": path},
@@ -218,14 +281,15 @@ class FileTool(Tool):
     def _undo_edit(self, path: str, **_: Any) -> ToolResult:
         if path not in self._undo:
             return ToolResult(error=f"nothing to undo for {path}")
-        previous = self._undo.pop(path)
+        previous = self._undo[path]
         if previous is None:
-            self.workspace.delete_file(path)
+            self._write_locked(path, lambda: self.workspace.delete_file(path))
+            self._undo.pop(path)
             return ToolResult(output=f"undid create of {path}")
         try:
             current = self.workspace.read_text(path)
         except FileNotFoundError:
             current = ""
-        self.workspace.write_text(path, previous)
+        self._write_locked(path, lambda: self.workspace.write_text(path, previous))
         self._undo[path] = current  # undo is itself undoable (redo)
         return ToolResult(output=f"reverted {path} to its previous content")
