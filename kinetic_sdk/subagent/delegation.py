@@ -265,16 +265,24 @@ def spawn_subagent(
     # spawn_subagent), so a top-level import would be circular.
     from kinetic_sdk.subagent.tool import DelegateTool
 
-    # Full tool inheritance (design decision 1). DelegateTools are cloned
-    # and re-bound to the SUB-agent (sharing the same spec registry and the
-    # SAME budget instance) so nested spawns charge the shared budget too.
+    # Full tool inheritance (design decision 1). DelegateTools and FileTools
+    # are cloned and re-bound to the SUB-agent: delegates share the tree
+    # budget, while file editors share the same lock registry but get the
+    # child's distinct owner id.
     tools: list[Any] = []
     delegate_clones: list[DelegateTool] = []
+    file_tool_clones: list[Any] = []
+    from kinetic_sdk.files.tool import FileTool
+
     for tool in parent_agent._tools.values():  # noqa: SLF001 - intra-SDK access
         if isinstance(tool, DelegateTool):
             clone = tool._clone_for(budget)  # noqa: SLF001
             delegate_clones.append(clone)
             tools.append(clone)
+        elif isinstance(tool, FileTool):
+            file_clone = tool._clone_for()  # noqa: SLF001
+            file_tool_clones.append(file_clone)
+            tools.append(file_clone)
         else:
             tools.append(tool)
 
@@ -298,6 +306,8 @@ def spawn_subagent(
         hooks=parent_agent.hooks,
     )
     for clone in delegate_clones:
+        clone.bind(sub_agent)
+    for clone in file_tool_clones:
         clone.bind(sub_agent)
 
     with _AGENT_IDS_LOCK:

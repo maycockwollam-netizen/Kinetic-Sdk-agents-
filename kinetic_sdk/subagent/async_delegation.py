@@ -172,13 +172,22 @@ def spawn_async_subagent(
     # Imported lazily: async_tool.py imports this module (circular at top).
     from kinetic_sdk.subagent.async_tool import AsyncDelegateTool
 
+    # File editors are cloned so every child has its own audit owner id while
+    # retaining the exact same registry instance for cross-tree coordination.
     tools: list[Any] = []
     delegate_clones: list[AsyncDelegateTool] = []
+    file_tool_clones: list[Any] = []
+    from kinetic_sdk.files.tool import FileTool
+
     for tool in parent_agent._tools.values():  # noqa: SLF001 - intra-SDK access
         if isinstance(tool, AsyncDelegateTool):
             clone = tool._clone_for(budget)  # noqa: SLF001
             delegate_clones.append(clone)
             tools.append(clone)
+        elif isinstance(tool, FileTool):
+            file_clone = tool._clone_for()  # noqa: SLF001
+            file_tool_clones.append(file_clone)
+            tools.append(file_clone)
         else:
             tools.append(tool)
 
@@ -200,6 +209,8 @@ def spawn_async_subagent(
     )
     for clone in delegate_clones:
         clone.bind(sub_agent)
+    for clone in file_tool_clones:
+        clone.bind(sub_agent, owner_id=agent_id)
 
     with _AGENT_IDS_LOCK:
         _AGENT_IDS[sub_agent] = agent_id
