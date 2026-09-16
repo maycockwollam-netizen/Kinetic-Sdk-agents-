@@ -55,6 +55,7 @@ from kinetic_sdk.llm.client import LLMClient, LLMResponse, ToolCall
 from kinetic_sdk.llm.usage import UsageAccumulator
 from kinetic_sdk.memory.provider import MemoryProvider
 from kinetic_sdk.observability.logger import ObservabilityLogger
+from kinetic_sdk.replay.recorder import ReplayRecorder
 from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
 from kinetic_sdk.security.policy import (
     AllowListPolicy,
@@ -170,6 +171,7 @@ class Agent:
         hooks: HookRegistry | None = None,
         tool_timeout: float | None = None,
         state_store: ConversationStore | None = None,
+        replay_recorder: ReplayRecorder | None = None,
         validate_tool_inputs: bool = True,
         parallel_tool_execution: bool = False,
         memory: MemoryProvider | None = None,
@@ -194,6 +196,10 @@ class Agent:
         else:
             self.state = ConversationState()
         self.event_bus = event_bus if event_bus is not None else EventBus()
+        #: Optional durable event recorder for offline replay debugging.
+        self.replay_recorder = replay_recorder
+        if replay_recorder is not None:
+            replay_recorder.attach(self.event_bus)
         self.classifier: TaskClassifier = classifier if classifier is not None else DefaultClassifier()
         self.context_manager: ContextManager = (
             context_manager if context_manager is not None else SimpleTruncateContextManager()
@@ -825,16 +831,24 @@ class Agent:
         full, permissions) must not kill a run - the failure is logged and
         the loop continues with the in-memory state.
         """
-        if self.state_store is None:
-            return
-        try:
-            self.state_store.save(self.state)
-        except Exception as exc:  # noqa: BLE001 - persistence is best-effort
-            logger.warning("Failed to persist conversation state: %s", exc)
-            self._emit(
-                "agent.state_persist_failed",
-                {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
-            )
+        if self.state_store is not None:
+            try:
+                self.state_store.save(self.state)
+            except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+                logger.warning("Failed to persist conversation state: %s", exc)
+                self._emit(
+                    "agent.state_persist_failed",
+                    {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+                )
+        if self.replay_recorder is not None:
+            try:
+                self.replay_recorder.snapshot(self.state, self._run_id)
+            except Exception as exc:  # noqa: BLE001 - replay recording is best-effort
+                logger.warning("Failed to persist replay snapshot: %s", exc)
+                self._emit(
+                    "agent.replay_persist_failed",
+                    {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+                )
 
     def _assistant_content(self, response: LLMResponse) -> Any:
         """Build the assistant message ``content`` to store in history.
