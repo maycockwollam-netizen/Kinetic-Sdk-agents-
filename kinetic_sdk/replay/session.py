@@ -191,8 +191,35 @@ class ReplayDebugSession:
         )
 
 
+_IDENTITY_FIELDS = frozenset({"run_id"})
+
+
+def _stable_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return payload content without per-run identifiers at any depth."""
+    return {
+        key: _stable_value(value)
+        for key, value in payload.items()
+        if key not in _IDENTITY_FIELDS
+    }
+
+
+def _stable_value(value: Any) -> Any:
+    """Recursively remove identity fields without mutating recorded payloads."""
+    if isinstance(value, dict):
+        return _stable_payload(value)
+    if isinstance(value, list):
+        return [_stable_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_stable_value(item) for item in value)
+    return value
+
+
 def _step_key(step: ReplayStep) -> str:
-    return json.dumps({"event_type": step.event_type, "payload": step.payload}, sort_keys=True, default=str)
+    return json.dumps(
+        {"event_type": step.event_type, "payload": _stable_payload(step.payload)},
+        sort_keys=True,
+        default=str,
+    )
 
 
 def _label(step: ReplayStep) -> str:
