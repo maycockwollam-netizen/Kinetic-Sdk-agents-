@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from kinetic_sdk.replay.models import ReplayRun, ReplayStep
+from kinetic_sdk.replay.session import ReplayDebugSession, ReplayDiff
 from kinetic_sdk.replay.store import ReplayStore, ReplayStoreError
 
 
@@ -49,3 +50,15 @@ class ReplayDebugger:
     def previous(self) -> ReplayStep | None:
         """Move back one step, returning ``None`` before the first step."""
         return self.seek(max(self._position - 1, -1))
+
+    def session(self) -> ReplayDebugSession:
+        """Open the higher-level timeline, fork and diff debug interface."""
+        return ReplayDebugSession(self.replay)
+
+    def fork(self, sequence: int | None = None):
+        """Fork from a replay-valid snapshot (see :class:`ReplayDebugSession`)."""
+        return self.session().fork(sequence)
+
+    def diff(self, other: ReplayRun) -> ReplayDiff:
+        """Compare this replay with another run for a debugger timeline."""
+        return self.session().compare(other)
