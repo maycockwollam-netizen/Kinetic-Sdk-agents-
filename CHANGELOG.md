@@ -6,6 +6,12 @@ All notable changes to `kinetic-agent-sdk`. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **Full replay debug sessions** — `ReplayDebugSession` adds UI-ready timeline
+  entries/JSON, replay-valid snapshot forks, changed input/model/tool branch
+  construction, position-by-position run diffs, and
+  `DeterministicToolReplay` side-effect-free recorded tool doubles. Forking
+  and deterministic tools reject normal redacted captures; callers must
+  explicitly opt into protected raw snapshots.
 - **Kubernetes workspace** — `KubernetesWorkspace` executes against an
   existing sidecar pod via injected, timeout-bound `kubectl` calls, providing
   the same workspace contract as Docker without a Kubernetes client dependency.

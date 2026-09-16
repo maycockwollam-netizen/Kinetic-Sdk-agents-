@@ -41,6 +41,11 @@ rewriting the agent loop.
   `AgentServer`, checkpoint fork/rewind helpers, an eval harness, docker
   sandbox adapters for `TerminalTool`, async sub-agent delegation, and MCP
   reconnect. See `CHANGELOG.md` for the full detail.
+- **Replay debugger — full branch workflow.** `ReplayDebugSession` supplies
+  UI-ready timelines, snapshot-safe forks, model/tool/input substitution,
+  run-to-run diffs, and opt-in deterministic replay tools. Raw snapshots are
+  required for live forks or deterministic tool results and must be stored as
+  protected secrets.
 - **Async layer — done.** `AsyncAgent` mirrors every sync capability
   (routing, compaction, hooks, policy, structured output, memory, usage).
 

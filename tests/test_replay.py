@@ -8,8 +8,12 @@ import pytest
 
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.replay import (
+    DeterministicReplayError,
+    DeterministicToolReplay,
     JsonFileReplayStore,
     ReplayDebugger,
+    ReplayDebugSession,
+    ReplayForkError,
     ReplayRecorder,
     ReplayRun,
     ReplayStep,
@@ -109,3 +113,98 @@ def test_debugger_moves_without_executing_or_mutating_replay(tmp_path):
     with pytest.raises(IndexError):
         debugger.seek(3)
     assert store.load() == original
+
+
+def _raw_snapshot(sequence: int, messages: list[dict]) -> ReplayStep:
+    return ReplayStep(
+        sequence,
+        "t",
+        "replay.snapshot",
+        {"state": {"system_prompt": None, "messages": messages, "max_messages": None, "metadata": {}}},
+    )
+
+
+def test_debug_session_forks_from_latest_snapshot_and_allows_input_model_and_tool_swap():
+    replay = ReplayRun(
+        "parent",
+        [
+            ReplayStep(0, "t0", "agent.run_started", {}),
+            _raw_snapshot(1, [{"role": "user", "content": "old input"}]),
+            ReplayStep(2, "t2", "agent.run_finished", {"final_text": "old"}),
+        ],
+    )
+    session = ReplayDebugSession(replay)
+
+    branch = session.fork(2).replace_input("new input")
+    agent = branch.create_agent(
+        MockLLMClient([text_response("new model answer")]),
+        tools=[MockTool("replacement", result="unused")],
+        permission_policy=PermissivePolicy(),
+    )
+
+    assert agent.run() == "new model answer"
+    assert agent.state.messages[0]["content"] == "new input"
+    assert branch.parent_run_id == "parent"
+    assert branch.fork_sequence == 1
+
+
+def test_branch_recorder_persists_parent_lineage(tmp_path):
+    replay = ReplayRun("parent", [_raw_snapshot(0, [{"role": "user", "content": "old"}])])
+    branch = ReplayDebugSession(replay).fork()
+    store = JsonFileReplayStore(tmp_path / "child.json")
+    recorder = branch.create_recorder(store, capture_raw_snapshots=True)
+    agent = branch.create_agent(
+        MockLLMClient([text_response("child")]),
+        replay_recorder=recorder,
+    )
+
+    assert agent.run() == "child"
+    child = store.load()
+    assert child is not None
+    assert (child.parent_run_id, child.fork_sequence) == ("parent", 0)
+
+
+def test_debug_session_rejects_redacted_or_non_checkpoint_forks_and_builds_ui_timeline():
+    replay = ReplayRun(
+        "parent",
+        [
+            ReplayStep(0, "t0", "agent.tool_call_started", {"name": "echo"}),
+            _raw_snapshot(1, [{"role": "user", "content": "[REDACTED]"}]),
+        ],
+    )
+    session = ReplayDebugSession(replay)
+    assert session.timeline()[0].label == "Tool started: echo"
+    assert '"label": "Tool started: echo"' in session.timeline_json()
+    with pytest.raises(ReplayForkError, match="redacted"):
+        session.fork()
+    with pytest.raises(ReplayForkError, match="no replay-valid"):
+        session.fork(0)
+
+
+def test_debug_session_compares_runs_without_timestamp_noise():
+    left = ReplayRun("left", [ReplayStep(0, "one", "agent.run_started", {}), ReplayStep(1, "two", "agent.run_finished", {"final_text": "a"})])
+    right = ReplayRun("right", [ReplayStep(0, "other", "agent.run_started", {}), ReplayStep(1, "later", "agent.run_finished", {"final_text": "b"})])
+
+    diff = ReplayDebugSession(left).compare(right)
+
+    assert [entry.kind for entry in diff.entries] == ["equal", "changed"]
+    assert not diff.is_equal
+
+
+def test_deterministic_tools_repeat_recorded_results_without_executing_real_tools():
+    messages = [
+        {"role": "user", "content": "do it"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "echo", "input": {"message": "hi"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "hi"}]},
+    ]
+    replay = ReplayRun("run", [_raw_snapshot(0, messages)])
+    tool = DeterministicToolReplay.from_replay(replay).tools()[0]
+
+    assert tool.execute(message="hi").output == "hi"
+    assert tool.execute(message="hi").is_error
+
+
+def test_deterministic_tools_require_protected_raw_snapshots():
+    replay = ReplayRun("run", [_raw_snapshot(0, [{"role": "user", "content": "[REDACTED]"}])])
+    with pytest.raises(DeterministicReplayError, match="capture_raw_snapshots"):
+        DeterministicToolReplay.from_replay(replay)
