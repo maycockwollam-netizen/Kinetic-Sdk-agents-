@@ -7,6 +7,7 @@ import json
 import pytest
 
 from kinetic_sdk.agent.agent import Agent
+from kinetic_sdk.event.bus import Event
 from kinetic_sdk.replay import (
     DeterministicReplayError,
     DeterministicToolReplay,
@@ -91,6 +92,41 @@ def test_agent_records_events_and_redacted_replay_valid_snapshot(tmp_path):
     snapshot = next(step for step in replay.steps if step.event_type == "replay.snapshot")
     assert "sk-super-secret-key-1234567890" not in str(snapshot.payload)
     assert "[REDACTED]" in str(snapshot.payload)
+
+
+def test_replay_recorder_skips_reasoning_trace_by_default(tmp_path):
+    store = JsonFileReplayStore(tmp_path / "run.json")
+    recorder = ReplayRecorder(store)
+
+    recorder.handle(Event("agent.run_started", {"run_id": "run-1"}))
+    recorder.handle(
+        Event(
+            "agent.reasoning_trace",
+            {"run_id": "run-1", "reasoning": "private reasoning"},
+        )
+    )
+
+    replay = store.load()
+    assert replay is not None
+    assert [step.event_type for step in replay.steps] == ["agent.run_started"]
+
+
+def test_replay_recorder_captures_and_redacts_reasoning_trace_when_enabled(tmp_path):
+    store = JsonFileReplayStore(tmp_path / "run.json")
+    recorder = ReplayRecorder(store, capture_reasoning=True)
+
+    recorder.handle(
+        Event(
+            "agent.reasoning_trace",
+            {"run_id": "run-1", "api_key": "sk-super-secret-key-1234567890"},
+        )
+    )
+
+    replay = store.load()
+    assert replay is not None
+    assert len(replay.steps) == 1
+    assert replay.steps[0].event_type == "agent.reasoning_trace"
+    assert replay.steps[0].payload["api_key"] == "[REDACTED]"
 
 
 def test_debugger_moves_without_executing_or_mutating_replay(tmp_path):

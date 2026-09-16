@@ -23,6 +23,10 @@ class ReplayRecorder:
     By default snapshots are redacted too. Set ``capture_raw_snapshots=True``
     only for protected local storage when the replay will be used to fork a
     conversation, because raw tool output can contain credentials.
+
+    Reasoning traces are omitted by default because they may contain sensitive
+    model output. Set ``capture_reasoning=True`` to include their redacted
+    event payloads in the replay.
     """
 
     def __init__(
@@ -30,6 +34,7 @@ class ReplayRecorder:
         store: ReplayStore,
         *,
         capture_raw_snapshots: bool = False,
+        capture_reasoning: bool = False,
         parent_run_id: str | None = None,
         fork_sequence: int | None = None,
     ) -> None:
@@ -37,6 +42,7 @@ class ReplayRecorder:
             raise ValueError("parent_run_id and fork_sequence must be supplied together")
         self.store = store
         self.capture_raw_snapshots = capture_raw_snapshots
+        self.capture_reasoning = capture_reasoning
         self.parent_run_id = parent_run_id
         self.fork_sequence = fork_sequence
         self._run: ReplayRun | None = None
@@ -52,6 +58,8 @@ class ReplayRecorder:
 
     def handle(self, event: Event) -> None:
         """Record an event belonging to an agent run; unrelated events skip."""
+        if event.type == "agent.reasoning_trace" and not self.capture_reasoning:
+            return
         run_id = event.payload.get("run_id")
         if not isinstance(run_id, str) or not run_id:
             return
