@@ -227,6 +227,36 @@ def test_debug_session_compares_runs_without_timestamp_noise():
     assert not diff.is_equal
 
 
+def test_debug_session_compares_runs_ignoring_payload_run_ids():
+    left = ReplayRun(
+        "left-run",
+        [
+            ReplayStep(
+                0,
+                "one",
+                "agent.run_started",
+                {"run_id": "left-uuid", "mode": "max"},
+            )
+        ],
+    )
+    right = ReplayRun(
+        "right-run",
+        [
+            ReplayStep(
+                0,
+                "other",
+                "agent.run_started",
+                {"run_id": "right-uuid", "mode": "max"},
+            )
+        ],
+    )
+
+    diff = ReplayDebugSession(left).compare(right)
+
+    assert diff.entries[0].kind == "equal"
+    assert diff.is_equal
+
+
 def test_deterministic_tools_repeat_recorded_results_without_executing_real_tools():
     messages = [
         {"role": "user", "content": "do it"},
