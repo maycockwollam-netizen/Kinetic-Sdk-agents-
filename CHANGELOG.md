@@ -6,6 +6,10 @@ All notable changes to `kinetic-agent-sdk`. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **Todo planning tools** — `TodoWriteTool` and `TodoReadTool` give agents a
+  focused, explicit scratchpad for non-trivial multi-step work. Todo lists
+  enforce one active item, support in-memory or versioned atomic JSON storage,
+  and include an offline runnable example.
 - **Full replay debug sessions** — `ReplayDebugSession` adds UI-ready timeline
   entries/JSON, replay-valid snapshot forks, changed input/model/tool branch
   construction, position-by-position run diffs, and
