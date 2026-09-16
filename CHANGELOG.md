@@ -6,6 +6,9 @@ All notable changes to `kinetic-agent-sdk`. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **Codebase mapping tool** — `CodebaseMapTool` builds a cached, AST-derived
+  Python module import map, exposes direct and transitive impact queries, and
+  keeps unparsable files visible so agents treat static-analysis gaps as unknown.
 - **Todo planning tools** — `TodoWriteTool` and `TodoReadTool` give agents a
   focused, explicit scratchpad for non-trivial multi-step work. Todo lists
   enforce one active item, support in-memory or versioned atomic JSON storage,

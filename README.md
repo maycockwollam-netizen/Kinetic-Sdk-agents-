@@ -103,6 +103,8 @@ rewriting the agent loop.
 - `kinetic_sdk/todo/` — `TodoReadTool` / `TodoWriteTool`: an agent-maintained
   scratchpad for focused multi-step plans, with in-memory or atomic JSON
   persistence.
+- `kinetic_sdk/codemap/` — `CodebaseMapTool`: cached, AST-derived Python
+  import maps for assessing downstream impact before edits.
 - `kinetic_sdk/eval/` — eval harness: cases, callable scorers, and an
   `EvalRunner` with per-case `RunTrace` reporting.
 - `kinetic_sdk/memory/` — long-term memory providers (in-memory + JSON
@@ -207,6 +209,15 @@ Use `TodoWriteTool` and `TodoReadTool` for non-trivial, multi-step tasks where
 the agent benefits from tracking one active task at a time. The offline
 [`examples/04_todo_planning.py`](examples/04_todo_planning.py) script shows an
 agent using both tools with `InMemoryTodoStore`; no API key is required.
+
+## Codebase mapping
+
+Use `CodebaseMapTool` before editing an unfamiliar module to inspect its direct
+imports, reverse importers, or transitive `impact_of` dependency view. It is a
+cached, static import-level map rather than a call graph, so dynamic loading and
+other implicit coupling remain unknown. The offline
+[`examples/05_codebase_map.py`](examples/05_codebase_map.py) script builds a
+small temporary project and runs every query mode without an API key.
 
 ## Security defaults
 
