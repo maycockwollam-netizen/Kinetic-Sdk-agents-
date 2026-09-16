@@ -73,9 +73,18 @@ from kinetic_sdk.subagent.delegation import (
 )
 from kinetic_sdk.subagent.exceptions import (
     BudgetExceededError,
+    FileLockError,
+    FileLockOwnershipError,
+    FileLockTimeoutError,
     RepetitionLimitError,
     SubagentError,
     SubagentSpecError,
+)
+from kinetic_sdk.subagent.filelock import (
+    DEFAULT_LOCK_LEASE_SECONDS,
+    FileLock,
+    FileLockInfo,
+    FileLockRegistry,
 )
 from kinetic_sdk.subagent.manifest import (
     SUBAGENT_MAX_NAME_LENGTH,
@@ -92,8 +101,15 @@ __all__ = [
     "AsyncDelegateTool",
     "AsyncLLMFactory",
     "BudgetExceededError",
+    "DEFAULT_LOCK_LEASE_SECONDS",
     "DelegateTool",
     "DelegationResult",
+    "FileLock",
+    "FileLockError",
+    "FileLockInfo",
+    "FileLockOwnershipError",
+    "FileLockRegistry",
+    "FileLockTimeoutError",
     "LLMFactory",
     "RepetitionCircuitBreaker",
     "RepetitionLimitError",

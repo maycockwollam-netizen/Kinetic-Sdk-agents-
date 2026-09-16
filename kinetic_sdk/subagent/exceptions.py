@@ -39,3 +39,15 @@ class RepetitionLimitError(SubagentError):
     ``max_consecutive_repeats`` times consecutively — the classic signature
     of a stuck agent loop.
     """
+
+
+class FileLockError(SubagentError):
+    """Base class for sub-agent file-coordination failures."""
+
+
+class FileLockTimeoutError(FileLockError, TimeoutError):
+    """A file remained owned by another agent until the wait expired."""
+
+
+class FileLockOwnershipError(FileLockError):
+    """An agent attempted to release or renew a lock it does not own."""
