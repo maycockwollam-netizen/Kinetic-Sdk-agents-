@@ -100,6 +100,9 @@ rewriting the agent loop.
   and trace assertions.
 - `kinetic_sdk/ask_user/` — `AskUserTool`: the agent asks the operator a
   question mid-run through an injectable handler (human-in-the-loop).
+- `kinetic_sdk/todo/` — `TodoReadTool` / `TodoWriteTool`: an agent-maintained
+  scratchpad for focused multi-step plans, with in-memory or atomic JSON
+  persistence.
 - `kinetic_sdk/eval/` — eval harness: cases, callable scorers, and an
   `EvalRunner` with per-case `RunTrace` reporting.
 - `kinetic_sdk/memory/` — long-term memory providers (in-memory + JSON
@@ -197,6 +200,13 @@ llm = LiteLLMClient(
     api_base="https://llm-proxy.app.all-hands.dev",
 )
 ```
+
+## Todo planning
+
+Use `TodoWriteTool` and `TodoReadTool` for non-trivial, multi-step tasks where
+the agent benefits from tracking one active task at a time. The offline
+[`examples/04_todo_planning.py`](examples/04_todo_planning.py) script shows an
+agent using both tools with `InMemoryTodoStore`; no API key is required.
 
 ## Security defaults
 
