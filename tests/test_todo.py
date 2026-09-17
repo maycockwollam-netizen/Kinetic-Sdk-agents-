@@ -94,6 +94,25 @@ def test_todo_write_accepts_valid_list_and_renders_checklist():
     assert [item.id for item in saved.items] == ["1", "2", "3"]
 
 
+def test_todo_write_accepts_new_plan_with_only_pending_items():
+    store = InMemoryTodoStore()
+    result = TodoWriteTool(store).execute(
+        [
+            {"content": "Inspect repository", "status": "pending"},
+            {"content": "Implement fix", "status": "pending"},
+        ]
+    )
+
+    assert not result.is_error
+    assert result.output == "[ ] 1. Inspect repository\n[ ] 2. Implement fix"
+    assert store.load() == TodoList(
+        [
+            TodoItem("1", "Inspect repository", "pending"),
+            TodoItem("2", "Implement fix", "pending"),
+        ]
+    )
+
+
 def test_todo_write_rejects_zero_or_multiple_active_items_without_persisting():
     store = InMemoryTodoStore()
     tool = TodoWriteTool(store)

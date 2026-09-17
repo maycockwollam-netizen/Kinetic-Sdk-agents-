@@ -26,9 +26,12 @@ class TodoWriteTool(Tool):
     description = (
         "Maintain an explicit plan for a multi-step, non-trivial task; do not use it "
         "for a single trivial request. Send the full ordered todo list on every call. "
-        "Keep exactly one unfinished item in_progress, mark an item completed "
+        "A newly created plan may contain only pending items; once work has started, "
+        "keep exactly one unfinished item in_progress, mark an item completed "
         "immediately when it is finished (do not batch updates at the end), and then "
-        "advance the next item. Example: [{\"content\": \"Inspect tests\", "
+        "advance the next item. New-plan example: [{\"content\": \"Inspect tests\", "
+        "\"status\": \"pending\"}, {\"content\": \"Implement fix\", "
+        "\"status\": \"pending\"}]. Active-plan example: [{\"content\": \"Inspect tests\", "
         "\"status\": \"completed\"}, {\"content\": \"Implement fix\", "
         "\"status\": \"in_progress\"}, {\"content\": \"Run tests\", "
         "\"status\": \"pending\"}]."
@@ -88,9 +91,10 @@ class TodoWriteTool(Tool):
             return ToolResult(error="todo ids must be unique")
         in_progress_count = sum(item.status == "in_progress" for item in items)
         all_completed = bool(items) and all(item.status == "completed" for item in items)
-        if items and not all_completed and in_progress_count != 1:
+        all_pending = bool(items) and all(item.status == "pending" for item in items)
+        if items and not all_completed and not all_pending and in_progress_count != 1:
             return ToolResult(
-                error="exactly one todo must be in_progress unless the list is empty or all completed"
+                error="exactly one todo must be in_progress unless the list is empty, all completed, or all pending"
             )
 
         todo_list = TodoList(items)
