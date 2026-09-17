@@ -16,6 +16,13 @@ from kinetic_sdk.agent.classifier import (
     TaskComplexity,
 )
 from kinetic_sdk.agent.modes import AgentMode
+from kinetic_sdk.agent.planning import (
+    AnswerVerifier,
+    Plan,
+    PlanStrategy,
+    StaticPlanStrategy,
+    VerificationResult,
+)
 from kinetic_sdk.agent.settings import AgentSettings
 from kinetic_sdk.agent.stuck_detector import StuckDetector
 
@@ -23,6 +30,7 @@ __all__ = [
     "Agent",
     "AgentSettings",
     "AgentMode",
+    "AnswerVerifier",
     "AsyncAgent",
     "AsyncDefaultClassifier",
     "AsyncLiteLLMClassifier",
@@ -32,7 +40,11 @@ __all__ = [
     "LiteLLMClassifier",
     "RunBudget",
     "RunBudgetExceeded",
+    "Plan",
+    "PlanStrategy",
+    "StaticPlanStrategy",
     "TaskClassifier",
     "TaskComplexity",
+    "VerificationResult",
     "StuckDetector",
 ]
