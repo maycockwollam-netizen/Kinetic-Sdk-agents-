@@ -55,7 +55,7 @@ from kinetic_sdk.hooks.base import HookContext, HookPoint, HookResult
 from kinetic_sdk.hooks.registry import HookRegistry
 from kinetic_sdk.llm.client import LLMClient, LLMResponse, ToolCall
 from kinetic_sdk.llm.usage import UsageAccumulator
-from kinetic_sdk.memory.provider import MemoryProvider
+from kinetic_sdk.memory.provider import MemoryProvider, MemorySource, MemoryTier
 from kinetic_sdk.observability.logger import ObservabilityLogger
 from kinetic_sdk.replay.recorder import ReplayRecorder
 from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
@@ -477,6 +477,8 @@ class Agent:
                 ),
             )
             self._emit("agent.error", {"reason": "exception", "error": str(exc)})
+            if self.memory is not None:
+                self._clear_working_memory()
             raise
 
         self._trigger_hooks(
@@ -488,6 +490,8 @@ class Agent:
         self._emit("agent.run_finished", {"final_text": final_text, "mode": self.mode.value})
         if user_message is not None and self.memory is not None:
             self._store_memory(user_message, final_text)
+        if self.memory is not None:
+            self._clear_working_memory()
         return final_text
 
     def escalate(self) -> bool:
@@ -940,6 +944,8 @@ class Agent:
             entry = self.memory.add(
                 f"User: {user_message}\nAssistant: {final_text}",
                 metadata={"run_id": self._run_id},
+                tier=MemoryTier.EPISODIC,
+                source=MemorySource.LLM_INFERENCE,
             )
             self._emit("agent.memory_stored", {"id": entry.id})
         except Exception as exc:  # noqa: BLE001 - fail-soft
@@ -948,6 +954,17 @@ class Agent:
                 "agent.memory_store_failed",
                 {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
             )
+
+    def _clear_working_memory(self) -> None:
+        """Remove run-local memories after a run without affecting other tiers."""
+        assert self.memory is not None
+        if self._run_id is None:
+            return
+        try:
+            self.memory.clear({"run_id": self._run_id}, tiers={MemoryTier.WORKING})
+        except Exception as exc:  # noqa: BLE001 - cleanup must not alter outcome
+            logger.warning("Working memory cleanup failed: %s", exc)
+            self._emit("agent.memory_cleanup_failed", {"error": redact_secrets(f"{type(exc).__name__}: {exc}")})
 
     def _budget_stop_message(self) -> str | None:
         """Check the run budget before an LLM call.

@@ -28,10 +28,12 @@ from kinetic_sdk.memory.provider import (
     MemoryEntry,
     MemoryError,
     MemoryProvider,
+    MemorySource,
+    MemoryTier,
     relevance,
     tokens,
 )
-from kinetic_sdk.memory.tool import MemoryTool
+from kinetic_sdk.memory.tool import MemoryForgetTool, MemoryInspectTool, MemoryTool
 from kinetic_sdk.memory.vector import (
     EmbeddingClient,
     LiteLLMEmbeddingClient,
@@ -44,7 +46,11 @@ __all__ = [
     "MemoryEntry",
     "MemoryError",
     "MemoryProvider",
+    "MemorySource",
+    "MemoryTier",
     "MemoryTool",
+    "MemoryInspectTool",
+    "MemoryForgetTool",
     "EmbeddingClient",
     "LiteLLMEmbeddingClient",
     "VectorMemory",

@@ -1,24 +1,13 @@
-"""Long-term memory providers: what survives across sessions.
+"""Production-oriented memory providers with tier, provenance, TTL and scope.
 
-Conversation persistence (``conversation/store.py``) resumes ONE run's
-history; compaction keeps a long turn inside the context window. Neither
-answers "what did we learn in the session three weeks ago that matters now?"
-— that question is a memory layer's job, and every mature agent SDK ships
-one shape of it (LangChain's memory + vector stores, CrewAI's knowledge
-bases, the OpenAI Agents session+external-memory split).
-
-The layer here is deliberately minimal and provider-neutral:
-
-* :class:`MemoryProvider` ABC — ``add`` / ``search`` / ``all`` / ``clear``.
-* :class:`~kinetic_sdk.memory.inmemory.InMemoryMemory` — zero-dependency
-  keyword-overlap search (tests, demos, small deployments).
-* :class:`~kinetic_sdk.memory.json_file.JsonFileMemory` — same search,
-  persisted to one JSON file (the file is user data, treated like the
-  conversation store: never redacted, protect at the FS level).
-
-An embedding/vector implementation only has to satisfy the same ABC to slot
-in (the SDK ships none — embeddings need a provider dependency the core
-does not carry, same rule as ``litellm`` being optional).
+Unlike conversation persistence (one resumed history) or context compaction
+(one long turn), this layer retains facts across runs.  It deliberately keeps
+one provider contract while annotating each entry with its lifecycle:
+working memory is run-local, episodic memory records a run, and persistent
+memory survives sessions.  Providers also expose source provenance, optional
+expiry, and subset-matched workspace/project/user scopes.  This is a smaller,
+provider-neutral equivalent of the memory abstractions offered by LangChain
+and CrewAI: it does not promise automatic fact extraction or a vector DB.
 """
 
 from __future__ import annotations
@@ -26,46 +15,52 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Any
 
-#: Minimal English/Vietnamese stopword set — overlap scoring without it
-#: ranks "the/and/và/của" above the content words.
-_STOPWORDS = frozenset(
-    {
-        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
-        "is", "are", "was", "were", "be", "it", "its", "this", "that",
-        "và", "của", "là", "cho", "với", "trong", "một", "các", "những", "được",
-    }
-)
 
+class MemoryTier(str, Enum):
+    """Lifecycle class of a memory entry."""
+
+    WORKING = "working"
+    EPISODIC = "episodic"
+    PERSISTENT = "persistent"
+
+
+class MemorySource(str, Enum):
+    """How the remembered content was obtained."""
+
+    UNKNOWN = "unknown"  # Compatibility marker for pre-provenance data.
+    USER_INPUT = "user_input"
+    TOOL_RESULT = "tool_result"
+    LLM_INFERENCE = "llm_inference"
+
+
+_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
+    "is", "are", "was", "were", "be", "it", "its", "this", "that",
+    "và", "của", "là", "cho", "với", "trong", "một", "các", "những", "được",
+})
 _TOKEN_RE = re.compile(r"[0-9a-zA-Zà-ỹÀ-Ỹ_]+")
 
 
 def tokens(text: str) -> set[str]:
     """Extract lowercase content tokens (Unicode letters/digits/_)."""
-    out: set[str] = set()
-    for match in _TOKEN_RE.findall(text.lower()):
-        if match not in _STOPWORDS and len(match) > 1:
-            out.add(match)
-    return out
+    return {match for match in _TOKEN_RE.findall(text.lower()) if match not in _STOPWORDS and len(match) > 1}
 
 
 @dataclass(frozen=True)
 class MemoryEntry:
-    """One stored memory.
-
-    Attributes:
-        id: Provider-assigned id (uuid hex).
-        text: The remembered content (e.g. a user/assistant exchange).
-        metadata: Free-form tags (run_id, task kind, source, ...).
-        created_at: ISO-8601 UTC creation timestamp.
-    """
+    """One remembered value, including lifecycle and provenance metadata."""
 
     id: str
     text: str
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
+    tier: MemoryTier = MemoryTier.PERSISTENT
+    source: MemorySource = MemorySource.UNKNOWN
+    expires_at: str | None = None
 
 
 def utcnow_iso() -> str:
@@ -73,44 +68,66 @@ def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def expiry_iso(ttl_seconds: float | None, created_at: str) -> str | None:
+    """Return an expiry timestamp, validating TTL without hidden scheduling."""
+    if ttl_seconds is None:
+        return None
+    if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float)) or ttl_seconds < 0:
+        raise MemoryError("ttl_seconds must be a non-negative number or None")
+    return (datetime.fromisoformat(created_at) + timedelta(seconds=ttl_seconds)).isoformat()
+
+
+def is_expired(entry: MemoryEntry, now: datetime | None = None) -> bool:
+    """Whether *entry* is expired at *now* (malformed persisted expiry is expired)."""
+    if entry.expires_at is None:
+        return False
+    try:
+        expires_at = datetime.fromisoformat(entry.expires_at.replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return expires_at <= (now or datetime.now(timezone.utc))
+
+
+def matches_scope(entry: MemoryEntry, scope: dict[str, str] | None) -> bool:
+    """Return true when every requested scope key/value occurs in metadata."""
+    return scope is None or all(entry.metadata.get(key) == value for key, value in scope.items())
+
+
 class MemoryError(Exception):
     """Memory operations that cannot be completed (corrupt store, bad input)."""
 
 
 class MemoryProvider(ABC):
-    """Interface for long-term memory backends.
-
-    Implementations must be idempotent-safe: ``search`` on an empty store
-    returns an empty list, never raises. ``add`` returns the created entry
-    so callers can correlate it with audit/observability ids.
-    """
+    """Interface shared by keyword, JSON, and vector memory backends."""
 
     @abstractmethod
-    def add(self, text: str, metadata: dict[str, Any] | None = None) -> MemoryEntry:
-        """Store *text* and return the created :class:`MemoryEntry`."""
+    def add(self, text: str, metadata: dict[str, Any] | None = None, *, tier: MemoryTier = MemoryTier.PERSISTENT, source: MemorySource = MemorySource.UNKNOWN, ttl_seconds: float | None = None) -> MemoryEntry:
+        """Store text with lifecycle/provenance; ``UNKNOWN`` preserves old callers."""
 
     @abstractmethod
-    def search(self, query: str, limit: int = 5) -> list[MemoryEntry]:
-        """Return up to *limit* entries relevant to *query* (best first)."""
+    def search(self, query: str, limit: int = 5, *, tiers: set[MemoryTier] | None = None, scope: dict[str, str] | None = None, include_expired: bool = False) -> list[MemoryEntry]:
+        """Return relevant non-expired entries, optionally constrained by tier/scope."""
 
     @abstractmethod
-    def all(self) -> list[MemoryEntry]:
-        """Every stored entry, oldest first."""
+    def all(self, *, tiers: set[MemoryTier] | None = None, scope: dict[str, str] | None = None, include_expired: bool = False) -> list[MemoryEntry]:
+        """Return stored entries, oldest first, with optional lifecycle filters."""
 
     @abstractmethod
-    def clear(self) -> None:
-        """Drop all stored entries."""
+    def clear(self, scope: dict[str, str] | None = None, *, tiers: set[MemoryTier] | None = None) -> None:
+        """Drop all entries matching optional scope and tiers."""
+
+    def delete(self, entry_id: str) -> bool:
+        """Delete one entry by id; legacy providers may opt out explicitly."""
+        raise NotImplementedError("this memory provider does not support deletion by id")
+
+    def purge_expired(self) -> int:
+        """Delete expired entries; retained for backwards-compatible providers."""
+        return 0
 
 
 def relevance(query: str, entry_text: str) -> float:
-    """Keyword-overlap score in [0, 1]: |query ∩ entry| / |query|.
-
-    Deterministic, dependency-free, and good enough to rank short texts.
-    Embedding providers substitute cosine similarity under the same
-    contract (0 .. completely unrelated .. 1).
-    """
-    q = tokens(query)
-    if not q:
-        return 0.0
-    e = tokens(entry_text)
-    return len(q & e) / len(q)
+    """Keyword-overlap score in [0, 1]: |query ∩ entry| / |query|."""
+    query_tokens = tokens(query)
+    return len(query_tokens & tokens(entry_text)) / len(query_tokens) if query_tokens else 0.0
