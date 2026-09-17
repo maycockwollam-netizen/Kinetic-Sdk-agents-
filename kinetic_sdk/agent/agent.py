@@ -34,6 +34,7 @@ from typing import Any, Iterable
 from kinetic_sdk.agent.budget import RunBudget, RunBudgetExceeded
 from kinetic_sdk.agent.classifier import DefaultClassifier, TaskClassifier
 from kinetic_sdk.agent.modes import AgentMode
+from kinetic_sdk.agent.planning import AnswerVerifier, Plan, PlanStrategy
 from kinetic_sdk.agent.structured import (
     CORRECTION_TEMPLATE,
     DEFAULT_STRUCTURED_RETRIES,
@@ -133,6 +134,16 @@ class Agent:
             When it detects repetition, the run is cooperatively cancelled
             after emitting ``agent.stuck_detected``. ``None`` preserves the
             historical behavior with no detection.
+        planner: Optional strategy that creates an immutable plan once before
+            execution. Its rendered plan is supplied on every LLM call as a
+            system-prompt appendix; planner failures fail open and emit
+            ``agent.plan_failed``.
+        answer_verifier: Optional verifier for proposed final answers. A
+            rejected answer gets a correction turn with verifier feedback,
+            bounded by ``max_verification_retries``. Verifier exceptions fail
+            open so an observability extension cannot block a completed task.
+        max_verification_retries: Number of verifier-requested correction
+            rounds allowed per run; defaults to one and must be non-negative.
 
     Attributes:
         mode: Current :class:`AgentMode`. Set once by the classifier at the
@@ -178,6 +189,9 @@ class Agent:
         memory_recall_limit: int = 3,
         run_budget: RunBudget | None = None,
         stuck_detector: StuckDetector | None = None,
+        planner: PlanStrategy | None = None,
+        answer_verifier: AnswerVerifier | None = None,
+        max_verification_retries: int = 1,
     ) -> None:
         self.llm = llm
         #: Optional persistence backend. When set (and no explicit ``state``
@@ -292,6 +306,14 @@ class Agent:
         self.run_budget = run_budget
         #: Optional sliding-window repeated-tool-call guard. Disabled by default.
         self.stuck_detector = stuck_detector
+        if max_verification_retries < 0:
+            raise ValueError("max_verification_retries must be non-negative")
+        #: Optional explicit plan created before execution. Planning failures
+        #: fail open: the ordinary tool loop remains available and observable.
+        self.planner = planner
+        self.answer_verifier = answer_verifier
+        self.max_verification_retries = max_verification_retries
+        self.plan: Plan | None = None
 
         tool_list = list(tools or [])
         self._tools: dict[str, Tool] = {}
@@ -393,6 +415,7 @@ class Agent:
             ),
         )
         self._classify_and_route(user_message)
+        self.plan = self._create_plan(user_message)
 
         self._emit(
             "agent.run_started",
@@ -553,6 +576,7 @@ class Agent:
         retries_left = (
             DEFAULT_STRUCTURED_RETRIES if structured_retries is None else structured_retries
         )
+        verification_retries_left = self.max_verification_retries
         while iteration < self.max_iterations:
             self._pause_event.wait()
             if self._cancel_event.is_set():
@@ -608,6 +632,20 @@ class Agent:
                     decision = self._check_structured(output_schema, final_text, retries_left)
                     if decision == "retry":
                         retries_left -= 1
+                        iteration += 1
+                        continue
+                if self.answer_verifier is not None:
+                    accepted, feedback = self._verify_final_answer(final_text)
+                    if not accepted and verification_retries_left > 0:
+                        verification_retries_left -= 1
+                        self.state.add_user_message(
+                            "The proposed final answer was not verified. Correct it using "
+                            f"the available evidence. Verifier feedback: {feedback or 'No details provided.'}"
+                        )
+                        self._emit(
+                            "agent.verification_retry",
+                            {"feedback": feedback, "retries_left": verification_retries_left},
+                        )
                         iteration += 1
                         continue
                 # Persist only at replay-valid boundaries: an assistant text
@@ -752,6 +790,55 @@ class Agent:
             return "retry"
         self._emit("agent.structured_output_invalid", {"problems": problems})
         return "break"
+
+    def _create_plan(self, user_message: str | None) -> Plan | None:
+        """Create one opt-in plan, failing open if an extension is unhealthy."""
+        if self.planner is None:
+            return None
+        task = user_message or self._first_user_message() or "Continue the current task"
+        try:
+            plan = self.planner.create_plan(task, self.tool_schemas())
+        except Exception as exc:  # noqa: BLE001 - an optional planner must not kill work
+            self._emit(
+                "agent.plan_failed",
+                {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+            )
+            return None
+        if not isinstance(plan, Plan):
+            self._emit("agent.plan_failed", {"error": "planner returned a non-Plan value"})
+            return None
+        self._emit("agent.plan_created", {"goal": plan.goal, "steps": list(plan.steps)})
+        return plan
+
+    def _verify_final_answer(self, answer: str) -> tuple[bool, str]:
+        """Run the optional verifier, failing closed for an invalid verdict.
+
+        Verifier exceptions are surfaced as events but do not turn a healthy
+        completed run into a failure; extensions must not become an outage
+        multiplier.  A malformed verifier result is treated as a rejection,
+        because silently accepting it would undermine the verify contract.
+        """
+        assert self.answer_verifier is not None
+        task = self._first_user_message() or "Continue the current task"
+        try:
+            verdict = self.answer_verifier.verify(task, answer, self.plan)
+        except Exception as exc:  # noqa: BLE001 - verifier is optional
+            self._emit(
+                "agent.verification_failed",
+                {"reason": "exception", "error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+            )
+            return True, ""
+        if not hasattr(verdict, "accepted") or not isinstance(verdict.accepted, bool):
+            self._emit("agent.verification_failed", {"reason": "invalid_verdict"})
+            return False, "Verifier returned an invalid verdict."
+        feedback = getattr(verdict, "feedback", "")
+        if not isinstance(feedback, str):
+            feedback = ""
+        self._emit(
+            "agent.verification_passed" if verdict.accepted else "agent.verification_failed",
+            {"feedback": redact_secrets(feedback)},
+        )
+        return verdict.accepted, feedback
 
     def _recall_memory(self, query: str) -> None:
         """Inject relevant memories as a user message before the real task.
@@ -1024,8 +1111,7 @@ class Agent:
             )
             self.cancel()
 
-    @staticmethod
-    def _system_prompt_append(results: list[HookResult]) -> str | None:
+    def _system_prompt_append(self, results: list[HookResult]) -> str | None:
         """Collect request-local system-prompt additions from LLM hooks."""
         additions = [
             result.modified_context["system_prompt"]
@@ -1035,6 +1121,8 @@ class Agent:
             and isinstance(result.modified_context.get("system_prompt"), str)
             and result.modified_context["system_prompt"].strip()
         ]
+        if self.plan is not None:
+            additions.insert(0, self.plan.to_prompt())
         return "\n\n".join(additions) or None
 
     def _execute_one(self, call: ToolCall) -> ToolResult:
