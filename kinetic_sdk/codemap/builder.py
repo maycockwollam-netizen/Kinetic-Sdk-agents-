@@ -35,17 +35,44 @@ def _relative_base(module_name: str, level: int, module: str | None, is_package:
     return ".".join(base)
 
 
-def _imports(tree: ast.Module, module_name: str, is_package: bool) -> set[str]:
+def _canonical_module_name(name: str, known_modules: set[str], package_name: str | None) -> str:
+    """Return the map's module name for an import rooted at this package."""
+    if package_name and name.startswith(f"{package_name}."):
+        relative_name = name.removeprefix(f"{package_name}.")
+        if relative_name in known_modules:
+            return relative_name
+    return name
+
+
+def _imports(
+    tree: ast.Module,
+    module_name: str,
+    is_package: bool,
+    known_modules: set[str],
+    package_name: str | None,
+) -> set[str]:
     imports: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            imports.update(alias.name for alias in node.names)
+            imports.update(_canonical_module_name(alias.name, known_modules, package_name) for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             base = node.module or ""
             if node.level:
                 base = _relative_base(module_name, node.level, node.module, is_package)
+            base = _canonical_module_name(base, known_modules, package_name)
+            if not base:
+                imports.update(alias.name for alias in node.names)
+                continue
             for alias in node.names:
-                imports.add(f"{base}.{alias.name}" if base else alias.name)
+                if alias.name == "*":
+                    imports.add(base)
+                    continue
+                candidate = f"{base}.{alias.name}"
+                # ``from package import child`` imports a child module, while
+                # ``from module import Name`` imports an attribute defined by
+                # its base module. AST alone cannot distinguish them, so use
+                # the modules discovered for this codebase.
+                imports.add(candidate if candidate in known_modules else base)
     return imports
 
 
@@ -88,6 +115,8 @@ def build_codebase_map(root_path: str | os.PathLike[str], *, exclude: Iterable[s
                 absolute = Path(directory) / filename
                 relative = absolute.relative_to(root).as_posix()
                 files.append((absolute, relative, _module_name(relative)))
+    known_modules = {module_name for _, _, module_name in files}
+    package_name = root.name if (root / "__init__.py").is_file() else None
     nodes: list[ModuleNode] = []
     skipped: list[str] = []
     for absolute, relative, module_name in files:
@@ -98,5 +127,12 @@ def build_codebase_map(root_path: str | os.PathLike[str], *, exclude: Iterable[s
             nodes.append(ModuleNode(relative, module_name, (), ()))
             skipped.append(relative)
             continue
-        nodes.append(ModuleNode(relative, module_name, tuple(sorted(_imports(tree, module_name, is_package))), tuple(sorted(_defines(tree)))))
+        nodes.append(
+            ModuleNode(
+                relative,
+                module_name,
+                tuple(sorted(_imports(tree, module_name, is_package, known_modules, package_name))),
+                tuple(sorted(_defines(tree))),
+            )
+        )
     return CodebaseMap(str(root), tuple(sorted(nodes, key=lambda item: item.module_name)), tuple(sorted(skipped)))

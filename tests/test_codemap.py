@@ -27,6 +27,38 @@ def test_build_resolves_imports_and_collects_module_scope_defines(tmp_path):
     assert nodes["pkg.main"].defines == ("Conditional", "direct")
 
 
+def test_from_import_distinguishes_submodules_attributes_and_star_imports(tmp_path):
+    write(tmp_path, "pkg/__init__.py", "")
+    write(tmp_path, "pkg/sub.py", "class SomeClass: pass\n")
+    write(tmp_path, "pkg/using_submodule.py", "from pkg import sub\n")
+    write(tmp_path, "pkg/using_attribute.py", "from pkg.sub import SomeClass\n")
+    write(tmp_path, "pkg/using_star.py", "from pkg.sub import *\n")
+
+    result = build_codebase_map(tmp_path)
+    nodes = {node.module_name: node for node in result.modules}
+
+    assert nodes["pkg.using_submodule"].imports == ("pkg.sub",)
+    assert nodes["pkg.using_attribute"].imports == ("pkg.sub",)
+    assert nodes["pkg.using_star"].imports == ("pkg.sub",)
+    assert result.importers_of("pkg.sub") == (
+        "pkg.using_attribute",
+        "pkg.using_star",
+        "pkg.using_submodule",
+    )
+
+
+def test_package_root_normalizes_absolute_imports_to_map_module_names(tmp_path):
+    package = tmp_path / "app"
+    write(package, "__init__.py", "")
+    write(package, "core.py", "class Engine: pass\n")
+    write(package, "consumer.py", "from app.core import Engine\n")
+
+    result = build_codebase_map(package)
+
+    assert result.imports_of("consumer") == ("core",)
+    assert result.importers_of("core") == ("consumer",)
+
+
 def test_syntax_error_is_visible_but_other_modules_remain_mapped(tmp_path):
     write(tmp_path, "good.py", "def fine(): pass\n")
     write(tmp_path, "broken.py", "def nope(:\n")
