@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from kinetic_sdk.tool.base import Tool, ToolResult
+from kinetic_sdk.tool.base import Tool, ToolFailureCategory, ToolResult
 from tests._helpers import EchoTool
 
 
@@ -34,6 +34,13 @@ def test_tool_result_metadata_is_unique_per_instance():
     b = ToolResult()
     a.metadata["k"] = 1
     assert b.metadata == {}
+
+
+def test_tool_result_accepts_optional_failure_category():
+    result = ToolResult(
+        error="service unavailable", failure_category=ToolFailureCategory.TRANSIENT
+    )
+    assert result.failure_category is ToolFailureCategory.TRANSIENT
 
 
 def test_tool_is_abstract():

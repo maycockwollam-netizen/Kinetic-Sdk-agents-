@@ -2,6 +2,7 @@ from kinetic_sdk.agent import Agent, StuckDetector
 from kinetic_sdk.event import EventBus
 from kinetic_sdk.security import PermissivePolicy
 from kinetic_sdk.testing import MockLLMClient, MockTool, text_response, tool_response
+from kinetic_sdk.tool import ToolResult
 
 
 def test_repeated_tool_call_stops_run_and_emits_event():
@@ -20,3 +21,10 @@ def test_different_tool_arguments_do_not_trigger_detector():
     agent = Agent(llm, tools=[MockTool("echo", result="ok")], permission_policy=PermissivePolicy(), stuck_detector=StuckDetector(window_size=3, repeat_threshold=3))
     assert agent.run("go") == "done"
     assert len(llm.calls) == 4
+
+
+def test_changed_tool_result_does_not_trigger_detector():
+    detector = StuckDetector(window_size=3, repeat_threshold=3)
+    assert detector.check("echo", {"x": 1}, ToolResult(output="first")) is False
+    assert detector.check("echo", {"x": 1}, ToolResult(output="second")) is False
+    assert detector.check("echo", {"x": 1}, ToolResult(output="third")) is False

@@ -25,6 +25,7 @@ import json
 import logging
 import queue
 import threading
+import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -64,7 +65,7 @@ from kinetic_sdk.security.policy import (
     PermissionPolicy,
 )
 from kinetic_sdk.security.redact import redact_secrets
-from kinetic_sdk.tool.base import Tool, ToolResult
+from kinetic_sdk.tool.base import Tool, ToolFailureCategory, ToolResult
 from kinetic_sdk.tool.validation import validate_tool_input
 
 logger = logging.getLogger(__name__)
@@ -146,9 +147,17 @@ class Agent:
             asks the ``ON_PERMISSION_CHECK`` hooks instead of denying
             outright — see :meth:`_execute_one`.
         stuck_detector: Optional sliding-window guard for repeated tool calls.
-            When it detects repetition, the run is cooperatively cancelled
-            after emitting ``agent.stuck_detected``. ``None`` preserves the
-            historical behavior with no detection.
+            It stops a run early only when the same call has produced the
+            same result repeatedly, emitting ``agent.stuck_detected`` then
+            ``agent.error(reason="unproductive_loop")``. ``None`` preserves
+            the historical behavior with no detection.
+        max_transient_retries: Maximum automatic attempts after a tool
+            returns ``ToolResult(error=..., failure_category=TRANSIENT)``.
+            Other failure categories, and the default ``None``, are never
+            retried automatically.
+        transient_retry_backoff_seconds: Initial delay before a transient
+            retry; successive retries use exponential backoff. Set to zero
+            in deterministic tests when sleeping is undesirable.
         planner: Optional strategy that creates an immutable plan once before
             execution. Its rendered plan is supplied on every LLM call as a
             system-prompt appendix; planner failures fail open and emit
@@ -210,6 +219,8 @@ class Agent:
         planner: PlanStrategy | None = None,
         answer_verifier: AnswerVerifier | None = None,
         max_verification_retries: int = 1,
+        max_transient_retries: int = 2,
+        transient_retry_backoff_seconds: float = 0.25,
     ) -> None:
         self.llm = llm
         #: Optional persistence backend. When set (and no explicit ``state``
@@ -324,6 +335,14 @@ class Agent:
         self.run_budget = run_budget
         #: Optional sliding-window repeated-tool-call guard. Disabled by default.
         self.stuck_detector = stuck_detector
+        if max_transient_retries < 0:
+            raise ValueError("max_transient_retries must be non-negative")
+        if transient_retry_backoff_seconds < 0:
+            raise ValueError("transient_retry_backoff_seconds must be non-negative")
+        #: Retries for tools explicitly declaring a transient failure.
+        self.max_transient_retries = max_transient_retries
+        self.transient_retry_backoff_seconds = transient_retry_backoff_seconds
+        self._stop_reason: str | None = None
         if max_verification_retries < 0:
             raise ValueError("max_verification_retries must be non-negative")
         #: Optional explicit plan created before execution. Planning failures
@@ -425,6 +444,7 @@ class Agent:
             self.state.add_user_message(composed)
 
         self._cancel_event.clear()  # a new run starts un-cancelled
+        self._stop_reason = None
         self._run_id = str(uuid.uuid4())
         self._trigger_hooks(
             HookPoint.BEFORE_RUN,
@@ -681,6 +701,13 @@ class Agent:
 
             any_error = self._execute_tool_calls(response.tool_calls)
             self._persist_state()
+
+            if self._stop_reason is not None:
+                self._emit(
+                    "agent.error",
+                    {"reason": self._stop_reason, "iteration": iteration},
+                )
+                return final_text
 
             # A tool-call round is complete, so this is both replay-valid and
             # the earliest point at which injected user input can be acted on.
@@ -1102,7 +1129,7 @@ class Agent:
                     call.id, self._format_tool_output(result), is_error=result.is_error
                 )
                 continue
-            result = executed[i]
+            result = self._retry_transient_tool(call, self._tools[call.name], executed_args[i], executed[i])
             any_error = any_error or result.is_error
             self._finalize_call(call, executed_args[i], result)
             self._emit_tool_call_finished(call, result)
@@ -1144,14 +1171,14 @@ class Agent:
                 "output_preview": redact_secrets(self._preview(result.output)),
             },
         )
-        if self.stuck_detector is not None and self.stuck_detector.observe(
-            call.name, call.arguments
+        if self.stuck_detector is not None and self.stuck_detector.check(
+            call.name, call.arguments, result
         ):
             self._emit(
                 "agent.stuck_detected",
                 {"tool_name": call.name, "window": self.stuck_detector.window},
             )
-            self.cancel()
+            self._stop_reason = "unproductive_loop"
 
     def _system_prompt_append(self, results: list[HookResult]) -> str | None:
         """Collect request-local system-prompt additions from LLM hooks."""
@@ -1201,7 +1228,34 @@ class Agent:
         except Exception as exc:  # noqa: BLE001 - surface as tool error
             logger.exception("Tool %s raised", call.name)
             result = ToolResult(error=f"{type(exc).__name__}: {exc}")
+        result = self._retry_transient_tool(call, tool, arguments, result)
         self._finalize_call(call, arguments, result)
+        return result
+
+    def _retry_transient_tool(
+        self, call: ToolCall, tool: Tool, arguments: dict[str, Any], result: ToolResult
+    ) -> ToolResult:
+        """Retry explicitly transient tool failures with bounded exponential backoff."""
+        retries = 0
+        while (
+            result.is_error
+            and result.failure_category is ToolFailureCategory.TRANSIENT
+            and retries < self.max_transient_retries
+            and not self._cancel_event.is_set()
+        ):
+            retries += 1
+            delay = self.transient_retry_backoff_seconds * (2 ** (retries - 1))
+            self._emit(
+                "agent.tool_retry",
+                {"name": call.name, "id": call.id, "attempt": retries, "delay_seconds": delay},
+            )
+            if delay:
+                time.sleep(delay)
+            try:
+                result = self._run_tool(tool, arguments)
+            except Exception as exc:  # noqa: BLE001 - surface as tool error
+                logger.exception("Tool %s raised during transient retry", call.name)
+                result = ToolResult(error=f"{type(exc).__name__}: {exc}")
         return result
 
     def _prepare_call(
