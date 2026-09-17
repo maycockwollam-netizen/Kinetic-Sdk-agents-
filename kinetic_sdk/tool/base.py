@@ -11,7 +11,16 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
+
+
+class ToolFailureCategory(str, Enum):
+    """How the agent can safely recover from a failed tool invocation."""
+
+    RECOVERABLE_INPUT = "recoverable_input"
+    TRANSIENT = "transient"
+    PERMANENT = "permanent"
 
 
 @dataclass
@@ -26,11 +35,15 @@ class ToolResult:
             execution as failed and may retry or surface it to the user.
         metadata: Optional bag of extra information (timing, token counts,
             file paths touched, ...). Never used for control flow.
+        failure_category: Optional recovery hint for failed results. ``None``
+            preserves the historical behaviour: the result is returned to the
+            model without an automatic retry.
     """
 
     output: Any = None
     error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    failure_category: ToolFailureCategory | None = None
 
     @property
     def is_error(self) -> bool:
