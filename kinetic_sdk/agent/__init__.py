@@ -1,6 +1,6 @@
 """Agent package: tool-calling loop (sync + async), modes and classifiers."""
 
-from kinetic_sdk.agent.agent import Agent
+from kinetic_sdk.agent.agent import Agent, AnswerNotVerifiedError
 from kinetic_sdk.agent.async_agent import AsyncAgent
 from kinetic_sdk.agent.async_classifier import (
     AsyncDefaultClassifier,
@@ -28,6 +28,7 @@ from kinetic_sdk.agent.stuck_detector import StuckDetector
 
 __all__ = [
     "Agent",
+    "AnswerNotVerifiedError",
     "AgentSettings",
     "AgentMode",
     "AnswerVerifier",
