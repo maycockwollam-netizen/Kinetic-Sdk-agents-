@@ -15,7 +15,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from kinetic_sdk.memory.provider import MemoryEntry, MemoryProvider
+from kinetic_sdk.memory.provider import (
+    MemoryEntry,
+    MemoryProvider,
+    MemorySource,
+    MemoryTier,
+)
 from kinetic_sdk.tool.base import Tool, ToolResult
 
 
@@ -75,7 +80,7 @@ class MemoryTool(Tool):
         if action == "store":
             if not text.strip():
                 return ToolResult(error="'store' requires a non-empty 'text'")
-            entry = self.provider.add(text)
+            entry = self.provider.add(text, source=MemorySource.LLM_INFERENCE)
             return ToolResult(output={"id": entry.id, "stored": True})
         if action == "search":
             if not query.strip():
@@ -109,4 +114,81 @@ class MemoryTool(Tool):
             "text": entry.text,
             "metadata": entry.metadata,
             "created_at": entry.created_at,
+            "tier": entry.tier.value,
+            "source": entry.source.value,
+            "expires_at": entry.expires_at,
         }
+
+
+class MemoryInspectTool(Tool):
+    """Read memory entries with optional lifecycle and scope filters."""
+
+    name = "memory_inspect"
+    description = "Inspect stored memories by tier and metadata scope without changing them."
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "tiers": {"type": "array", "items": {"type": "string", "enum": [tier.value for tier in MemoryTier]}},
+            "scope": {"type": "object", "additionalProperties": {"type": "string"}},
+            "include_expired": {"type": "boolean"},
+        },
+    }
+
+    def __init__(self, provider: MemoryProvider) -> None:
+        self.provider = provider
+
+    def execute(self, tiers: list[str] | None = None, scope: dict[str, str] | None = None, include_expired: bool = False, **_: Any) -> ToolResult:  # type: ignore[override]
+        parsed_tiers = _parse_tiers(tiers)
+        if parsed_tiers is None and tiers is not None:
+            return ToolResult(error="tiers must contain valid memory tier names")
+        if scope is not None and not _valid_scope(scope):
+            return ToolResult(error="scope must be an object with string keys and values")
+        entries = self.provider.all(tiers=parsed_tiers, scope=scope, include_expired=include_expired)
+        return ToolResult(output={"memories": [MemoryTool._entry_dict(entry) for entry in entries], "count": len(entries)})
+
+
+class MemoryForgetTool(Tool):
+    """Delete one memory id or a scoped subset; never wipes all persistent data."""
+
+    name = "memory_forget"
+    description = "Forget one memory by id or a scoped subset. Whole persistent-memory deletion is refused."
+    #: Configure this on an AllowListPolicy for confirmation of scoped persistent deletion.
+    REQUIRE_CONFIRMATION_PATTERNS = ['"persistent"']
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "scope": {"type": "object", "additionalProperties": {"type": "string"}},
+            "tiers": {"type": "array", "items": {"type": "string", "enum": [tier.value for tier in MemoryTier]}},
+        },
+    }
+
+    def __init__(self, provider: MemoryProvider) -> None:
+        self.provider = provider
+
+    def execute(self, id: str | None = None, scope: dict[str, str] | None = None, tiers: list[str] | None = None, **_: Any) -> ToolResult:  # type: ignore[override]
+        if id:
+            return ToolResult(output={"deleted": self.provider.delete(id), "id": id})
+        parsed_tiers = _parse_tiers(tiers)
+        if parsed_tiers is None and tiers is not None:
+            return ToolResult(error="tiers must contain valid memory tier names")
+        if scope is None or not _valid_scope(scope):
+            return ToolResult(error="forgetting by scope requires a non-empty string-valued scope")
+        if parsed_tiers is None or MemoryTier.PERSISTENT in parsed_tiers:
+            return ToolResult(error="refusing to delete persistent memory by scope; delete a specific id instead")
+        before = len(self.provider.all(tiers=parsed_tiers, scope=scope, include_expired=True))
+        self.provider.clear(scope, tiers=parsed_tiers)
+        return ToolResult(output={"deleted": before, "scope": scope})
+
+
+def _parse_tiers(values: list[str] | None) -> set[MemoryTier] | None:
+    if values is None:
+        return None
+    try:
+        return {MemoryTier(value) for value in values}
+    except (TypeError, ValueError):
+        return None
+
+
+def _valid_scope(scope: dict[str, str]) -> bool:
+    return bool(scope) and all(isinstance(key, str) and isinstance(value, str) for key, value in scope.items())

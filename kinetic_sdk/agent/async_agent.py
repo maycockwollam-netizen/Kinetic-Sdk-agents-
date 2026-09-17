@@ -72,7 +72,7 @@ from kinetic_sdk.llm.client import (
     ToolCall,
 )
 from kinetic_sdk.llm.usage import UsageAccumulator
-from kinetic_sdk.memory.provider import MemoryProvider
+from kinetic_sdk.memory.provider import MemoryProvider, MemorySource, MemoryTier
 from kinetic_sdk.observability.logger import ObservabilityLogger
 from kinetic_sdk.replay.recorder import ReplayRecorder
 from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
@@ -375,6 +375,8 @@ class AsyncAgent:
                 ),
             )
             await self._emit("agent.error", {"reason": "exception", "error": str(exc)})
+            if self.memory is not None:
+                await self._clear_working_memory()
             raise
 
         await self._trigger_hooks(
@@ -386,6 +388,8 @@ class AsyncAgent:
         await self._emit("agent.run_finished", {"final_text": final_text, "mode": self.mode.value})
         if user_message is not None and self.memory is not None:
             await self._store_memory(user_message, final_text)
+        if self.memory is not None:
+            await self._clear_working_memory()
         return final_text
 
     def escalate(self) -> bool:
@@ -708,6 +712,8 @@ class AsyncAgent:
             entry = self.memory.add(
                 f"User: {user_message}\nAssistant: {final_text}",
                 metadata={"run_id": self._run_id},
+                tier=MemoryTier.EPISODIC,
+                source=MemorySource.LLM_INFERENCE,
             )
             await self._emit("agent.memory_stored", {"id": entry.id})
         except Exception as exc:  # noqa: BLE001 - fail-soft
@@ -716,6 +722,17 @@ class AsyncAgent:
                 "agent.memory_store_failed",
                 {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
             )
+
+    async def _clear_working_memory(self) -> None:
+        """Remove run-local memories after a run without changing its result."""
+        assert self.memory is not None
+        if self._run_id is None:
+            return
+        try:
+            self.memory.clear({"run_id": self._run_id}, tiers={MemoryTier.WORKING})
+        except Exception as exc:  # noqa: BLE001 - cleanup is fail-soft
+            logger.warning("Working memory cleanup failed: %s", exc)
+            await self._emit("agent.memory_cleanup_failed", {"error": redact_secrets(f"{type(exc).__name__}: {exc}")})
 
     async def _record_usage(self, response: LLMResponse) -> None:
         """Fold one LLM turn's usage into the agent total + emit a delta."""

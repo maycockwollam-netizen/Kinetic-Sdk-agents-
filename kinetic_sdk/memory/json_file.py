@@ -16,12 +16,17 @@ import os
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from kinetic_sdk.memory.inmemory import InMemoryMemory
-from kinetic_sdk.memory.provider import MemoryEntry, MemoryError
+from kinetic_sdk.memory.provider import (
+    MemoryEntry,
+    MemoryError,
+    MemorySource,
+    MemoryTier,
+)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class JsonFileMemory(InMemoryMemory):
@@ -38,19 +43,26 @@ class JsonFileMemory(InMemoryMemory):
         self.path = Path(path)
         self._load()
 
-    def add(
-        self, text: str, metadata: dict[str, Any] | None = None
-    ) -> MemoryEntry:
-        entry = super().add(text, metadata)
+    def add(self, text: str, metadata: dict[str, Any] | None = None, *, tier: MemoryTier = MemoryTier.PERSISTENT, source: MemorySource = MemorySource.UNKNOWN, ttl_seconds: float | None = None) -> MemoryEntry:
+        entry = super().add(text, metadata, tier=tier, source=source, ttl_seconds=ttl_seconds)
         self._persist()
         return entry
 
-    def clear(self) -> None:
-        super().clear()
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
+    def clear(self, scope: dict[str, str] | None = None, *, tiers: set[MemoryTier] | None = None) -> None:
+        super().clear(scope, tiers=tiers)
+        self._persist_or_remove_if_empty()
+
+    def delete(self, entry_id: str) -> bool:
+        deleted = super().delete(entry_id)
+        if deleted:
+            self._persist_or_remove_if_empty()
+        return deleted
+
+    def purge_expired(self) -> int:
+        purged = super().purge_expired()
+        if purged:
+            self._persist_or_remove_if_empty()
+        return purged
 
     # --- persistence ---------------------------------------------------
 
@@ -65,11 +77,11 @@ class JsonFileMemory(InMemoryMemory):
             raise MemoryError(
                 f"Cannot load memory from {self.path}: not a memory file"
             )
-        if payload.get("schema_version") != SCHEMA_VERSION:
+        schema_version = payload.get("schema_version")
+        if schema_version not in {1, SCHEMA_VERSION}:
             raise MemoryError(
                 f"Cannot load memory from {self.path}: schema version "
-                f"{payload.get('schema_version')!r} is not supported "
-                f"(expected {SCHEMA_VERSION})"
+                f"{schema_version!r} is not supported (expected 1 or {SCHEMA_VERSION})"
             )
         entries = payload["entries"]
         if not isinstance(entries, list):
@@ -77,10 +89,11 @@ class JsonFileMemory(InMemoryMemory):
         with self._lock:
             self._entries = [
                 MemoryEntry(
-                    id=str(item.get("id", "")),
-                    text=str(item.get("text", "")),
-                    metadata=dict(item.get("metadata") or {}),
-                    created_at=str(item.get("created_at", "")),
+                    id=str(item.get("id", "")), text=str(item.get("text", "")),
+                    metadata=dict(item.get("metadata") or {}), created_at=str(item.get("created_at", "")),
+                    tier=cast(MemoryTier, _enum_or_default(MemoryTier, item.get("tier"), MemoryTier.PERSISTENT)),
+                    source=cast(MemorySource, _enum_or_default(MemorySource, item.get("source"), MemorySource.UNKNOWN)),
+                    expires_at=_optional_string(item.get("expires_at")),
                 )
                 for item in entries
                 if isinstance(item, dict)
@@ -89,7 +102,7 @@ class JsonFileMemory(InMemoryMemory):
     def _persist(self) -> None:
         payload = {
             "schema_version": SCHEMA_VERSION,
-            "entries": [asdict(e) for e in self.all()],
+            "entries": [asdict(e) for e in self.all(include_expired=True)],
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(
@@ -105,3 +118,23 @@ class JsonFileMemory(InMemoryMemory):
             except OSError:
                 pass
             raise
+
+    def _persist_or_remove_if_empty(self) -> None:
+        if self.all(include_expired=True):
+            self._persist()
+            return
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _enum_or_default(enum_type: type[MemoryTier] | type[MemorySource], value: object, default: MemoryTier | MemorySource) -> MemoryTier | MemorySource:
+    try:
+        return enum_type(value) if isinstance(value, str) else default
+    except ValueError:
+        return default
+
+
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) else None
