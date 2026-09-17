@@ -75,6 +75,20 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class AnswerNotVerifiedError(RuntimeError):
+    """Raised when every allowed verification attempt rejects a final answer.
+
+    The candidate answer and verifier feedback remain available to callers so
+    they can present a recovery UI or request human review.  Neither value is
+    included in the exception message, which may be logged by host programs.
+    """
+
+    def __init__(self, answer: str, feedback: str) -> None:
+        super().__init__("The final answer was rejected by the answer verifier.")
+        self.answer = answer
+        self.feedback = feedback
+
+
 class Agent:
     """A tool-calling agent bound to one LLM and a set of tools.
 
@@ -90,6 +104,7 @@ class Agent:
               ``run(stream=True)``), ``agent.tool_call_started``,
               ``agent.tool_call_finished``, ``agent.run_finished``,
               ``agent.escalated``, ``agent.classified``, ``agent.error``,
+              ``agent.verification_exhausted``,
               ``agent.budget_exceeded``, ``context.compacted``,
               ``context.summarization_failed``, ``security.permission_denied``,
               ``agent.stuck_detected``, ``hooks.error`` (via the hook registry).
@@ -140,8 +155,11 @@ class Agent:
             ``agent.plan_failed``.
         answer_verifier: Optional verifier for proposed final answers. A
             rejected answer gets a correction turn with verifier feedback,
-            bounded by ``max_verification_retries``. Verifier exceptions fail
-            open so an observability extension cannot block a completed task.
+            bounded by ``max_verification_retries``. If the retries or the
+            iteration budget are exhausted while the answer remains rejected,
+            :class:`AnswerNotVerifiedError` is raised. Verifier exceptions
+            fail open so an observability extension cannot block a completed
+            task.
         max_verification_retries: Number of verifier-requested correction
             rounds allowed per run; defaults to one and must be non-negative.
 
@@ -577,6 +595,7 @@ class Agent:
             DEFAULT_STRUCTURED_RETRIES if structured_retries is None else structured_retries
         )
         verification_retries_left = self.max_verification_retries
+        rejected_answer: tuple[str, str] | None = None
         while iteration < self.max_iterations:
             self._pause_event.wait()
             if self._cancel_event.is_set():
@@ -636,7 +655,10 @@ class Agent:
                         continue
                 if self.answer_verifier is not None:
                     accepted, feedback = self._verify_final_answer(final_text)
-                    if not accepted and verification_retries_left > 0:
+                    if not accepted:
+                        rejected_answer = (final_text, feedback)
+                        if verification_retries_left <= 0:
+                            self._raise_answer_not_verified(final_text, feedback)
                         verification_retries_left -= 1
                         self.state.add_user_message(
                             "The proposed final answer was not verified. Correct it using "
@@ -646,8 +668,12 @@ class Agent:
                             "agent.verification_retry",
                             {"feedback": feedback, "retries_left": verification_retries_left},
                         )
+                        escalated = self._maybe_escalate(
+                            iteration, triggered_by_error=True, already_escalated=escalated
+                        )
                         iteration += 1
                         continue
+                    rejected_answer = None
                 # Persist only at replay-valid boundaries: an assistant text
                 # turn (no dangling tool_use) or right after tool results.
                 self._persist_state()
@@ -665,22 +691,38 @@ class Agent:
                 self._emit("agent.cancelled", {"iteration": iteration})
                 return final_text
 
-            if not escalated and self.mode is AgentMode.FLASH:
-                should_escalate = False
-                if iteration == 0 and any_error:
-                    should_escalate = True
-                elif (iteration + 1) >= self.FLASH_ESCALATION_THRESHOLD:
-                    should_escalate = True
-                if should_escalate:
-                    escalated = self.escalate()
+            escalated = self._maybe_escalate(
+                iteration, triggered_by_error=any_error, already_escalated=escalated
+            )
             iteration += 1
         else:
+            if rejected_answer is not None:
+                self._raise_answer_not_verified(*rejected_answer)
             logger.warning("Agent hit max_iterations=%d", self.max_iterations)
             self._emit(
                 "agent.error",
                 {"reason": "max_iterations", "iterations": self.max_iterations},
             )
         return final_text
+
+    def _maybe_escalate(
+        self, iteration: int, *, triggered_by_error: bool, already_escalated: bool
+    ) -> bool:
+        """Escalate FLASH after a failure signal or prolonged execution."""
+        if already_escalated or self.mode is not AgentMode.FLASH:
+            return already_escalated
+        should_escalate = (iteration == 0 and triggered_by_error) or (
+            (iteration + 1) >= self.FLASH_ESCALATION_THRESHOLD
+        )
+        return self.escalate() if should_escalate else False
+
+    def _raise_answer_not_verified(self, answer: str, feedback: str) -> None:
+        """Emit an explicit failure event and prevent a rejected answer escaping."""
+        self._emit(
+            "agent.verification_exhausted",
+            {"feedback": redact_secrets(feedback)},
+        )
+        raise AnswerNotVerifiedError(answer, feedback)
 
     def _drain_inbox(self) -> None:
         """Append queued cross-thread user messages and notify observers."""
