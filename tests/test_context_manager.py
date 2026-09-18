@@ -12,11 +12,13 @@ import pytest
 
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.context.manager import (
+    ContextBudget,
     ContextManager,
     LLMContextSummarizer,
     NoopContextManager,
     SimpleTruncateContextManager,
     SummarizingContextManager,
+    ToolOutputCompressor,
     estimate_tokens,
 )
 from kinetic_sdk.conversation.state import ConversationState
@@ -115,6 +117,33 @@ def test_should_compact_rejects_nonpositive_limit():
     manager = SimpleTruncateContextManager()
     with pytest.raises(ValueError):
         manager.should_compact(ConversationState(), model_context_limit=0)
+
+
+def test_section_budget_prioritizes_tool_output_before_history():
+    state = ConversationState()
+    state.messages = [_user("history " * 20), _tool_result("call", "log " * 300)]
+    manager = SimpleTruncateContextManager(
+        budget=ContextBudget(tool_output=0.10, history=0.80, system_prompt=0.0, memory=0.0, plan=0.0),
+        tool_output_compressor=ToolOutputCompressor(),
+    )
+
+    assert manager.should_compact(state, model_context_limit=500)
+    compacted = manager.compact(state)
+
+    assert compacted.messages[0] == state.messages[0]
+    block = compacted.messages[1]["content"][0]
+    assert block["_compaction"]["kind"] == "truncated"
+    assert manager.budget_report(state)["tool_output"] > manager.budget_report(state)["history"]
+
+
+def test_structure_aware_compressor_keeps_path_and_exit_code():
+    path_line = "/workspace/project/src/main.py:42: Error: failed assertion\n"
+    exit_line = "process exited with 17\n"
+    text = "noise\n" * 50 + path_line + "noise\n" * 50 + exit_line + "noise\n" * 50
+    compressed = ToolOutputCompressor().compress(text, 180)
+
+    assert path_line.strip() in compressed
+    assert exit_line.strip() in compressed
 
 
 # --- compact policy --------------------------------------------------------
@@ -826,3 +855,11 @@ def test_summarizing_manager_also_truncates():
     compacted = manager.compact(_big_result_conversation())
     assert any("cắt bớt" in str(m["content"]) for m in compacted.messages)
     assert any("tóm tắt" in str(m["content"]) for m in compacted.messages)
+
+
+def test_elided_message_has_truncation_provenance_metadata():
+    manager = SimpleTruncateContextManager(keep_last_tool_results=1)
+    compacted = manager.compact(_long_conversation(turns=4))
+
+    marker = next(message for message in compacted.messages if message.get("_compaction"))
+    assert marker["_compaction"] == {"kind": "truncated", "source_message_count": 6}

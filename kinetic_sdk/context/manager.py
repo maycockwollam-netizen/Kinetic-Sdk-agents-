@@ -10,18 +10,19 @@ preserved first:
 2. Everything in between is a candidate for compaction once the estimated
    token count crosses a safety threshold of the model's context limit.
 
-The only compaction technique shipped complete for now is simple truncation:
-the dropped middle span is replaced by a single placeholder message
-(e.g. ``"[12 tin nhắn trước đó đã được rút gọn]"``). LLM-based summarisation
-is implemented by :class:`SummarizingContextManager` when a summarizer is
-provided, with safe fallback to truncation on any summarizer failure.
+Compaction supports simple middle truncation and optional LLM summarisation,
+both with provenance metadata.  When requested, a per-section budget can
+prioritise oversized tool output, and a structure-aware compressor preserves
+useful paths and failures from verbose tool logs.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from kinetic_sdk.conversation.state import ConversationState
@@ -30,6 +31,74 @@ from kinetic_sdk.llm.client import LLMClient, Message
 from kinetic_sdk.security.redact import redact_secrets, redact_value
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ContextBudget:
+    """Fractions of a model context window reserved for each input section."""
+
+    system_prompt: float = 0.10
+    history: float = 0.45
+    tool_output: float = 0.25
+    memory: float = 0.10
+    plan: float = 0.05
+
+    def __post_init__(self) -> None:
+        values = (self.system_prompt, self.history, self.tool_output, self.memory, self.plan)
+        if any(value < 0 for value in values) or sum(values) > 1:
+            raise ValueError("context budget fractions must be non-negative and sum to <= 1")
+
+
+@dataclass
+class ToolOutputCompressor:
+    """Structure-aware compression which retains paths and failure evidence."""
+
+    preserve_patterns: list[re.Pattern[str]] = field(default_factory=lambda: [
+        re.compile(r"(?:[A-Za-z]:\\\\|/|(?:^|\s)[\w.-]+/)[\w./\\\\-]+"),
+        re.compile(r"exit(?:ed)?\s*(?:code|with)?\s*[:=]?\s*\d+|returncode\s*=\s*\d+", re.I),
+        re.compile(r"(?:Error|Exception|Traceback)[:\s]", re.I),
+    ])
+
+    def compress(self, text: str, limit: int) -> str:
+        """Return a bounded log while retaining salient complete lines."""
+        if len(text) <= limit:
+            return text
+        lines = text.splitlines(keepends=True)
+        important = [i for i, line in enumerate(lines) if any(p.search(line) for p in self.preserve_patterns)]
+        if not important:
+            return _head_tail(text, limit)
+        # Keep the matched line and the first/last line of every contiguous
+        # error region, so multiple tracebacks retain useful boundaries.
+        keep = set(important)
+        for index in important:
+            if any(p.search(lines[index]) for p in self.preserve_patterns[1:]):
+                start = index
+                while start > 0 and lines[start - 1].strip():
+                    start -= 1
+                end = index
+                while end + 1 < len(lines) and lines[end + 1].strip():
+                    end += 1
+                keep.update((start, end))
+        selected = [lines[i] for i in sorted(keep)]
+        marker = "[... verbose tool output omitted ...]\n"
+        result = marker + "".join(selected) + marker
+        if len(result) <= limit:
+            return result
+        # Lines are evidence: include as many whole prioritized lines as fit.
+        out = marker
+        for line in selected:
+            if len(out) + len(line) + len(marker) > limit:
+                continue
+            out += line
+        return out + marker if len(out) + len(marker) <= limit else out[:limit]
+
+
+def _head_tail(text: str, limit: int) -> str:
+    """Historical head/tail fallback used for unstructured tool output."""
+    head = limit * 2 // 3
+    tail = limit - head
+    omitted = len(text) - head - tail
+    return text[:head] + SimpleTruncateContextManager.TRUNCATION_MARKER.format(n=omitted) + text[-tail:]
 
 
 def estimate_tokens(text: str, chars_per_token: int = 4) -> int:
@@ -182,6 +251,37 @@ class ContextManager(ABC):
             total += self._count_tokens(_stringify_content(msg.get("content")))
         return total
 
+    def budget_report(self, state: ConversationState) -> dict[str, float]:
+        """Return each section's share of the current estimated context.
+
+        Memory and plan are read from optional state metadata, allowing hosts
+        that inject either section outside normal history to expose it without
+        changing the conversation wire format.
+        """
+        sections = self._budget_sections(state)
+        counts = {name: self._count_tokens(_stringify_content(value)) for name, value in sections.items()}
+        total = sum(counts.values())
+        return {name: count / total if total else 0.0 for name, count in counts.items()}
+
+    @staticmethod
+    def _budget_sections(state: ConversationState) -> dict[str, Any]:
+        """Split state into budget categories without altering its wire form."""
+        sections: dict[str, Any] = {"system_prompt": state.system_prompt or "", "history": "", "tool_output": "",
+                                    "memory": "", "plan": state.metadata.get("plan", "")}
+        for message in state.messages:
+            content = message.get("content")
+            if isinstance(content, str) and content.startswith("[Recalled memories]"):
+                sections["memory"] += content
+                continue
+            if isinstance(content, list):
+                tool_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+                other_blocks = [b for b in content if b not in tool_blocks]
+                sections["tool_output"] += _stringify_content(tool_blocks)
+                sections["history"] += _stringify_content(other_blocks)
+            else:
+                sections["history"] += _stringify_content(content)
+        return sections
+
 
 class NoopContextManager(ContextManager):
     """Never compacts. Useful as an opt-out or in tests."""
@@ -232,6 +332,8 @@ class SimpleTruncateContextManager(ContextManager):
         chars_per_token: int = 4,
         token_counter: Callable[[str], int] | None = None,
         max_tool_result_chars: int | None = None,
+        budget: ContextBudget | None = None,
+        tool_output_compressor: ToolOutputCompressor | None = None,
     ) -> None:
         if keep_last_tool_results < 0:
             raise ValueError("keep_last_tool_results must be >= 0")
@@ -250,6 +352,9 @@ class SimpleTruncateContextManager(ContextManager):
         #: conversation whose protected tail alone overflows the window
         #: (e.g. 5 huge build logs) - eliding messages cannot help there.
         self.max_tool_result_chars = max_tool_result_chars
+        self.budget = budget
+        self.tool_output_compressor = tool_output_compressor
+        self._budget_context_limit: int | None = None
 
     def _count_tokens(self, text: str) -> int:
         if self.token_counter is not None:
@@ -262,6 +367,11 @@ class SimpleTruncateContextManager(ContextManager):
         """True when the estimate crosses ``safety_threshold`` of the limit."""
         if model_context_limit <= 0:
             raise ValueError("model_context_limit must be positive")
+        self._budget_context_limit = model_context_limit
+        if self.budget is not None:
+            counts = self._budget_token_counts(state)
+            allocations = self._budget_allocations(model_context_limit)
+            return any(counts[name] >= allocations[name] for name in counts)
         budget = model_context_limit * self.safety_threshold
         return self.estimate_state_tokens(state) >= budget
 
@@ -282,6 +392,12 @@ class SimpleTruncateContextManager(ContextManager):
         call outright.
         """
         messages = state.messages
+        if self.budget is not None and self._budget_context_limit is not None:
+            # Tool logs are independent evidence and can be reduced without
+            # discarding conversational history.  Do this before any middle cut.
+            reduced = self._compact_tool_output_to_budget(list(messages))
+            if reduced != messages:
+                return self._copy(state, reduced)
         if len(messages) <= 2:
             return self._copy(state, self._truncate_oversized_tool_results(list(messages)))
 
@@ -311,6 +427,7 @@ class SimpleTruncateContextManager(ContextManager):
         return {
             "role": "user",
             "content": self.PLACEHOLDER_TEMPLATE.format(n=removed),
+            "_compaction": {"kind": "truncated", "source_message_count": removed},
         }
 
     # --- internals --------------------------------------------------------
@@ -402,13 +519,55 @@ class SimpleTruncateContextManager(ContextManager):
         assert limit is not None  # guarded by the caller
         if len(text) <= limit:
             return block
-        head = limit * 2 // 3
-        tail = limit - head
-        omitted = len(text) - head - tail
+        compressed = self.tool_output_compressor.compress(text, limit) if self.tool_output_compressor else _head_tail(text, limit)
         return {
             **block,
-            "content": text[:head] + self.TRUNCATION_MARKER.format(n=omitted) + text[-tail:],
+            "content": compressed,
+            "_compaction": {"kind": "truncated", "omitted_chars": len(text) - len(compressed)},
         }
+
+    def _budget_allocations(self, limit: int) -> dict[str, float]:
+        assert self.budget is not None
+        return {name: limit * getattr(self.budget, name) for name in ("system_prompt", "history", "tool_output", "memory", "plan")}
+
+    def _budget_token_counts(self, state: ConversationState) -> dict[str, int]:
+        return {
+            name: self._count_tokens(_stringify_content(value))
+            for name, value in self._budget_sections(state).items()
+        }
+
+    def _compact_tool_output_to_budget(self, messages: list[Message]) -> list[Message]:
+        assert self._budget_context_limit is not None and self.budget is not None
+        allowed_chars = max(100, int(self._budget_context_limit * self.budget.tool_output * self.chars_per_token))
+        blocks: list[tuple[int, int, str]] = []
+        total = 0
+        for mi, msg in enumerate(messages):
+            if isinstance(msg.get("content"), list):
+                for bi, block in enumerate(msg["content"]):
+                    if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), str):
+                        blocks.append((mi, bi, block["content"]))
+                        total += len(block["content"])
+        if total <= allowed_chars:
+            return messages
+        out = [dict(msg) for msg in messages]
+        # Reduce oldest output first, leaving newest evidence as intact as possible.
+        remaining = total
+        for mi, bi, text in blocks:
+            if remaining <= allowed_chars:
+                break
+            target = max(100, len(text) - (remaining - allowed_chars))
+            if target >= len(text):
+                continue
+            content = list(out[mi]["content"])
+            original = content[bi]
+            assert isinstance(original, dict)
+            saved_limit = self.max_tool_result_chars
+            self.max_tool_result_chars = target
+            content[bi] = self._truncate_block(original)
+            self.max_tool_result_chars = saved_limit
+            out[mi] = {**out[mi], "content": content}
+            remaining -= len(text) - len(content[bi]["content"])
+        return out
 
     @staticmethod
     def _copy(state: ConversationState, messages: list[Message]) -> ConversationState:
@@ -462,6 +621,8 @@ class SummarizingContextManager(SimpleTruncateContextManager):
         summary_max_tokens: int = 150,
         token_counter: Callable[[str], int] | None = None,
         max_tool_result_chars: int | None = None,
+        budget: ContextBudget | None = None,
+        tool_output_compressor: ToolOutputCompressor | None = None,
     ) -> None:
         super().__init__(
             keep_last_tool_results=keep_last_tool_results,
@@ -469,6 +630,8 @@ class SummarizingContextManager(SimpleTruncateContextManager):
             chars_per_token=chars_per_token,
             token_counter=token_counter,
             max_tool_result_chars=max_tool_result_chars,
+            budget=budget,
+            tool_output_compressor=tool_output_compressor,
         )
         if summarizer is not None and summarizer_client is not None:
             raise ValueError("pass either `summarizer` or `summarizer_client`, not both")
@@ -487,6 +650,7 @@ class SummarizingContextManager(SimpleTruncateContextManager):
         return {
             "role": "user",
             "content": self.SUMMARY_TEMPLATE.format(n=removed, summary=summary),
+            "_compaction": {"kind": "summary", "source_message_count": removed},
         }
 
     def _summarize(self, messages: list[Message]) -> str:
