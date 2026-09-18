@@ -240,7 +240,8 @@ def test_before_tool_call_hook_can_replace_tool_input():
         for b in m["content"]
         if isinstance(b, dict) and b.get("type") == "tool_result"
     ]
-    assert tool_results[0]["content"] == "rewritten"
+    assert "rewritten" in tool_results[0]["content"]
+    assert tool_results[0]["content"].startswith('<untrusted source="tool:echo">')
 
 
 def test_agent_wires_its_bus_into_registry_without_one():

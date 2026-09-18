@@ -43,6 +43,7 @@ from kinetic_sdk.agent.structured import (
     schema_instruction,
 )
 from kinetic_sdk.agent.stuck_detector import StuckDetector
+from kinetic_sdk.context.injection import InjectionGuard
 from kinetic_sdk.context.manager import (
     ContextManager,
     SimpleTruncateContextManager,
@@ -171,6 +172,9 @@ class Agent:
             task.
         max_verification_retries: Number of verifier-requested correction
             rounds allowed per run; defaults to one and must be non-negative.
+        injection_guard: Structural boundary wrapper for tool output. It is
+            enabled by default (including unknown custom tools) as a fail-safe;
+            pass ``False`` only for controlled internal output.
 
     Attributes:
         mode: Current :class:`AgentMode`. Set once by the classifier at the
@@ -221,6 +225,7 @@ class Agent:
         max_verification_retries: int = 1,
         max_transient_retries: int = 2,
         transient_retry_backoff_seconds: float = 0.25,
+        injection_guard: InjectionGuard | bool | None = None,
     ) -> None:
         self.llm = llm
         #: Optional persistence backend. When set (and no explicit ``state``
@@ -351,6 +356,11 @@ class Agent:
         self.answer_verifier = answer_verifier
         self.max_verification_retries = max_verification_retries
         self.plan: Plan | None = None
+        #: Tool output is untrusted by default.  ``False`` is the explicit
+        #: opt-out for controlled, purely internal tools.
+        self.injection_guard: InjectionGuard | None = (
+            None if injection_guard is False else injection_guard if isinstance(injection_guard, InjectionGuard) else InjectionGuard()
+        )
 
         tool_list = list(tools or [])
         self._tools: dict[str, Tool] = {}
@@ -454,6 +464,12 @@ class Agent:
         )
         self._classify_and_route(user_message)
         self.plan = self._create_plan(user_message)
+        if self.plan is not None:
+            # A plan is appended to the system prompt outside state.messages;
+            # retain it as budget-only metadata for ContextBudget reporting.
+            self.state.metadata["plan"] = self.plan.to_prompt()
+        else:
+            self.state.metadata.pop("plan", None)
 
         self._emit(
             "agent.run_started",
@@ -1060,20 +1076,14 @@ class Agent:
         for call in calls:
             if self._cancel_event.is_set():
                 result = ToolResult(error="skipped: run cancelled")
-                self.state.add_tool_result(
-                    call.id, self._format_tool_output(result), is_error=True
-                )
+                self.state.add_tool_result(call.id, self._tool_output_for_state(call, result), is_error=True)
                 any_error = True
                 continue
             self._emit("agent.tool_call_started", {"name": call.name, "id": call.id})
             result = self._execute_one(call)
             any_error = any_error or result.is_error
             self._emit_tool_call_finished(call, result)
-            self.state.add_tool_result(
-                call.id,
-                self._format_tool_output(result),
-                is_error=result.is_error,
-            )
+            self.state.add_tool_result(call.id, self._tool_output_for_state(call, result), is_error=result.is_error)
         return any_error
 
     def _execute_tool_calls_parallel(self, calls: list[ToolCall]) -> bool:
@@ -1142,17 +1152,13 @@ class Agent:
                 any_error = any_error or result.is_error
                 if i not in skipped:
                     self._emit_tool_call_finished(call, result)
-                self.state.add_tool_result(
-                    call.id, self._format_tool_output(result), is_error=result.is_error
-                )
+                self.state.add_tool_result(call.id, self._tool_output_for_state(call, result), is_error=result.is_error)
                 continue
             result = self._retry_transient_tool(call, self._tools[call.name], executed_args[i], executed[i])
             any_error = any_error or result.is_error
             self._finalize_call(call, executed_args[i], result)
             self._emit_tool_call_finished(call, result)
-            self.state.add_tool_result(
-                call.id, self._format_tool_output(result), is_error=result.is_error
-            )
+            self.state.add_tool_result(call.id, self._tool_output_for_state(call, result), is_error=result.is_error)
         return any_error
 
     def _get_executor(self) -> ThreadPoolExecutor:
@@ -1435,6 +1441,13 @@ class Agent:
             return json.dumps(payload) if not isinstance(payload, str) else payload
         except (TypeError, ValueError):
             return str(payload)
+
+    def _tool_output_for_state(self, call: ToolCall, result: ToolResult) -> str:
+        """Format and structurally fence external tool output before storage."""
+        output = self._format_tool_output(result)
+        if self.injection_guard is not None:
+            return self.injection_guard.wrap(output, f"tool:{call.name}")
+        return output
 
     @staticmethod
     def _preview(value: Any, limit: int = 200) -> str:
