@@ -23,6 +23,38 @@ class ToolFailureCategory(str, Enum):
     PERMANENT = "permanent"
 
 
+class ToolRiskLevel(str, Enum):
+    """The side-effect risk a tool voluntarily declares to the agent."""
+
+    READ_ONLY = "read_only"
+    WRITE = "write"
+    DESTRUCTIVE = "destructive"
+
+
+class ToolCapability(str, Enum):
+    """A resource domain a tool voluntarily declares it can access."""
+
+    LOCAL = "local"
+    NETWORK = "network"
+    FILESYSTEM = "filesystem"
+
+
+@dataclass(frozen=True)
+class ToolExecutionPolicy:
+    """Optional per-tool execution overrides.
+
+    ``None`` for ``timeout_seconds`` and ``max_transient_retries`` retains
+    the agent-wide historical settings. ``None`` for
+    ``circuit_breaker_threshold`` disables the circuit breaker for this tool,
+    preserving historical behaviour.
+    """
+
+    timeout_seconds: float | None = None
+    max_transient_retries: int | None = None
+    circuit_breaker_threshold: int | None = None
+    circuit_breaker_cooldown_seconds: float = 30.0
+
+
 @dataclass
 class ToolResult:
     """Structured result returned by a tool execution.
@@ -38,12 +70,19 @@ class ToolResult:
         failure_category: Optional recovery hint for failed results. ``None``
             preserves the historical behaviour: the result is returned to the
             model without an automatic retry.
+        duration_seconds: Wall-clock duration measured by the agent around
+            ``execute``. ``None`` means the result did not come from an agent
+            execution path (the historical shape).
+        artifacts: Optional paths or identifiers for supplementary data
+            produced by the tool. An empty list preserves historical behaviour.
     """
 
     output: Any = None
     error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     failure_category: ToolFailureCategory | None = None
+    duration_seconds: float | None = None
+    artifacts: list[str] = field(default_factory=list)
 
     @property
     def is_error(self) -> bool:
@@ -77,11 +116,27 @@ class Tool(ABC):
     #: Use ``type: object`` with ``properties`` for the fields you expect.
     parameters: dict[str, Any]
 
+    #: Optional side-effect declaration. ``None`` keeps historical fail-safe
+    #: behaviour: consumers that need a risk decision must treat the tool as
+    #: write-capable.
+    risk_level: ToolRiskLevel | None = None
+
+    #: Optional resource-domain declarations. An empty set keeps historical
+    #: behaviour and makes no assertion about the tool's capabilities.
+    capabilities: frozenset[ToolCapability] = frozenset()
+
+    #: Optional per-tool execution policy. ``None`` uses the agent-wide
+    #: timeout/retry settings and has no circuit breaker, as before.
+    execution_policy: ToolExecutionPolicy | None = None
+
     @abstractmethod
-    def execute(self, **params: Any) -> ToolResult:
+    def execute(self, *, idempotency_key: str | None = None, **params: Any) -> ToolResult:
         """Run the tool with validated parameters and return a result.
 
         Args:
+            idempotency_key: Optional stable key supplied by the agent for a
+                write/destructive call that may be retried. ``None`` preserves
+                historical invocation behaviour; tools may ignore this value.
             **params: Keyword arguments matching :attr:`parameters`. The
                 agent loop is responsible for extracting these from the
                 model's tool call payload before invoking this method.

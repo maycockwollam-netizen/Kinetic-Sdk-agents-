@@ -21,6 +21,8 @@ to each step without coupling to the agent internals.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import logging
 import queue
@@ -66,7 +68,7 @@ from kinetic_sdk.security.policy import (
     PermissionPolicy,
 )
 from kinetic_sdk.security.redact import redact_secrets
-from kinetic_sdk.tool.base import Tool, ToolFailureCategory, ToolResult
+from kinetic_sdk.tool.base import Tool, ToolFailureCategory, ToolResult, ToolRiskLevel
 from kinetic_sdk.tool.validation import validate_tool_input
 
 logger = logging.getLogger(__name__)
@@ -347,6 +349,9 @@ class Agent:
         #: Retries for tools explicitly declaring a transient failure.
         self.max_transient_retries = max_transient_retries
         self.transient_retry_backoff_seconds = transient_retry_backoff_seconds
+        #: Per-tool consecutive-failure counts and open-circuit deadlines.
+        #: This state intentionally lives only for this Agent instance.
+        self._circuit_breakers: dict[str, tuple[int, float | None]] = {}
         self._stop_reason: str | None = None
         if max_verification_retries < 0:
             raise ValueError("max_verification_retries must be non-negative")
@@ -1124,23 +1129,25 @@ class Agent:
                 future = self._submit_timed_tool(executor, tool, arguments)
                 if future is None:
                     executed[i] = ToolResult(error="tool execution capacity exhausted")
+                    executed_args[i] = arguments
                 else:
-                    futures[future] = (i, call, arguments)
-            for future, (i, call, arguments) in futures.items():
+                    futures[future] = (i, call, tool, arguments, time.perf_counter())
+            for future, (i, call, tool, arguments, started) in futures.items():
                 executed_args[i] = arguments
                 try:
                     executed[i] = (
-                        future.result(timeout=self.tool_timeout)
-                        if self.tool_timeout is not None
+                        future.result(timeout=self._tool_timeout(tool))
+                        if self._tool_timeout(tool) is not None
                         else future.result()
                     )
                 except FutureTimeoutError:
                     future.cancel()
                     executed[i] = ToolResult(
                         error=(
-                            f"Tool {call.name!r} timed out after {self.tool_timeout}s "
+                            f"Tool {call.name!r} timed out after {self._tool_timeout(tool)}s "
                             "(the call may still be running in the background)"
-                        )
+                        ),
+                        duration_seconds=time.perf_counter() - started,
                     )
                 except Exception as exc:  # noqa: BLE001 - surface as tool error
                     logger.exception("Tool %s raised", call.name)
@@ -1180,7 +1187,7 @@ class Agent:
         """
         if not self._tool_slots.acquire(blocking=False):
             return None
-        future = executor.submit(tool.execute, **arguments)
+        future = executor.submit(self._invoke_tool, tool, arguments)
         future.add_done_callback(lambda _future: self._tool_slots.release())
         return future
 
@@ -1192,6 +1199,8 @@ class Agent:
                 "id": call.id,
                 "is_error": result.is_error,
                 "output_preview": redact_secrets(self._preview(result.output)),
+                "duration_seconds": result.duration_seconds,
+                "artifacts": result.artifacts,
             },
         )
         if self.stuck_detector is not None and self.stuck_detector.check(
@@ -1246,11 +1255,7 @@ class Agent:
         if early is not None:
             return early
         assert tool is not None  # guaranteed by _prepare_call's contract
-        try:
-            result = self._run_tool(tool, arguments)
-        except Exception as exc:  # noqa: BLE001 - surface as tool error
-            logger.exception("Tool %s raised", call.name)
-            result = ToolResult(error=f"{type(exc).__name__}: {exc}")
+        result = self._run_tool(tool, arguments)
         result = self._retry_transient_tool(call, tool, arguments, result)
         self._finalize_call(call, arguments, result)
         return result
@@ -1263,7 +1268,7 @@ class Agent:
         while (
             result.is_error
             and result.failure_category is ToolFailureCategory.TRANSIENT
-            and retries < self.max_transient_retries
+            and retries < self._max_transient_retries(tool)
             and not self._cancel_event.is_set()
         ):
             retries += 1
@@ -1274,11 +1279,7 @@ class Agent:
             )
             if delay:
                 time.sleep(delay)
-            try:
-                result = self._run_tool(tool, arguments)
-            except Exception as exc:  # noqa: BLE001 - surface as tool error
-                logger.exception("Tool %s raised during transient retry", call.name)
-                result = ToolResult(error=f"{type(exc).__name__}: {exc}")
+            result = self._run_tool(tool, arguments)
         return result
 
     def _prepare_call(
@@ -1332,6 +1333,11 @@ class Agent:
         if tool is None:
             logger.error("Unknown tool requested: %s", call.name)
             return None, arguments, ToolResult(error=f"Unknown tool: {call.name}")
+        if self._circuit_is_open(tool):
+            return None, arguments, ToolResult(
+                error=f"Circuit breaker open for tool {call.name!r}",
+                failure_category=ToolFailureCategory.PERMANENT,
+            )
         if self.validate_tool_inputs:
             problems = validate_tool_input(tool.parameters, arguments)
             if problems:
@@ -1345,6 +1351,7 @@ class Agent:
     ) -> None:
         """Audit + AFTER_TOOL_CALL hooks for an EXECUTED call (main thread)."""
         self.audit_logger.log_tool_result(call.name, result, _utcnow())
+        self._record_circuit_result(call.name, self._tools[call.name], result)
         self._trigger_hooks(
             HookPoint.AFTER_TOOL_CALL,
             HookContext(
@@ -1367,21 +1374,98 @@ class Agent:
         not the tool process. Tools wrapping subprocesses/network should
         enforce their own real timeout too (``GitTool`` already does).
         """
-        if self.tool_timeout is None:
-            return tool.execute(**arguments)
+        timeout = self._tool_timeout(tool)
+        if timeout is None:
+            return self._invoke_tool(tool, arguments)
         future = self._submit_timed_tool(self._get_executor(), tool, arguments)
         if future is None:
             return ToolResult(error="tool execution capacity exhausted")
+        started = time.perf_counter()
         try:
-            return future.result(timeout=self.tool_timeout)
+            return future.result(timeout=timeout)
         except FutureTimeoutError:
             future.cancel()
             return ToolResult(
                 error=(
-                    f"Tool {tool.name!r} timed out after {self.tool_timeout}s "
+                    f"Tool {tool.name!r} timed out after {timeout}s "
                     "(the call may still be running in the background; capacity is bounded)"
-                )
+                ),
+                duration_seconds=time.perf_counter() - started,
             )
+
+    def _invoke_tool(self, tool: Tool, arguments: dict[str, Any]) -> ToolResult:
+        """Invoke a tool once, normalising duration and unexpected exceptions."""
+        started = time.perf_counter()
+        try:
+            kwargs = dict(arguments)
+            if self._accepts_idempotency_key(tool) and self._needs_idempotency_key(tool):
+                kwargs["idempotency_key"] = self._idempotency_key(tool, arguments)
+            result = tool.execute(**kwargs)
+            if not isinstance(result, ToolResult):
+                result = ToolResult(output=result)
+        except Exception as exc:  # noqa: BLE001 - surface as tool error
+            logger.exception("Tool %s raised", tool.name)
+            result = ToolResult(error=f"{type(exc).__name__}: {exc}")
+        result.duration_seconds = time.perf_counter() - started
+        return result
+
+    def _tool_timeout(self, tool: Tool) -> float | None:
+        policy = tool.execution_policy
+        return policy.timeout_seconds if policy and policy.timeout_seconds is not None else self.tool_timeout
+
+    def _max_transient_retries(self, tool: Tool) -> int:
+        policy = tool.execution_policy
+        return (
+            policy.max_transient_retries
+            if policy and policy.max_transient_retries is not None
+            else self.max_transient_retries
+        )
+
+    def _circuit_is_open(self, tool: Tool) -> bool:
+        policy = tool.execution_policy
+        if policy is None or policy.circuit_breaker_threshold is None:
+            return False
+        failures, open_until = self._circuit_breakers.get(tool.name, (0, None))
+        if open_until is None:
+            return False
+        if time.monotonic() < open_until:
+            return True
+        self._circuit_breakers[tool.name] = (0, None)
+        return False
+
+    def _record_circuit_result(self, name: str, tool: Tool, result: ToolResult) -> None:
+        policy = tool.execution_policy
+        threshold = policy.circuit_breaker_threshold if policy else None
+        if policy is None or threshold is None:
+            return
+        if not result.is_error:
+            self._circuit_breakers[name] = (0, None)
+            return
+        failures, _ = self._circuit_breakers.get(name, (0, None))
+        failures += 1
+        open_until = (
+            time.monotonic() + policy.circuit_breaker_cooldown_seconds
+            if failures >= threshold
+            else None
+        )
+        self._circuit_breakers[name] = (failures, open_until)
+
+    @staticmethod
+    def _accepts_idempotency_key(tool: Tool) -> bool:
+        return "idempotency_key" in inspect.signature(tool.execute).parameters
+
+    @staticmethod
+    def _needs_idempotency_key(tool: Tool) -> bool:
+        return tool.risk_level in {ToolRiskLevel.WRITE, ToolRiskLevel.DESTRUCTIVE}
+
+    def _idempotency_key(self, tool: Tool, arguments: dict[str, Any]) -> str:
+        payload = json.dumps(
+            {"tool": tool.name, "arguments": arguments, "run_id": self._run_id},
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _trigger_hooks(self, point: HookPoint, context: HookContext) -> list[HookResult]:
         """Run the hooks registered for *point*, or nothing when unconfigured."""
