@@ -4,6 +4,7 @@ from kinetic_sdk.replay.checkpoint import (
     CheckpointError,
     CheckpointManager,
     PendingConfirmationError,
+    resume_async_from_confirmation,
     resume_from_confirmation,
 )
 from kinetic_sdk.replay.debugger import ReplayDebugger
@@ -53,4 +54,5 @@ __all__ = [
     "PendingConfirmationError",
     "TimelineEntry",
     "resume_from_confirmation",
+    "resume_async_from_confirmation",
 ]

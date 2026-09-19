@@ -3,6 +3,8 @@
 :class:`AsyncAgent` is the async twin of
 :class:`~kinetic_sdk.agent.agent.Agent`. It implements the SAME feature set
 with the SAME semantics — FLASH/MAX routing and escalation, sticky MAX,
+planning and answer verification, stuck-loop detection, retry/circuit-breaker
+tool recovery, injection fencing, checkpointed confirmation, inbox/pause,
 context compaction, hooks, permission policy + confirmation, audit,
 observability, schema validation, cancellation, state persistence and
 streaming — so behaviour is identical from the outside; only the mechanics
@@ -35,12 +37,16 @@ concurrent task; independent agents run concurrently just fine.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, Literal
 
+from kinetic_sdk.agent.agent import AnswerNotVerifiedError
 from kinetic_sdk.agent.async_classifier import (
     AsyncDefaultClassifier,
     AsyncTaskClassifier,
@@ -48,12 +54,15 @@ from kinetic_sdk.agent.async_classifier import (
 from kinetic_sdk.agent.budget import RunBudget, RunBudgetExceeded
 from kinetic_sdk.agent.classifier import TaskClassifier
 from kinetic_sdk.agent.modes import AgentMode
+from kinetic_sdk.agent.planning import AnswerVerifier, Plan, PlanStrategy
 from kinetic_sdk.agent.structured import (
     CORRECTION_TEMPLATE,
     DEFAULT_STRUCTURED_RETRIES,
     check_final_answer,
     schema_instruction,
 )
+from kinetic_sdk.agent.stuck_detector import StuckDetector
+from kinetic_sdk.context.injection import InjectionGuard
 from kinetic_sdk.context.manager import (
     ContextManager,
     SimpleTruncateContextManager,
@@ -74,6 +83,7 @@ from kinetic_sdk.llm.client import (
 from kinetic_sdk.llm.usage import UsageAccumulator
 from kinetic_sdk.memory.provider import MemoryProvider, MemorySource, MemoryTier
 from kinetic_sdk.observability.logger import ObservabilityLogger
+from kinetic_sdk.replay.checkpoint import PendingConfirmationError
 from kinetic_sdk.replay.recorder import ReplayRecorder
 from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
 from kinetic_sdk.security.policy import (
@@ -82,10 +92,13 @@ from kinetic_sdk.security.policy import (
     PermissionPolicy,
 )
 from kinetic_sdk.security.redact import redact_secrets
-from kinetic_sdk.tool.base import Tool, ToolResult
+from kinetic_sdk.tool.base import Tool, ToolFailureCategory, ToolResult, ToolRiskLevel
 from kinetic_sdk.tool.validation import validate_tool_input
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from kinetic_sdk.replay.checkpoint import CheckpointManager
 
 
 def _utcnow() -> datetime:
@@ -167,6 +180,14 @@ class AsyncAgent:
         memory: MemoryProvider | None = None,
         memory_recall_limit: int = 3,
         run_budget: RunBudget | None = None,
+        checkpoint_manager: CheckpointManager | None = None,
+        stuck_detector: StuckDetector | None = None,
+        planner: PlanStrategy | None = None,
+        answer_verifier: AnswerVerifier | None = None,
+        max_verification_retries: int = 1,
+        max_transient_retries: int = 2,
+        transient_retry_backoff_seconds: float = 0.25,
+        injection_guard: InjectionGuard | bool | None = None,
     ) -> None:
         if isinstance(llm, AsyncLLMClient):
             self.llm: AsyncLLMClient = llm
@@ -196,6 +217,7 @@ class AsyncAgent:
         self.replay_recorder = replay_recorder
         if replay_recorder is not None:
             replay_recorder.attach(self.event_bus)
+        self.checkpoint_manager = checkpoint_manager
         if classifier is None:
             self.classifier: AsyncTaskClassifier = AsyncDefaultClassifier()
         elif isinstance(classifier, AsyncTaskClassifier):
@@ -253,9 +275,15 @@ class AsyncAgent:
         #: Cooperative cancellation flag, set via :meth:`cancel` from any
         #: task. Checked between iterations and between tool calls.
         self._cancel_event = asyncio.Event()
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()
+        self._inbox: asyncio.Queue[str] = asyncio.Queue()
         #: UUID of the in-flight (or most recent) :meth:`run`; ``None``
         #: before the first run. Every event emitted during a run carries it.
         self._run_id: str | None = None
+        self._resuming_checkpoint = False
+        self._pending_confirmation: tuple[ToolCall, dict[str, Any], PermissionDecision] | None = None
+        self._pending_remaining_calls: list[ToolCall] = []
         # User override of the iteration cap. ``None`` => let routing pick
         # per mode. Stored separately so an escalation can re-derive the cap.
         self._max_iterations_override: int | None = max_iterations
@@ -280,6 +308,24 @@ class AsyncAgent:
         #: gracefully with ``agent.budget_exceeded`` and an explanatory
         #: final text. ``None`` (default) = unlimited.
         self.run_budget = run_budget
+        self.stuck_detector = stuck_detector
+        if max_transient_retries < 0:
+            raise ValueError("max_transient_retries must be non-negative")
+        if transient_retry_backoff_seconds < 0:
+            raise ValueError("transient_retry_backoff_seconds must be non-negative")
+        self.max_transient_retries = max_transient_retries
+        self.transient_retry_backoff_seconds = transient_retry_backoff_seconds
+        self._circuit_breakers: dict[str, tuple[int, float | None]] = {}
+        self._stop_reason: str | None = None
+        if max_verification_retries < 0:
+            raise ValueError("max_verification_retries must be non-negative")
+        self.planner = planner
+        self.answer_verifier = answer_verifier
+        self.max_verification_retries = max_verification_retries
+        self.plan: Plan | None = None
+        self.injection_guard: InjectionGuard | None = (
+            None if injection_guard is False else injection_guard if isinstance(injection_guard, InjectionGuard) else InjectionGuard()
+        )
 
         tool_list = list(tools or [])
         self._tools: dict[str, Tool] = {}
@@ -334,7 +380,10 @@ class AsyncAgent:
             published; on :meth:`cancel` the best text so far is returned
             and ``agent.cancelled`` is published.
         """
+        resuming = self._resuming_checkpoint and user_message is None
         self.structured_output = None
+        if resuming and self._pending_confirmation is not None:
+            raise RuntimeError("Resolve the pending confirmation before continuing this checkpoint")
         if user_message is not None and self.memory is not None:
             await self._recall_memory(user_message)
         composed = user_message
@@ -343,20 +392,26 @@ class AsyncAgent:
         if composed is not None:
             self.state.add_user_message(composed)
 
-        self._cancel_event.clear()  # a new run starts un-cancelled
-        self._run_id = str(uuid.uuid4())
-        await self._trigger_hooks(
-            HookPoint.BEFORE_RUN,
-            HookContext(
-                point=HookPoint.BEFORE_RUN, run_id=self._run_id, user_message=user_message
-            ),
-        )
-        await self._classify_and_route(user_message)
-
-        await self._emit(
-            "agent.run_started",
-            {"mode": self.mode.value, "tools": list(self._tools), "max_iterations": self.max_iterations},
-        )
+        if not resuming:
+            self._cancel_event.clear()
+            self._stop_reason = None
+            self._run_id = str(uuid.uuid4())
+            await self._trigger_hooks(
+                HookPoint.BEFORE_RUN,
+                HookContext(
+                    point=HookPoint.BEFORE_RUN, run_id=self._run_id, user_message=user_message
+                ),
+            )
+            await self._classify_and_route(user_message)
+            self.plan = await self._create_plan(user_message)
+            if self.plan is not None:
+                self.state.metadata["plan"] = self.plan.to_prompt()
+            else:
+                self.state.metadata.pop("plan", None)
+            await self._emit(
+                "agent.run_started",
+                {"mode": self.mode.value, "tools": list(self._tools), "max_iterations": self.max_iterations},
+            )
 
         final_text = ""
         try:
@@ -365,6 +420,8 @@ class AsyncAgent:
                 output_schema=output_schema,
                 structured_retries=structured_retries,
             )
+        except PendingConfirmationError:
+            raise
         except Exception as exc:
             await self._trigger_hooks(
                 HookPoint.ON_ERROR,
@@ -379,6 +436,7 @@ class AsyncAgent:
                 await self._clear_working_memory()
             raise
 
+        self._resuming_checkpoint = False
         await self._trigger_hooks(
             HookPoint.AFTER_RUN,
             HookContext(
@@ -425,6 +483,21 @@ class AsyncAgent:
         cooperative cancellation cannot preempt running work.
         """
         self._cancel_event.set()
+        self._pause_event.set()
+
+    def pause(self) -> None:
+        """Pause an in-flight run at its next replay-valid boundary."""
+        self._pause_event.clear()
+
+    def resume(self) -> None:
+        """Resume a run paused by :meth:`pause`."""
+        self._pause_event.set()
+
+    def send_message_while_running(self, text: str) -> None:
+        """Queue a non-empty user message for the next tool-call boundary."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text must be a non-empty string")
+        self._inbox.put_nowait(text)
 
     @property
     def cancelled(self) -> bool:
@@ -497,19 +570,23 @@ class AsyncAgent:
         retries_left = (
             DEFAULT_STRUCTURED_RETRIES if structured_retries is None else structured_retries
         )
+        verification_retries_left = self.max_verification_retries
+        rejected_answer: tuple[str, str] | None = None
         while iteration < self.max_iterations:
+            await self._pause_event.wait()
             if self._cancel_event.is_set():
                 logger.info("Agent run cancelled at iteration %d", iteration)
                 await self._emit("agent.cancelled", {"iteration": iteration})
                 return final_text
             await self._emit("agent.turn_started", {"iteration": iteration, "mode": self.mode.value})
             await self._maybe_compact_context()
-            await self._trigger_hooks(
+            hook_results = await self._trigger_hooks(
                 HookPoint.BEFORE_LLM_CALL,
                 HookContext(
                     point=HookPoint.BEFORE_LLM_CALL,
                     run_id=self._run_id,
                     iteration=iteration,
+                    user_message=self._first_user_message(),
                 ),
             )
             # Re-check after hooks: a hook is a common place for UI-driven
@@ -527,7 +604,9 @@ class AsyncAgent:
                         "agent.budget_exceeded", self.run_budget.details()
                     )
                     return f"Run stopped: budget exceeded ({exc})."
-            response = await self._call_llm(stream=stream)
+            response = await self._call_llm(
+                stream=stream, system_append=self._system_prompt_append(hook_results)
+            )
             await self._trigger_hooks(
                 HookPoint.AFTER_LLM_CALL,
                 HookContext(
@@ -538,6 +617,10 @@ class AsyncAgent:
                 ),
             )
             self.state.add_assistant(self._assistant_content(response))
+            if response.reasoning_text:
+                await self._emit(
+                    "agent.reasoning_trace", {"text": response.reasoning_text, "iteration": iteration}
+                )
             await self._emit(
                 "agent.llm_response",
                 {"tool_calls": len(response.tool_calls), "stop_reason": response.stop_reason},
@@ -553,6 +636,27 @@ class AsyncAgent:
                         retries_left -= 1
                         iteration += 1
                         continue
+                if self.answer_verifier is not None:
+                    accepted, feedback = await self._verify_final_answer(final_text)
+                    if not accepted:
+                        rejected_answer = (final_text, feedback)
+                        if verification_retries_left <= 0:
+                            await self._raise_answer_not_verified(final_text, feedback)
+                        verification_retries_left -= 1
+                        self.state.add_user_message(
+                            "The proposed final answer was not verified. Correct it using "
+                            f"the available evidence. Verifier feedback: {feedback or 'No details provided.'}"
+                        )
+                        await self._emit(
+                            "agent.verification_retry",
+                            {"feedback": feedback, "retries_left": verification_retries_left},
+                        )
+                        escalated = await self._maybe_escalate(
+                            iteration, triggered_by_error=True, already_escalated=escalated
+                        )
+                        iteration += 1
+                        continue
+                    rejected_answer = None
                 # Persist only at replay-valid boundaries: an assistant text
                 # turn (no dangling tool_use) or right after tool results.
                 await self._persist_state()
@@ -561,28 +665,55 @@ class AsyncAgent:
             any_error = await self._execute_tool_calls(response.tool_calls)
             await self._persist_state()
 
-            if not escalated and self.mode is AgentMode.FLASH:
-                should_escalate = False
-                if iteration == 0 and any_error:
-                    should_escalate = True
-                elif (iteration + 1) >= self.FLASH_ESCALATION_THRESHOLD:
-                    should_escalate = True
-                if should_escalate:
-                    previous = self.mode
-                    escalated = self.escalate()
-                    if escalated:
-                        await self._emit(
-                            "agent.escalated",
-                            {"from": previous.value, "to": self.mode.value},
-                        )
+            if self._stop_reason is not None:
+                await self._emit("agent.error", {"reason": self._stop_reason, "iteration": iteration})
+                return final_text
+            await self._drain_inbox()
+            await self._pause_event.wait()
+            if self._cancel_event.is_set():
+                await self._emit("agent.cancelled", {"iteration": iteration})
+                return final_text
+
+            escalated = await self._maybe_escalate(
+                iteration, triggered_by_error=any_error, already_escalated=escalated
+            )
             iteration += 1
         else:
+            if rejected_answer is not None:
+                await self._raise_answer_not_verified(*rejected_answer)
             logger.warning("Agent hit max_iterations=%d", self.max_iterations)
             await self._emit(
                 "agent.error",
                 {"reason": "max_iterations", "iterations": self.max_iterations},
             )
         return final_text
+
+    async def _maybe_escalate(
+        self, iteration: int, *, triggered_by_error: bool, already_escalated: bool
+    ) -> bool:
+        """Escalate FLASH after a failure signal or prolonged execution."""
+        if already_escalated or self.mode is not AgentMode.FLASH:
+            return already_escalated
+        if (iteration == 0 and triggered_by_error) or (iteration + 1) >= self.FLASH_ESCALATION_THRESHOLD:
+            previous = self.mode
+            if self.escalate():
+                await self._emit("agent.escalated", {"from": previous.value, "to": self.mode.value})
+                return True
+        return False
+
+    async def _raise_answer_not_verified(self, answer: str, feedback: str) -> None:
+        await self._emit("agent.verification_exhausted", {"feedback": redact_secrets(feedback)})
+        raise AnswerNotVerifiedError(answer, feedback)
+
+    async def _drain_inbox(self) -> None:
+        """Append queued messages at a replay-valid boundary."""
+        while True:
+            try:
+                message = self._inbox.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            self.state.add_user_message(message)
+            await self._emit("agent.message_injected", {"message": message})
 
     def _first_user_message(self) -> str | None:
         """Return the most recent user text message, if any (for re-runs)."""
@@ -622,7 +753,9 @@ class AsyncAgent:
             },
         )
 
-    async def _call_llm(self, stream: bool = False) -> LLMResponse:
+    async def _call_llm(
+        self, stream: bool = False, system_append: str | None = None
+    ) -> LLMResponse:
         """Ask the LLM for the next turn using the current history + tools.
 
         With ``stream=True`` the client's ``chat_stream`` is consumed:
@@ -633,6 +766,8 @@ class AsyncAgent:
         streaming falls back to a plain ``chat`` call.
         """
         system, messages = self.state.for_llm()
+        if system_append:
+            system = f"{system}\n\n{system_append}" if system else system_append
         tools = self.tool_schemas() or None
         if not stream:
             response = await self.llm.chat(messages=messages, tools=tools, system=system)
@@ -684,6 +819,59 @@ class AsyncAgent:
             return "retry"
         await self._emit("agent.structured_output_invalid", {"problems": problems})
         return "break"
+
+    async def _create_plan(self, user_message: str | None) -> Plan | None:
+        """Create an opt-in synchronous plan without blocking the event loop."""
+        if self.planner is None:
+            return None
+        task = user_message or self._first_user_message() or "Continue the current task"
+        try:
+            plan = await asyncio.to_thread(self.planner.create_plan, task, self.tool_schemas())
+        except Exception as exc:  # noqa: BLE001
+            await self._emit("agent.plan_failed", {"error": redact_secrets(f"{type(exc).__name__}: {exc}")})
+            return None
+        if not isinstance(plan, Plan):
+            await self._emit("agent.plan_failed", {"error": "planner returned a non-Plan value"})
+            return None
+        await self._emit("agent.plan_created", {"goal": plan.goal, "steps": list(plan.steps)})
+        return plan
+
+    async def _verify_final_answer(self, answer: str) -> tuple[bool, str]:
+        """Run the synchronous verifier in a worker thread, fail-open on errors."""
+        assert self.answer_verifier is not None
+        task = self._first_user_message() or "Continue the current task"
+        try:
+            verdict = await asyncio.to_thread(self.answer_verifier.verify, task, answer, self.plan)
+        except Exception as exc:  # noqa: BLE001
+            await self._emit(
+                "agent.verification_failed",
+                {"reason": "exception", "error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+            )
+            return True, ""
+        if not hasattr(verdict, "accepted") or not isinstance(verdict.accepted, bool):
+            await self._emit("agent.verification_failed", {"reason": "invalid_verdict"})
+            return False, "Verifier returned an invalid verdict."
+        feedback = getattr(verdict, "feedback", "")
+        if not isinstance(feedback, str):
+            feedback = ""
+        await self._emit(
+            "agent.verification_passed" if verdict.accepted else "agent.verification_failed",
+            {"feedback": redact_secrets(feedback)},
+        )
+        return verdict.accepted, feedback
+
+    def _system_prompt_append(self, results: list[HookResult]) -> str | None:
+        """Collect hook and plan additions for this LLM request."""
+        additions = [
+            result.modified_context["system_prompt"]
+            for result in results
+            if result.modified_context
+            and isinstance(result.modified_context.get("system_prompt"), str)
+            and result.modified_context["system_prompt"].strip()
+        ]
+        if self.plan is not None:
+            additions.insert(0, self.plan.to_prompt())
+        return "\n\n".join(additions) or None
 
     async def _recall_memory(self, query: str) -> None:
         """Inject relevant memories before the task (fail-soft, like sync)."""
@@ -808,21 +996,30 @@ class AsyncAgent:
         if self.parallel_tool_execution and len(calls) > 1:
             return await self._execute_tool_calls_parallel(calls)
         any_error = False
-        for call in calls:
+        for index, call in enumerate(calls):
             if self._cancel_event.is_set():
                 result = ToolResult(error="skipped: run cancelled")
                 self.state.add_tool_result(
-                    call.id, self._format_tool_output(result), is_error=True
+                    call.id, self._tool_output_for_state(call, result), is_error=True
                 )
                 any_error = True
                 continue
             await self._emit("agent.tool_call_started", {"name": call.name, "id": call.id})
-            result = await self._execute_one(call)
+            try:
+                result = await self._execute_one(call)
+            except PendingConfirmationError:
+                self._pending_remaining_calls = calls[index + 1 :]
+                # The first save happens while preparing the pending call;
+                # overwrite it after recording the rest of this model batch
+                # so resumption never silently drops sibling tool calls.
+                if self.checkpoint_manager is not None:
+                    await asyncio.to_thread(self.checkpoint_manager.save, self)  # type: ignore[arg-type]
+                raise
             any_error = any_error or result.is_error
             await self._emit_tool_call_finished(call, result)
             self.state.add_tool_result(
                 call.id,
-                self._format_tool_output(result),
+                self._tool_output_for_state(call, result),
                 is_error=result.is_error,
             )
         return any_error
@@ -878,15 +1075,15 @@ class AsyncAgent:
                 if i not in skipped:
                     await self._emit_tool_call_finished(call, result)
                 self.state.add_tool_result(
-                    call.id, self._format_tool_output(result), is_error=result.is_error
+                    call.id, self._tool_output_for_state(call, result), is_error=result.is_error
                 )
                 continue
-            result = executed[i]
+            result = await self._retry_transient_tool(call, self._tools[call.name], executed_args[i], executed[i])
             any_error = any_error or result.is_error
             await self._finalize_call(call, executed_args[i], result)
             await self._emit_tool_call_finished(call, result)
             self.state.add_tool_result(
-                call.id, self._format_tool_output(result), is_error=result.is_error
+                call.id, self._tool_output_for_state(call, result), is_error=result.is_error
             )
         return any_error
 
@@ -909,6 +1106,7 @@ class AsyncAgent:
         except Exception as exc:  # noqa: BLE001 - surface as tool error
             logger.exception("Tool %s raised", call.name)
             result = ToolResult(error=f"{type(exc).__name__}: {exc}")
+        result = await self._retry_transient_tool(call, tool, arguments, result)
         await self._finalize_call(call, arguments, result)
         return result
 
@@ -950,9 +1148,12 @@ class AsyncAgent:
         self.audit_logger.log_tool_call(call.name, arguments, decision, _utcnow())
         if not decision.allowed:
             return None, arguments, await self._deny_call(call, decision.reason, arguments)
-        if decision.requires_confirmation and not await self._confirmed_by_hooks(
-            call, arguments, decision
-        ):
+        confirmation = await self._confirmation_status(call, arguments, decision)
+        if decision.requires_confirmation and confirmation == "no_hook" and self.checkpoint_manager is not None:
+            self._pending_confirmation = (call, dict(arguments), decision)
+            checkpoint_id = await asyncio.to_thread(self.checkpoint_manager.save, self)  # type: ignore[arg-type]
+            raise PendingConfirmationError(call, arguments, decision, checkpoint_id)
+        if decision.requires_confirmation and confirmation != "approved":
             return None, arguments, await self._deny_call(
                 call,
                 "requires manual confirmation, not yet supported in automated "
@@ -964,6 +1165,11 @@ class AsyncAgent:
         if tool is None:
             logger.error("Unknown tool requested: %s", call.name)
             return None, arguments, ToolResult(error=f"Unknown tool: {call.name}")
+        if self._circuit_is_open(tool):
+            return None, arguments, ToolResult(
+                error=f"Circuit breaker open for tool {call.name!r}",
+                failure_category=ToolFailureCategory.PERMANENT,
+            )
         if self.validate_tool_inputs:
             problems = validate_tool_input(tool.parameters, arguments)
             if problems:
@@ -977,6 +1183,7 @@ class AsyncAgent:
     ) -> None:
         """Audit + AFTER_TOOL_CALL hooks for an EXECUTED call."""
         self.audit_logger.log_tool_result(call.name, result, _utcnow())
+        self._record_circuit_result(call.name, self._tools[call.name], result)
         await self._trigger_hooks(
             HookPoint.AFTER_TOOL_CALL,
             HookContext(
@@ -999,19 +1206,103 @@ class AsyncAgent:
         tools wrapping subprocesses/network should enforce their own real
         timeout too (``GitTool`` already does).
         """
-        if self.tool_timeout is None:
-            return await tool.execute_async(**arguments)
+        timeout = self._tool_timeout(tool)
+        if timeout is None:
+            return await self._invoke_tool(tool, arguments)
         try:
             return await asyncio.wait_for(
-                tool.execute_async(**arguments), timeout=self.tool_timeout
+                self._invoke_tool(tool, arguments), timeout=timeout
             )
         except asyncio.TimeoutError:
             return ToolResult(
                 error=(
-                    f"Tool {tool.name!r} timed out after {self.tool_timeout}s "
+                    f"Tool {tool.name!r} timed out after {timeout}s "
                     "(the call may still be running in the background)"
                 )
             )
+
+    async def _invoke_tool(self, tool: Tool, arguments: dict[str, Any]) -> ToolResult:
+        """Invoke once, adding stable idempotency keys to write retries."""
+        started = time.perf_counter()
+        try:
+            kwargs = dict(arguments)
+            if self._accepts_idempotency_key(tool) and self._needs_idempotency_key(tool):
+                kwargs["idempotency_key"] = self._idempotency_key(tool, arguments)
+            result = await tool.execute_async(**kwargs)
+            if not isinstance(result, ToolResult):
+                result = ToolResult(output=result)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Tool %s raised", tool.name)
+            result = ToolResult(error=f"{type(exc).__name__}: {exc}")
+        result.duration_seconds = time.perf_counter() - started
+        return result
+
+    async def _retry_transient_tool(
+        self, call: ToolCall, tool: Tool, arguments: dict[str, Any], result: ToolResult
+    ) -> ToolResult:
+        retries = 0
+        while (
+            result.is_error
+            and result.failure_category is ToolFailureCategory.TRANSIENT
+            and retries < self._max_transient_retries(tool)
+            and not self._cancel_event.is_set()
+        ):
+            retries += 1
+            delay = self.transient_retry_backoff_seconds * (2 ** (retries - 1))
+            await self._emit(
+                "agent.tool_retry", {"name": call.name, "id": call.id, "attempt": retries, "delay_seconds": delay}
+            )
+            if delay:
+                await asyncio.sleep(delay)
+            result = await self._run_tool(tool, arguments)
+        return result
+
+    def _tool_timeout(self, tool: Tool) -> float | None:
+        policy = tool.execution_policy
+        return policy.timeout_seconds if policy and policy.timeout_seconds is not None else self.tool_timeout
+
+    def _max_transient_retries(self, tool: Tool) -> int:
+        policy = tool.execution_policy
+        return policy.max_transient_retries if policy and policy.max_transient_retries is not None else self.max_transient_retries
+
+    def _circuit_is_open(self, tool: Tool) -> bool:
+        policy = tool.execution_policy
+        if policy is None or policy.circuit_breaker_threshold is None:
+            return False
+        failures, open_until = self._circuit_breakers.get(tool.name, (0, None))
+        if open_until is None:
+            return False
+        if time.monotonic() < open_until:
+            return True
+        self._circuit_breakers[tool.name] = (0, None)
+        return False
+
+    def _record_circuit_result(self, name: str, tool: Tool, result: ToolResult) -> None:
+        policy = tool.execution_policy
+        threshold = policy.circuit_breaker_threshold if policy else None
+        if policy is None or threshold is None:
+            return
+        if not result.is_error:
+            self._circuit_breakers[name] = (0, None)
+            return
+        failures, _ = self._circuit_breakers.get(name, (0, None))
+        failures += 1
+        self._circuit_breakers[name] = (
+            failures,
+            time.monotonic() + policy.circuit_breaker_cooldown_seconds if failures >= threshold else None,
+        )
+
+    @staticmethod
+    def _accepts_idempotency_key(tool: Tool) -> bool:
+        return "idempotency_key" in inspect.signature(tool.execute).parameters
+
+    @staticmethod
+    def _needs_idempotency_key(tool: Tool) -> bool:
+        return tool.risk_level in {ToolRiskLevel.WRITE, ToolRiskLevel.DESTRUCTIVE}
+
+    def _idempotency_key(self, tool: Tool, arguments: dict[str, Any]) -> str:
+        payload = json.dumps({"tool": tool.name, "arguments": arguments, "run_id": self._run_id}, sort_keys=True, default=str, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     async def _trigger_hooks(
         self, point: HookPoint, context: HookContext
@@ -1021,9 +1312,9 @@ class AsyncAgent:
             return []
         return await self.hooks.trigger_async(point, context)
 
-    async def _confirmed_by_hooks(
+    async def _confirmation_status(
         self, call: ToolCall, arguments: dict[str, Any], decision: PermissionDecision
-    ) -> bool:
+    ) -> Literal["approved", "denied", "no_hook"]:
         """Ask ``ON_PERMISSION_CHECK`` hooks to confirm a flagged tool call.
 
         Returns ``True`` when at least one hook explicitly allows the call
@@ -1032,7 +1323,9 @@ class AsyncAgent:
         confirmed — the safe default.
         """
         if self.hooks is None:
-            return False
+            return "no_hook"
+        if not self.hooks.hooks_for(HookPoint.ON_PERMISSION_CHECK):
+            return "no_hook"
         results = await self._trigger_hooks(
             HookPoint.ON_PERMISSION_CHECK,
             HookContext(
@@ -1043,7 +1336,11 @@ class AsyncAgent:
                 permission_decision=decision,
             ),
         )
-        return any(r.should_continue for r in results)
+        if any(r.should_continue for r in results):
+            return "approved"
+        if any(not r.should_continue for r in results):
+            return "denied"
+        return "no_hook"
 
     async def _deny_call(
         self, call: ToolCall, reason: str, tool_input: dict[str, Any] | None = None
@@ -1063,6 +1360,77 @@ class AsyncAgent:
         )
         return ToolResult(error=f"Permission denied for tool {call.name!r}: {reason}")
 
+    def _checkpoint_runtime_state(self) -> dict[str, Any]:
+        """Return JSON-compatible runtime fields absent from conversation state."""
+        pending = self._pending_confirmation
+        return {
+            "mode": self.mode.value, "sticky_max": self._sticky_max,
+            "max_iterations": self.max_iterations,
+            "max_iterations_override": self._max_iterations_override,
+            "enable_extended_reasoning": self.enable_extended_reasoning,
+            "pending_confirmation": None if pending is None else {
+                "call": {"id": pending[0].id, "name": pending[0].name, "arguments": pending[0].arguments},
+                "arguments": pending[1],
+                "decision": {"allowed": pending[2].allowed, "reason": pending[2].reason, "requires_confirmation": pending[2].requires_confirmation},
+            },
+            "pending_remaining_calls": [
+                {"id": call.id, "name": call.name, "arguments": call.arguments}
+                for call in self._pending_remaining_calls
+            ],
+        }
+
+    def _restore_checkpoint_runtime_state(self, run_id: str, runtime: dict[str, Any]) -> None:
+        """Restore checkpoint routing and pending-call state without reclassification."""
+        try:
+            self.mode = AgentMode(runtime["mode"])
+            self._sticky_max = bool(runtime["sticky_max"])
+            self.max_iterations = int(runtime["max_iterations"])
+            override = runtime.get("max_iterations_override")
+            self._max_iterations_override = override if isinstance(override, int) else None
+            self.enable_extended_reasoning = bool(runtime["enable_extended_reasoning"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid checkpoint runtime state: {exc}") from exc
+        pending = runtime.get("pending_confirmation")
+        if isinstance(pending, dict):
+            call_data, args_data, decision_data = pending.get("call"), pending.get("arguments"), pending.get("decision")
+            if not isinstance(call_data, dict) or not isinstance(args_data, dict) or not isinstance(decision_data, dict):
+                raise ValueError("Invalid pending confirmation checkpoint data")
+            self._pending_confirmation = (
+                ToolCall(str(call_data["id"]), str(call_data["name"]), dict(call_data["arguments"])),
+                dict(args_data), PermissionDecision(**decision_data),
+            )
+        remaining = runtime.get("pending_remaining_calls", [])
+        if not isinstance(remaining, list):
+            raise ValueError("Invalid pending remaining calls checkpoint data")
+        self._pending_remaining_calls = [
+            ToolCall(str(item["id"]), str(item["name"]), dict(item["arguments"]))
+            for item in remaining if isinstance(item, dict)
+        ]
+        self._run_id = run_id
+        self._resuming_checkpoint = True
+
+    async def _resolve_pending_confirmation(self, approved: bool) -> None:
+        """Apply a human decision, finish its batch, then persist the state."""
+        if self._pending_confirmation is None:
+            raise ValueError("Checkpoint has no pending confirmation")
+        call, arguments, _decision = self._pending_confirmation
+        self._pending_confirmation = None
+        tool = self._tools.get(call.name)
+        if approved and tool is not None:
+            result = await self._retry_transient_tool(call, tool, arguments, await self._run_tool(tool, arguments))
+            await self._finalize_call(call, arguments, result)
+        elif approved:
+            result = ToolResult(error=f"Unknown tool: {call.name}")
+        else:
+            result = await self._deny_call(call, "confirmation declined by user", arguments)
+        await self._emit_tool_call_finished(call, result)
+        self.state.add_tool_result(call.id, self._tool_output_for_state(call, result), is_error=result.is_error)
+        remaining = self._pending_remaining_calls
+        self._pending_remaining_calls = []
+        if remaining:
+            await self._execute_tool_calls(remaining)
+        await self._persist_state()
+
     async def _emit_tool_call_finished(self, call: ToolCall, result: ToolResult) -> None:
         await self._emit(
             "agent.tool_call_finished",
@@ -1073,6 +1441,13 @@ class AsyncAgent:
                 "output_preview": redact_secrets(self._preview(result.output)),
             },
         )
+        if self.stuck_detector is not None and self.stuck_detector.check(
+            call.name, call.arguments, result
+        ):
+            await self._emit(
+                "agent.stuck_detected", {"tool_name": call.name, "window": self.stuck_detector.window}
+            )
+            self._stop_reason = "unproductive_loop"
 
     @staticmethod
     def _format_tool_output(result: ToolResult) -> str:
@@ -1084,6 +1459,10 @@ class AsyncAgent:
             return json.dumps(payload) if not isinstance(payload, str) else payload
         except (TypeError, ValueError):
             return str(payload)
+
+    def _tool_output_for_state(self, call: ToolCall, result: ToolResult) -> str:
+        output = self._format_tool_output(result)
+        return self.injection_guard.wrap(output, f"tool:{call.name}") if self.injection_guard else output
 
     @staticmethod
     def _preview(value: Any, limit: int = 200) -> str:
