@@ -57,6 +57,8 @@ def test_rg_and_python_skip_hidden_and_binary_files_equally(search_workspace, tm
 
 @pytest.mark.parametrize("engine", ["rg", "python"])
 def test_grep_never_leaks_symlink_outside_workspace(search_workspace, tmp_path, monkeypatch, engine):
+    if engine == "rg" and shutil.which("rg") is None:
+        pytest.skip("ripgrep is not installed")
     outside = tmp_path.parent / "search-outside-secret.txt"
     outside.write_text("needle\n")
     (tmp_path / "escape.txt").symlink_to(outside)
