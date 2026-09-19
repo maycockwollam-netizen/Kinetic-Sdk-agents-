@@ -22,6 +22,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
+from kinetic_sdk.files.snapshots import (
+    GitSnapshotStore,
+    SnapshotStoreError,
+    is_internal_snapshot_path,
+)
 from kinetic_sdk.subagent.exceptions import FileLockTimeoutError
 from kinetic_sdk.subagent.filelock import FileLockRegistry
 from kinetic_sdk.tool.base import Tool, ToolResult
@@ -137,6 +142,9 @@ class FileTool(Tool):
             Call :meth:`bind` after constructing the owning agent so the
             lease owner uses its stable delegation audit id.
         lock_timeout: Seconds to wait for another agent's write lease.
+        snapshot_store: Optional private ``GitSnapshotStore`` that records the
+            content before each ``str_replace`` and ``insert``. ``None``
+            (the default) makes no snapshot files or repositories.
     """
 
     name: str = "file_editor"
@@ -197,6 +205,7 @@ class FileTool(Tool):
         *,
         lock_registry: FileLockRegistry | None = None,
         lock_timeout: float = 5.0,
+        snapshot_store: GitSnapshotStore | None = None,
     ) -> None:
         if max_view_lines < 10:
             raise ValueError("max_view_lines must be >= 10")
@@ -207,6 +216,7 @@ class FileTool(Tool):
         self._lock_registry = lock_registry
         self.lock_timeout = lock_timeout
         self._owner_id: str | None = None
+        self._snapshot_store = snapshot_store
         # path -> previous content, for single-level undo_edit.
         self._undo: dict[str, str | None] = {}
 
@@ -230,6 +240,7 @@ class FileTool(Tool):
             self.max_view_lines,
             lock_registry=self._lock_registry,
             lock_timeout=self.lock_timeout,
+            snapshot_store=self._snapshot_store,
         )
 
     # --- dispatch -----------------------------------------------------
@@ -253,13 +264,15 @@ class FileTool(Tool):
                 error=f"unknown action {action!r} (expected view/create/str_replace/insert/undo_edit)"
             )
         try:
+            if is_internal_snapshot_path(path):
+                return ToolResult(error="path is reserved for internal snapshot storage")
             return handler(path, **params)
         except FileLockTimeoutError as exc:
             logger.warning("Write lock unavailable for %r: %s", path, exc)
             return ToolResult(error=f"file is locked for writing: {exc}")
         except ValueError as exc:
             return ToolResult(error=f"path rejected: {exc}")
-        except (OSError, WorkspaceError) as exc:
+        except (OSError, WorkspaceError, SnapshotStoreError) as exc:
             return ToolResult(error=f"filesystem error: {exc}")
 
     # --- actions --------------------------------------------------------
@@ -328,6 +341,7 @@ class FileTool(Tool):
             entries = self.workspace.list_directory(path)
         except (FileNotFoundError, NotADirectoryError):
             return ToolResult(error=f"no such file or directory: {path}")
+        entries = [entry for entry in entries if entry.rstrip("/") != ".kinetic"]
         return ToolResult(output="\n".join(entries) or "(empty directory)")
 
     def _create(self, path: str, file_text: str | None = None, **_: Any) -> ToolResult:
@@ -392,7 +406,10 @@ class FileTool(Tool):
             new_content = content[:start] + new_str + content[end:]
             count = 1
             metadata = {"path": path, "count": count, "match_strategy": strategy}
-        self._write_locked(path, lambda: self.workspace.write_text(path, new_content))
+        self._write_locked(
+            path,
+            lambda: self._snapshot_and_write(path, content, new_content),
+        )
         self._undo[path] = content
         return ToolResult(
             output=f"edited {path} ({count} replacement(s))", metadata=metadata
@@ -418,12 +435,20 @@ class FileTool(Tool):
         if new_str and not new_str.endswith("\n"):
             new_lines[-1] += "\n"
         lines[insert_line:insert_line] = new_lines
-        self._write_locked(path, lambda: self.workspace.write_text(path, "".join(lines)))
+        self._write_locked(
+            path, lambda: self._snapshot_and_write(path, content, "".join(lines))
+        )
         self._undo[path] = content
         return ToolResult(
             output=f"inserted into {path} after line {insert_line}",
             metadata={"path": path},
         )
+
+    def _snapshot_and_write(self, path: str, previous: str, updated: str) -> None:
+        """Persist the pre-edit content immediately before the coordinated write."""
+        if self._snapshot_store is not None:
+            self._snapshot_store.snapshot(path, previous)
+        self.workspace.write_text(path, updated)
 
     def _undo_edit(self, path: str, **_: Any) -> ToolResult:
         if path not in self._undo:
