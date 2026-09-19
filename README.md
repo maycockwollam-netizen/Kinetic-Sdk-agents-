@@ -61,8 +61,9 @@ rewriting the agent loop.
   truncation compaction, oversized tool-result trimming, and optional
   LLM-summarised compaction with safe fallback.
 - `kinetic_sdk/event/` — synchronous/async event bus with wildcard subscribers.
-- `kinetic_sdk/files/` — `FileTool`: workspace-confined view/create/
-  str_replace/insert/undo_edit (all paths traversal-safe via `Workspace`).
+- `kinetic_sdk/files/` — workspace-confined editing tools: `FileTool` for
+  view/create/str_replace/insert/undo_edit and `ApplyPatchTool` for atomic,
+  multi-file standard unified diffs (all paths traversal-safe via `Workspace`).
 - `kinetic_sdk/terminal/` — `TerminalTool`: shell commands with process-group
   kill on timeout and head/tail output truncation.
 - `kinetic_sdk/git/` — `GitTool`: curated git operations (status/diff/add/
