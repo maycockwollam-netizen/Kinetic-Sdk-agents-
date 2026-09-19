@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any
 
 from kinetic_sdk.agent.agent import Agent
@@ -20,6 +21,7 @@ from kinetic_sdk.security import (
     PolicyRule,
     RuleBasedPolicy,
     redact_secrets,
+    redact_value,
 )
 from kinetic_sdk.tool.base import Tool, ToolResult
 from tests._helpers import EchoTool, MockLLM, text_response, tool_response
@@ -211,7 +213,7 @@ def test_redact_additional_secret_shapes():
     bearer_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJraW5ldGljLXVzZXItMTIzNDU2Nzg5MCJ9.signature1234567890"
     slack_token = "xoxb-" + "1234567890-abcdefghijklmnop"
     google_api_key = "AIza" + "A" * 35
-    pem_key = "-----BEGIN PRIVATE KEY-----\nprivate-key-material\n-----END PRIVATE KEY-----"
+    pem_key = "-----BEGIN PRIVATE KEY-----\nprivatekeymaterial\n-----END PRIVATE KEY-----"
     database_url = "postgres://admin:SuperSecret123@db.internal:5432/prod"
     aws_secret = "AWS_SECRET_ACCESS_KEY=abcdefghijklmnopqrstuvwxyz1234567890+/ABCD"
     short_password = "password: hunter2"
@@ -239,6 +241,90 @@ def test_redact_additional_patterns_leave_normal_text_untouched():
         "release version 1.2.3",
     ):
         assert redact_secrets(text) == text
+
+
+def test_redact_jwt_does_not_match_dotted_module_name():
+    assert redact_secrets("kinetic_sdk.conversation.checkpoint") == "kinetic_sdk.conversation.checkpoint"
+
+
+def test_redact_url_does_not_mistake_ports_or_git_refs_for_credentials():
+    for text in (
+        "https://example.com:443/@user",
+        "git+https://github.com/x/y@v1.0",
+    ):
+        assert redact_secrets(text) == text
+
+
+def test_redact_pem_complete_truncated_and_adjacent_blocks():
+    complete = "-----BEGIN PRIVATE KEY-----\nprivatekeymaterial\n-----END PRIVATE KEY-----"
+    truncated = "-----BEGIN PRIVATE KEY-----\nprivatekeymaterial"
+    adjacent = f"{complete}\n{complete}"
+
+    assert redact_secrets(complete) == REDACTED
+    assert redact_secrets(truncated) == REDACTED
+    assert redact_secrets(adjacent) == f"{REDACTED}\n{REDACTED}"
+
+
+def test_redact_value_redacts_sensitive_dict_keys_recursively():
+    value = {
+        "Password": "hunter2",
+        "nested": [{"api_key": "abc"}, {"cache_key": "safe"}],
+        "private_key": 42,
+    }
+
+    assert redact_value(value) == {
+        "Password": REDACTED,
+        "nested": [{"api_key": REDACTED}, {"cache_key": "safe"}],
+        "private_key": 42,
+    }
+
+
+def test_redact_string_json_sensitive_fields():
+    text = '{"password": "hunter2", \'api_key\': \'abc\', "cache_key": "safe"}'
+    redacted = redact_secrets(text)
+
+    assert "hunter2" not in redacted
+    assert "abc" not in redacted
+    assert '"password": "[REDACTED]"' in redacted
+    assert "'api_key': '[REDACTED]'" in redacted
+    assert '"cache_key": "safe"' in redacted
+
+
+def test_redaction_is_idempotent():
+    text = (
+        'password: hunter2; {"api_key": "abc"}; '
+        "postgres://admin:SuperSecret123@db.internal:5432/prod"
+    )
+    assert redact_secrets(redact_secrets(text)) == redact_secrets(text)
+
+
+def test_redact_url_credentials_is_fast_for_many_ports():
+    text = json.dumps(
+        [f"http://example.com:8080/p{index:010d}" for index in range(8_000)],
+        separators=(",", ":"),
+    )
+    assert len(text) >= 300_000
+
+    start = perf_counter()
+    assert redact_secrets(text) == text
+    assert perf_counter() - start < 1
+
+
+def test_redact_unterminated_pem_lines_is_fast():
+    text = "\n".join("-----BEGIN PRIVATE KEY-----" for _ in range(20_000))
+
+    start = perf_counter()
+    redacted = redact_secrets(text)
+    assert redacted.count(REDACTED) == 20_000
+    assert perf_counter() - start < 1
+
+
+def test_redact_large_pem_is_fast():
+    text = "-----BEGIN PRIVATE KEY-----\n" + "A" * (5 * 1024 * 1024) + "\n-----END PRIVATE KEY-----"
+
+    start = perf_counter()
+    assert redact_secrets(text) == REDACTED
+    assert perf_counter() - start < 1
 
 
 # --- Audit loggers ---------------------------------------------------------
