@@ -9,7 +9,9 @@ from typing import Any
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.event.bus import Event, EventBus
 from kinetic_sdk.hooks import HookContext, HookPoint, HookRegistry, HookResult
+from kinetic_sdk.llm.client import LLMResponse, ToolCall
 from kinetic_sdk.security import AllowListPolicy
+from kinetic_sdk.testing import MockTool
 from kinetic_sdk.tool.base import Tool, ToolResult
 from tests._helpers import MockLLM, text_response, tool_response
 
@@ -246,3 +248,120 @@ def test_unresolved_confirmation_can_be_declined_without_executing_tool(tmp_path
         tools=[resumed_spy],
     ) == "end"
     assert resumed_spy.executions == 0
+
+
+def _tool_result_ids(messages: list[dict[str, Any]]) -> list[str]:
+    """Return tool-result ids in their conversation order."""
+    return [
+        block["tool_use_id"]
+        for message in messages
+        for block in (message["content"] if isinstance(message["content"], list) else [])
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+
+
+def test_pending_confirmation_preserves_batch_before_and_after_parallel_gate(tmp_path):
+    """A parallel gate pause must checkpoint every unfinalized call exactly once."""
+    import pytest
+
+    from kinetic_sdk.replay import (
+        CheckpointManager,
+        JsonFileReplayStore,
+        PendingConfirmationError,
+        resume_from_confirmation,
+    )
+
+    calls = [
+        ToolCall(id="safe-1", name="safe1", arguments={}),
+        ToolCall(id="risky", name="risky", arguments={"action": "confirm"}),
+        ToolCall(id="safe-2", name="safe2", arguments={}),
+    ]
+    manager = CheckpointManager(JsonFileReplayStore(tmp_path / "checkpoint.json"))
+    policy = AllowListPolicy(
+        always_allow=["safe1", "risky", "safe2"],
+        require_confirmation_patterns={"risky": ["confirm"]},
+    )
+    agent = Agent(
+        llm=MockLLM([LLMResponse(content="", tool_calls=calls, stop_reason="tool_use")]),
+        tools=[
+            MockTool(name="safe1", result="safe-1 done"),
+            MockTool(name="risky", result="risky done"),
+            MockTool(name="safe2", result="safe-2 done"),
+        ],
+        permission_policy=policy,
+        checkpoint_manager=manager,
+        parallel_tool_execution=True,
+    )
+
+    with pytest.raises(PendingConfirmationError) as pending:
+        agent.run("do three things")
+
+    assert _tool_result_ids(agent.state.messages) == ["safe-1"]
+    assert [call.id for call in agent._pending_remaining_calls] == ["risky", "safe-2"]
+
+    resumed_llm = MockLLM([text_response("end")])
+    assert resume_from_confirmation(
+        pending.value.checkpoint_id,
+        True,
+        checkpoint_manager=manager,
+        llm=resumed_llm,
+        tools=[
+            MockTool(name="safe1", result="safe-1 done"),
+            MockTool(name="risky", result="risky done"),
+            MockTool(name="safe2", result="safe-2 done"),
+        ],
+    ) == "end"
+    assert _tool_result_ids(resumed_llm.calls[0]["messages"]) == ["safe-1", "risky", "safe-2"]
+
+
+def test_pending_confirmation_preserves_complete_suffix_sequentially(tmp_path):
+    """The sequential path follows the same complete-suffix checkpoint contract."""
+    import pytest
+
+    from kinetic_sdk.replay import (
+        CheckpointManager,
+        JsonFileReplayStore,
+        PendingConfirmationError,
+        resume_from_confirmation,
+    )
+
+    calls = [
+        ToolCall(id="safe-1", name="safe1", arguments={}),
+        ToolCall(id="risky", name="risky", arguments={"action": "confirm"}),
+        ToolCall(id="safe-2", name="safe2", arguments={}),
+    ]
+    manager = CheckpointManager(JsonFileReplayStore(tmp_path / "checkpoint.json"))
+    policy = AllowListPolicy(
+        always_allow=["safe1", "risky", "safe2"],
+        require_confirmation_patterns={"risky": ["confirm"]},
+    )
+    agent = Agent(
+        llm=MockLLM([LLMResponse(content="", tool_calls=calls, stop_reason="tool_use")]),
+        tools=[
+            MockTool(name="safe1", result="safe-1 done"),
+            MockTool(name="risky", result="risky done"),
+            MockTool(name="safe2", result="safe-2 done"),
+        ],
+        permission_policy=policy,
+        checkpoint_manager=manager,
+    )
+
+    with pytest.raises(PendingConfirmationError):
+        agent.run("do three things")
+
+    assert _tool_result_ids(agent.state.messages) == ["safe-1"]
+    assert [call.id for call in agent._pending_remaining_calls] == ["risky", "safe-2"]
+
+    resumed_llm = MockLLM([text_response("end")])
+    assert resume_from_confirmation(
+        agent.run_id or "",
+        True,
+        checkpoint_manager=manager,
+        llm=resumed_llm,
+        tools=[
+            MockTool(name="safe1", result="safe-1 done"),
+            MockTool(name="risky", result="risky done"),
+            MockTool(name="safe2", result="safe-2 done"),
+        ],
+    ) == "end"
+    assert _tool_result_ids(resumed_llm.calls[0]["messages"]) == ["safe-1", "risky", "safe-2"]

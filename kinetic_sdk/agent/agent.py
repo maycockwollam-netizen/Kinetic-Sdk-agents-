@@ -1113,7 +1113,12 @@ class Agent:
             try:
                 result = self._execute_one(call)
             except PendingConfirmationError:
-                self._pending_remaining_calls = calls[index + 1 :]
+                # Keep the pending call in the batch checkpoint as well as in
+                # ``_pending_confirmation``.  The latter is resolved directly
+                # from the human verdict; the former makes the complete
+                # unfinalized suffix explicit and durable.
+                self._pending_remaining_calls = calls[index:]
+                self._save_pending_confirmation_checkpoint()
                 raise
             any_error = any_error or result.is_error
             self._emit_tool_call_finished(call, result)
@@ -1131,7 +1136,6 @@ class Agent:
         cannot preempt in-flight executions, and skipped calls still receive
         their error ``tool_result`` so the history stays valid.
         """
-        any_error = False
         early_or_skip: dict[int, ToolResult] = {}
         skipped: set[int] = set()
         pending: list[tuple[int, ToolCall, Tool, dict[str, Any]]] = []
@@ -1142,13 +1146,34 @@ class Agent:
                 skipped.add(i)
                 continue
             self._emit("agent.tool_call_started", {"name": call.name, "id": call.id})
-            tool, arguments, early = self._prepare_call(call)
+            try:
+                tool, arguments, early = self._prepare_call(call)
+            except PendingConfirmationError:
+                # The gate intentionally runs before dispatching tools.  Do
+                # not lose calls that already passed it: execute and record
+                # their results before pausing, then checkpoint the pending
+                # call and every unprocessed call for a faithful resume.
+                self._dispatch_and_record(calls[:i], pending, early_or_skip, skipped)
+                self._pending_remaining_calls = calls[i:]
+                self._save_pending_confirmation_checkpoint()
+                raise
             if early is not None:
                 early_or_skip[i] = early
             else:
                 assert tool is not None
                 pending.append((i, call, tool, arguments))
 
+        return self._dispatch_and_record(calls, pending, early_or_skip, skipped)
+
+    def _dispatch_and_record(
+        self,
+        calls: list[ToolCall],
+        pending: list[tuple[int, ToolCall, Tool, dict[str, Any]]],
+        early_or_skip: dict[int, ToolResult],
+        skipped: set[int],
+    ) -> bool:
+        """Run already-gated calls and record their results in call order."""
+        any_error = False
         executed: dict[int, ToolResult] = {}
         executed_args: dict[int, dict[str, Any]] = {}
         if pending:
@@ -1196,6 +1221,17 @@ class Agent:
             self._emit_tool_call_finished(call, result)
             self.state.add_tool_result(call.id, self._tool_output_for_state(call, result), is_error=result.is_error)
         return any_error
+
+    def _save_pending_confirmation_checkpoint(self) -> None:
+        """Refresh a pending-confirmation checkpoint after batch bookkeeping.
+
+        ``_prepare_call`` saves the initial checkpoint before its caller has
+        recorded earlier calls or populated the remaining batch suffix.  A
+        second save replaces that checkpoint under the same run id with the
+        replay-valid state needed by ``resume_from_confirmation``.
+        """
+        if self.checkpoint_manager is not None:
+            self.checkpoint_manager.save(self)
 
     def _get_executor(self) -> ThreadPoolExecutor:
         """Lazily create the shared tool-execution thread pool."""
@@ -1601,6 +1637,11 @@ class Agent:
         self.state.add_tool_result(call.id, self._tool_output_for_state(call, result), is_error=result.is_error)
         remaining = self._pending_remaining_calls
         self._pending_remaining_calls = []
+        # Checkpoints retain the complete unfinalized suffix, including this
+        # call.  It was just resolved from the human verdict, so dispatch only
+        # the trailing calls and never emit a duplicate tool result.
+        if remaining and remaining[0].id == call.id:
+            remaining = remaining[1:]
         if remaining:
             self._execute_tool_calls(remaining)
         self._persist_state()
