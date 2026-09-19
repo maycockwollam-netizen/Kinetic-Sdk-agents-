@@ -195,6 +195,17 @@ class LLMClient(ABC):
                 stop sequences, ...).
         """
 
+    def count_tokens(self, text: str) -> int:
+        """Return the provider's token count for *text* when it is available.
+
+        Provider counting APIs differ: for example, some require complete
+        message structures rather than a text fragment.  The base interface
+        therefore deliberately remains optional.  Context counters must catch
+        :class:`NotImplementedError` and use a local fallback so existing
+        custom clients do not need to implement this method.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support token counting")
+
     def chat_stream(
         self,
         messages: list[Message],
