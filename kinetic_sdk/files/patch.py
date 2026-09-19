@@ -126,7 +126,10 @@ class ApplyPatchTool(Tool):
                 # Always make the explicit boundary check before a backend
                 # read, including backends whose read_text checks internally.
                 self.workspace.resolve(path)
-                original = self.workspace.read_text(path)
+                original = resolved.get(path)
+                if original is None:
+                    original = self.workspace.read_text(path)
+                    originals[path] = original
             except FileNotFoundError:
                 return ToolResult(error=f"apply_patch aborted: {path} does not exist")
             except (ValueError, WorkspaceError) as exc:
@@ -137,7 +140,6 @@ class ApplyPatchTool(Tool):
                 resolved[path] = self._apply_file_patch(original, file_patch)
             except PatchApplyError as exc:
                 return ToolResult(error=f"apply_patch aborted: {path}: {exc}")
-            originals[path] = original
 
         written: list[str] = []
         try:
@@ -224,6 +226,12 @@ class ApplyPatchTool(Tool):
                     if hunk_line.startswith("--- ") or hunk_line.startswith("diff --git "):
                         break
                     if hunk_line.startswith("\\ No newline at end of file"):
+                        if not hunk_lines:
+                            raise PatchApplyError("newline marker has no preceding hunk line")
+                        # The marker applies to the preceding old or new line.
+                        # Strip only its line ending so application can retain
+                        # the intentional missing final newline.
+                        hunk_lines[-1] = hunk_lines[-1].rstrip("\r\n")
                         index += 1
                         continue
                     if hunk_line.startswith((" ", "+", "-")):
@@ -252,6 +260,7 @@ class ApplyPatchTool(Tool):
     def _apply_file_patch(original: str, file_patch: _FilePatch) -> str:
         lines = original.splitlines(keepends=True)
         offset = 0
+        newline = "\r\n" if "\r\n" in original else "\n"
         for hunk in file_patch.hunks:
             # Unified diffs use ``-0,0`` when inserting before the first
             # line, where subtracting one would point before the file.
@@ -259,11 +268,27 @@ class ApplyPatchTool(Tool):
             start = old_index + offset
             if start < 0 or start > len(lines):
                 raise PatchApplyError("hunk position is outside the file")
-            expected = [line[1:] for line in hunk.lines if line[0] in " -"]
-            replacement = [line[1:] for line in hunk.lines if line[0] in " +"]
+            def file_newline(line: str) -> str:
+                body = line.rstrip("\r\n")
+                return body + (newline if line.endswith(("\n", "\r")) else "")
+
+            expected = [file_newline(line[1:]) for line in hunk.lines if line[0] in " -"]
+            replacement = [file_newline(line[1:]) for line in hunk.lines if line[0] in " +"]
             end = start + len(expected)
             if lines[start:end] != expected:
-                raise PatchApplyError("hunk context does not match the file")
+                lower = max(0, start - 20)
+                upper = min(len(lines) - len(expected), start + 20)
+                candidates = [
+                    candidate
+                    for candidate in range(lower, upper + 1)
+                    if lines[candidate : candidate + len(expected)] == expected
+                ]
+                if len(candidates) != 1:
+                    if len(candidates) > 1:
+                        raise PatchApplyError("hunk context matches multiple nearby locations")
+                    raise PatchApplyError("hunk context does not match the file within 20 lines")
+                start = candidates[0]
+                end = start + len(expected)
             lines[start:end] = replacement
-            offset += len(replacement) - len(expected)
+            offset += (start - old_index - offset) + len(replacement) - len(expected)
         return "".join(lines)
