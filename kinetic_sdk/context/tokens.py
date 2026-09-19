@@ -12,6 +12,8 @@ when it has one; failures and unsupported clients safely use its local fallback.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from hashlib import sha1
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -28,10 +30,18 @@ class ProviderTokenCounter:
     letting token accounting break compaction.
     """
 
-    def __init__(self, llm: LLMClient, fallback: Callable[[str], int] | None = None) -> None:
+    def __init__(
+        self,
+        llm: LLMClient,
+        fallback: Callable[[str], int] | None = None,
+        max_cache_entries: int = 4_096,
+    ) -> None:
+        if max_cache_entries < 1:
+            raise ValueError("max_cache_entries must be >= 1")
         self._llm = llm
         self._fallback = fallback or self._default_fallback
-        self._cache: dict[str, int] = {}
+        self.max_cache_entries = max_cache_entries
+        self._cache: OrderedDict[str, int] = OrderedDict()
 
     @staticmethod
     def _default_fallback(text: str) -> int:
@@ -41,8 +51,11 @@ class ProviderTokenCounter:
         return estimate_tokens(text)
 
     def __call__(self, text: str) -> int:
-        cached = self._cache.get(text)
+        # Do not retain arbitrary conversation/tool-output text in memory.
+        key = sha1(text.encode("utf-8")).hexdigest()
+        cached = self._cache.get(key)
         if cached is not None:
+            self._cache.move_to_end(key)
             return cached
         try:
             count = self._llm.count_tokens(text)
@@ -51,7 +64,10 @@ class ProviderTokenCounter:
         except Exception:  # noqa: BLE001 - token counting must never break compaction
             count = self._fallback(text)
         result = max(1, count)
-        self._cache[text] = result
+        self._cache[key] = result
+        self._cache.move_to_end(key)
+        if len(self._cache) > self.max_cache_entries:
+            self._cache.popitem(last=False)
         return result
 
 
