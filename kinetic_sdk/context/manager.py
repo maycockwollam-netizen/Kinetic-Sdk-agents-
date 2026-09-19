@@ -11,9 +11,12 @@ preserved first:
    token count crosses a safety threshold of the model's context limit.
 
 Compaction supports simple middle truncation and optional LLM summarisation,
-both with provenance metadata.  When requested, a per-section budget can
-prioritise oversized tool output, and a structure-aware compressor preserves
-useful paths and failures from verbose tool logs.
+both with provenance metadata.  Optional provider-backed token counters can
+confirm tokenizer-specific counts with a safe local fallback; an optional tail
+budget selects recent tool results by token cost; and progressive summarisation
+retains structured findings across repeated compaction rounds. When requested,
+a per-section budget can prioritise oversized tool output, and a structure-aware
+compressor preserves useful paths and failures from verbose tool logs.
 """
 
 from __future__ import annotations
@@ -165,6 +168,94 @@ def _message_has_tool_content(msg: Message) -> bool:
     return bool(_message_tool_use_ids(msg) or _message_tool_result_ids(msg))
 
 
+@dataclass
+class StructuredSummary:
+    """Additive findings retained across progressive compaction rounds."""
+
+    decisions: list[str] = field(default_factory=list)
+    files_touched: list[str] = field(default_factory=list)
+    errors_encountered: list[str] = field(default_factory=list)
+    open_questions: list[str] = field(default_factory=list)
+
+    _FIELDS = ("decisions", "files_touched", "errors_encountered", "open_questions")
+
+    def merged(self, newer: "StructuredSummary") -> "StructuredSummary":
+        """Return a de-duplicated additive merge, preserving earlier findings."""
+        return StructuredSummary(**{
+            name: list(dict.fromkeys(getattr(self, name) + getattr(newer, name)))
+            for name in self._FIELDS
+        })
+
+    @classmethod
+    def from_value(cls, value: Any) -> "StructuredSummary | None":
+        """Parse metadata/provider JSON defensively; reject malformed values."""
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            return None
+        fields: dict[str, list[str]] = {}
+        for name in cls._FIELDS:
+            items = value.get(name, [])
+            if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+                return None
+            fields[name] = items
+        return cls(**fields)
+
+    def to_prompt(self) -> str:
+        """Render the structure compactly for the next model turn."""
+        labels = {
+            "decisions": "Quyết định",
+            "files_touched": "Tệp đã chạm",
+            "errors_encountered": "Lỗi gặp phải",
+            "open_questions": "Câu hỏi còn mở",
+        }
+        lines = [f"{labels[name]}: " + ("; ".join(getattr(self, name)) or "Không có") for name in self._FIELDS]
+        return "Tóm tắt luỹ tiến:\n" + "\n".join(lines)
+
+
+class ProgressiveSummarizer:
+    """LLM-backed structured summarizer that additively merges prior findings."""
+
+    alias = "kinetic-progressive-summarizer-v1"
+
+    def __init__(self, llm: LLMClient, max_tokens: int = 200) -> None:
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
+        self.llm = llm
+        self.max_tokens = max_tokens
+
+    def summarize(
+        self, elided: list[Message], previous: StructuredSummary | None
+    ) -> StructuredSummary:
+        """Extract new JSON findings and merge them without dropping *previous*."""
+        previous_json = {
+            name: getattr(previous, name) if previous is not None else []
+            for name in StructuredSummary._FIELDS
+        }
+        instructions = (
+            "Trích xuất thông tin mới từ đoạn hội thoại thành JSON hợp lệ, chỉ với "
+            "các mảng chuỗi: decisions, files_touched, errors_encountered, "
+            "open_questions. Không thêm thông tin mới. Không lặp lại tóm tắt cũ."
+        )
+        response = self.llm.chat(
+            messages=[{"role": "user", "content": (
+                "Tóm tắt có cấu trúc trước đó:\n"
+                + json.dumps(previous_json, ensure_ascii=False)
+                + "\nĐoạn hội thoại mới cần hợp nhất:\n"
+                + json.dumps(elided, ensure_ascii=False, default=str)
+            )}],
+            system=instructions,
+            max_tokens=self.max_tokens,
+        )
+        try:
+            parsed = StructuredSummary.from_value(json.loads(response.content or ""))
+        except (TypeError, json.JSONDecodeError):
+            parsed = None
+        if parsed is None:
+            raise ValueError("progressive summarizer returned invalid JSON schema")
+        return (previous or StructuredSummary()).merged(parsed)
+
+
 class ContextSummarizer(Protocol):
     """Summarizes an elided conversation span for context compaction.
 
@@ -314,8 +405,13 @@ class SimpleTruncateContextManager(ContextManager):
         chars_per_token: Heuristic divisor for :func:`estimate_tokens`.
         token_counter: Optional callable ``str -> int`` replacing the
             heuristic entirely (e.g.
-            :class:`~kinetic_sdk.context.tokens.TiktokenCounter`). When set,
-            ``chars_per_token`` is unused.
+            :class:`~kinetic_sdk.context.tokens.ProviderTokenCounter`). When
+            set, ``chars_per_token`` is unused.
+        tail_token_budget: Optional fraction of the most recently supplied
+            context limit reserved for the tool-result tail. When set, it
+            selects newest results by token cost, capped by
+            ``keep_last_tool_results``; ``None`` preserves historical count
+            based behaviour.
 
     Compaction keeps, in order: the first message (normally the original
     user request) and the tail of the conversation starting just before the
@@ -334,6 +430,7 @@ class SimpleTruncateContextManager(ContextManager):
         max_tool_result_chars: int | None = None,
         budget: ContextBudget | None = None,
         tool_output_compressor: ToolOutputCompressor | None = None,
+        tail_token_budget: float | None = None,
     ) -> None:
         if keep_last_tool_results < 0:
             raise ValueError("keep_last_tool_results must be >= 0")
@@ -343,6 +440,8 @@ class SimpleTruncateContextManager(ContextManager):
             raise ValueError("chars_per_token must be >= 1")
         if max_tool_result_chars is not None and max_tool_result_chars < 100:
             raise ValueError("max_tool_result_chars must be >= 100 or None")
+        if tail_token_budget is not None and not 0 < tail_token_budget <= 1:
+            raise ValueError("tail_token_budget must be in (0, 1] or None")
         self.keep_last_tool_results = keep_last_tool_results
         self.safety_threshold = safety_threshold
         self.chars_per_token = chars_per_token
@@ -354,6 +453,7 @@ class SimpleTruncateContextManager(ContextManager):
         self.max_tool_result_chars = max_tool_result_chars
         self.budget = budget
         self.tool_output_compressor = tool_output_compressor
+        self.tail_token_budget = tail_token_budget
         self._budget_context_limit: int | None = None
 
     def _count_tokens(self, text: str) -> int:
@@ -446,7 +546,23 @@ class SimpleTruncateContextManager(ContextManager):
         tool_result_idx = [
             i for i, msg in enumerate(messages) if _message_has_tool_result(msg)
         ]
-        if len(tool_result_idx) >= self.keep_last_tool_results:
+        if self.tail_token_budget is not None and self._budget_context_limit is not None:
+            allowed = self._budget_context_limit * self.tail_token_budget
+            selected: list[int] = []
+            total = 0
+            for index in reversed(tool_result_idx):
+                if len(selected) >= self.keep_last_tool_results:
+                    break
+                cost = self._count_tokens(_stringify_content(messages[index].get("content")))
+                if total + cost > allowed:
+                    break
+                selected.append(index)
+                total += cost
+            if selected:
+                anchor = selected[-1]
+            else:
+                anchor = n - 1
+        elif len(tool_result_idx) >= self.keep_last_tool_results:
             anchor = tool_result_idx[-self.keep_last_tool_results]
         elif tool_result_idx:
             anchor = tool_result_idx[0]
@@ -614,7 +730,7 @@ class SummarizingContextManager(SimpleTruncateContextManager):
         keep_last_tool_results: int = 5,
         safety_threshold: float = 0.8,
         chars_per_token: int = 4,
-        summarizer: ContextSummarizer | None = None,
+        summarizer: ContextSummarizer | ProgressiveSummarizer | None = None,
         summarizer_client: LLMClient | None = None,
         event_bus: EventBus | None = None,
         max_summary_chars: int = 1_000,
@@ -623,6 +739,7 @@ class SummarizingContextManager(SimpleTruncateContextManager):
         max_tool_result_chars: int | None = None,
         budget: ContextBudget | None = None,
         tool_output_compressor: ToolOutputCompressor | None = None,
+        tail_token_budget: float | None = None,
     ) -> None:
         super().__init__(
             keep_last_tool_results=keep_last_tool_results,
@@ -632,6 +749,7 @@ class SummarizingContextManager(SimpleTruncateContextManager):
             max_tool_result_chars=max_tool_result_chars,
             budget=budget,
             tool_output_compressor=tool_output_compressor,
+            tail_token_budget=tail_token_budget,
         )
         if summarizer is not None and summarizer_client is not None:
             raise ValueError("pass either `summarizer` or `summarizer_client`, not both")
@@ -653,13 +771,38 @@ class SummarizingContextManager(SimpleTruncateContextManager):
             "_compaction": {"kind": "summary", "source_message_count": removed},
         }
 
+    def compact(self, state: ConversationState) -> ConversationState:
+        """Compact and persist an optional structured summary in metadata."""
+        self._progressive_previous = StructuredSummary.from_value(
+            state.metadata.get("structured_summary")
+        )
+        self._progressive_result: StructuredSummary | None = None
+        compacted = super().compact(state)
+        if self._progressive_result is not None:
+            metadata = dict(compacted.metadata)
+            metadata["structured_summary"] = self._progressive_result
+            return ConversationState(
+                system_prompt=compacted.system_prompt,
+                messages=compacted.messages,
+                max_messages=compacted.max_messages,
+                metadata=metadata,
+            )
+        return compacted
+
     def _summarize(self, messages: list[Message]) -> str:
         if self.summarizer is None:
             return ""
         # Scrub credentials out of the span before it is sent to another model.
         redacted = [redact_value(dict(m)) for m in messages]
         try:
-            summary = self.summarizer.summarize(redacted)
+            if isinstance(self.summarizer, ProgressiveSummarizer):
+                structured = self.summarizer.summarize(
+                    redacted, getattr(self, "_progressive_previous", None)
+                )
+                self._progressive_result = structured
+                summary = structured.to_prompt()
+            else:
+                summary = self.summarizer.summarize(redacted)
         except Exception as exc:  # noqa: BLE001 - compaction must safely degrade
             logger.warning("Context summarization failed: %s", exc)
             self._emit_failure("exception", messages, exc)

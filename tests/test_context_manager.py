@@ -863,3 +863,102 @@ def test_elided_message_has_truncation_provenance_metadata():
 
     marker = next(message for message in compacted.messages if message.get("_compaction"))
     assert marker["_compaction"] == {"kind": "truncated", "source_message_count": 6}
+
+# --- advanced optional compaction ------------------------------------------
+
+
+def test_provider_token_counter_uses_provider_result_and_caches():
+    from kinetic_sdk.context.tokens import ProviderTokenCounter
+
+    class CountingLLM(MockLLM):
+        def __init__(self):
+            super().__init__([])
+            self.count_calls = 0
+
+        def count_tokens(self, text: str) -> int:
+            self.count_calls += 1
+            return 37
+
+    llm = CountingLLM()
+    counter = ProviderTokenCounter(llm, fallback=lambda _: 1)
+
+    assert counter("same text") == 37
+    assert counter("same text") == 37
+    assert llm.count_calls == 1
+
+
+def test_provider_token_counter_falls_back_when_provider_counting_fails():
+    from kinetic_sdk.context.tokens import ProviderTokenCounter
+
+    class FailingLLM(MockLLM):
+        def count_tokens(self, text: str) -> int:
+            raise RuntimeError("provider rate limited")
+
+    assert ProviderTokenCounter(FailingLLM([]), fallback=lambda text: len(text))("abcd") == 4
+
+
+def test_tail_token_budget_selects_recent_results_by_cost_and_respects_cap():
+    def conversation(result_sizes: list[int]) -> ConversationState:
+        state = ConversationState()
+        state.messages.append(_user("task"))
+        for index, size in enumerate(result_sizes):
+            state.messages.append(
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": f"tail-{index}", "name": "t", "input": {}},
+                ]}
+            )
+            state.messages.append(_tool_result(f"tail-{index}", "x" * size))
+        return state
+
+    # With character counting, the newest short result fits but the preceding
+    # long result exhausts the 300-character tail allowance.
+    constrained = SimpleTruncateContextManager(
+        keep_last_tool_results=3, token_counter=len, tail_token_budget=0.15
+    )
+    constrained_state = conversation([20, 20, 500, 20])
+    constrained.should_compact(constrained_state, model_context_limit=2_000)
+    constrained_result = constrained.compact(constrained_state)
+    constrained_ids = [
+        message["content"][0]["tool_use_id"] for message in constrained_result.messages
+        if isinstance(message["content"], list) and message["content"] and message["content"][0].get("type") == "tool_result"
+    ]
+    assert constrained_ids == ["tail-3"]
+
+    # Small results use the same budget more efficiently, but never exceed the
+    # original count-based maximum.
+    roomy = SimpleTruncateContextManager(
+        keep_last_tool_results=3, token_counter=len, tail_token_budget=0.15
+    )
+    roomy_state = conversation([20, 20, 20, 20])
+    roomy.should_compact(roomy_state, model_context_limit=2_000)
+    roomy_result = roomy.compact(roomy_state)
+    roomy_ids = [
+        message["content"][0]["tool_use_id"] for message in roomy_result.messages
+        if isinstance(message["content"], list) and message["content"] and message["content"][0].get("type") == "tool_result"
+    ]
+    assert roomy_ids == ["tail-1", "tail-2", "tail-3"]
+    assert len(roomy_ids) <= 3
+
+
+def test_progressive_summarizer_merges_structured_summary_across_compactions():
+    from kinetic_sdk.context.manager import ProgressiveSummarizer, StructuredSummary
+
+    first = '{"decisions":["use cache"],"files_touched":["a.py"],"errors_encountered":[],"open_questions":["ship?"]}'
+    second = '{"decisions":["add tests"],"files_touched":["b.py"],"errors_encountered":["timeout"],"open_questions":[]}'
+    progressive = ProgressiveSummarizer(MockLLM([text_response(first), text_response(second)]))
+    manager = SummarizingContextManager(keep_last_tool_results=1, summarizer=progressive)
+
+    once = manager.compact(_long_conversation(turns=4))
+    twice_source = ConversationState(
+        system_prompt=once.system_prompt,
+        messages=[*once.messages, *_long_conversation(turns=3).messages[1:]],
+        metadata=dict(once.metadata),
+    )
+    twice = manager.compact(twice_source)
+
+    summary = twice.metadata["structured_summary"]
+    assert isinstance(summary, StructuredSummary)
+    assert summary.decisions == ["use cache", "add tests"]
+    assert summary.files_touched == ["a.py", "b.py"]
+    assert summary.errors_encountered == ["timeout"]
+    assert summary.open_questions == ["ship?"]
