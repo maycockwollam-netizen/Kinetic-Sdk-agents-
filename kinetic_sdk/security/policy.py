@@ -117,8 +117,19 @@ def _path_matches_prefix(path: str, prefix: str) -> bool:
     """
     norm_path = posixpath.normpath(path)
     norm_prefix = posixpath.normpath(prefix)
+    # ``posixpath.normpath`` deliberately preserves exactly two leading
+    # slashes for POSIX implementation-defined semantics. Policy paths are
+    # logical paths, so canonicalise them to one rooted namespace instead.
+    if norm_path.startswith("//"):
+        norm_path = "/" + norm_path.lstrip("/")
+    if norm_prefix.startswith("//"):
+        norm_prefix = "/" + norm_prefix.lstrip("/")
     if posixpath.isabs(norm_path) != posixpath.isabs(norm_prefix):
         return False
+    if norm_prefix == "/":
+        return posixpath.isabs(norm_path)
+    if norm_prefix == ".":
+        return not norm_path.startswith("..")
     return norm_path == norm_prefix or norm_path.startswith(norm_prefix + "/")
 
 
