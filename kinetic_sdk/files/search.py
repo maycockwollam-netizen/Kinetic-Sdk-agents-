@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 from typing import Any, ClassVar
 
+from kinetic_sdk.files.snapshots import is_internal_snapshot_path
 from kinetic_sdk.tool.base import (
     Tool,
     ToolCapability,
@@ -90,6 +91,8 @@ class _WorkspaceSearchTool(Tool):
         self.workspace = workspace
 
     def _resolve_root(self, path: str) -> Path:
+        if is_internal_snapshot_path(path):
+            raise WorkspaceError("path is reserved for internal snapshot storage")
         resolved = self.workspace.resolve(path)
         root = Path(resolved)
         if not root.exists():
@@ -267,6 +270,7 @@ class GlobTool(_WorkspaceSearchTool):
             limit = self._validate_max_results(max_results, self.DEFAULT_MAX_RESULTS)
             root = self._resolve_root(path)
             candidates = [root] if root.is_file() and root.match(pattern) else list(root.glob(pattern))
+            candidates = [candidate for candidate in candidates if not is_internal_snapshot_path(str(candidate.relative_to(Path(self.workspace.root_path))))]
             matches = sorted(
                 relative for candidate in candidates if candidate.is_file()
                 for relative in [self._safe_relative(candidate)] if relative is not None
