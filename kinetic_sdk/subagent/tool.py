@@ -64,8 +64,8 @@ class DelegateTool(Tool):
         max_consecutive_repeats: Circuit-breaker limit applied to each
             sub-agent this tool spawns.
         llm_factory: Forwarded to
-            :func:`~kinetic_sdk.subagent.delegation.spawn_subagent` for
-            specs whose ``model`` differs from the parent's.
+            :func:`~kinetic_sdk.subagent.delegation.spawn_subagent`. When
+            provided, it builds the child client even for an inherited model.
 
     The tool must be bound to its owning agent (:meth:`bind`) before use;
     :func:`~kinetic_sdk.subagent.delegation.spawn_subagent` clones and
