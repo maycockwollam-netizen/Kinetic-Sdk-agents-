@@ -76,8 +76,11 @@ rewriting the agent loop.
   their tools as Kinetic `Tool`s via stdio/SSE transports) and server
   (expose Kinetic tools to external MCP clients, with the same permission
   policy + audit log as the internal agent loop).
-- `kinetic_sdk/observability/` — structured event loggers and `RunTrace`
-  helpers for summarizing one agent run.
+- `kinetic_sdk/observability/` — structured event loggers, metrics, and
+  `RunTrace` helpers. `OTelObservabilityLogger` remains the stable, simple
+  export of one run span with event annotations; attach `Tracer` separately
+  when a full in-memory run → turn → tool → retry/compaction span tree and
+  per-level durations are needed.
 - `kinetic_sdk/plugin/` — dynamic loading of external Python packages that
   register extra tools: metadata-only discovery (entry points + PLUGIN.md
   directory convention), an AST-based static scanner (a tripwire, NOT a

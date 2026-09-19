@@ -1,4 +1,4 @@
-"""Observability package: structured event logging and per-run tracing."""
+"""Observability package: logs, metrics, flat OTel export, and span trees."""
 
 from kinetic_sdk.observability.logger import (
     ConsoleObservabilityLogger,
@@ -8,6 +8,7 @@ from kinetic_sdk.observability.logger import (
 from kinetic_sdk.observability.metrics import MetricsCollector
 from kinetic_sdk.observability.otel import OTelObservabilityLogger
 from kinetic_sdk.observability.trace import RunTrace
+from kinetic_sdk.observability.tracer import Tracer, TraceSpan
 
 __all__ = [
     "ConsoleObservabilityLogger",
@@ -16,4 +17,6 @@ __all__ = [
     "OTelObservabilityLogger",
     "ObservabilityLogger",
     "RunTrace",
+    "TraceSpan",
+    "Tracer",
 ]
