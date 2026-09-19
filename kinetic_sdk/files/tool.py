@@ -19,6 +19,7 @@ Actions (one ``action`` parameter, mirroring the curated ``GitTool`` design):
 
 from __future__ import annotations
 
+import difflib
 import logging
 from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
@@ -58,6 +59,13 @@ def _normalise_indentation(line: str) -> str:
     while index < len(line) and line[index] in " \t":
         index += 1
     return (" " if index else "") + line[index:]
+
+
+def _preserve_newline_style(value: str, reference: str) -> str:
+    """Use CRLF for inserted text when editing a CRLF file."""
+    if "\r\n" not in reference:
+        return value
+    return value.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
 
 
 def _fuzzy_find_details(content: str, old_str: str) -> tuple[str | None, list[tuple[int, int]]]:
@@ -100,22 +108,87 @@ def _fuzzy_find_details(content: str, old_str: str) -> tuple[str | None, list[tu
         if len(matches) == 1:
             return name, matches
 
-    # An anchored block deliberately ignores the middle: the exact first and
-    # last physical lines identify the block, allowing comments/blank lines to
-    # have changed since the model saw the code.
+    # Anchors are only a recovery mechanism, not permission to replace an
+    # arbitrarily large interval.  A candidate must remain close in length and
+    # retain substantial middle content.
     if len(old_bodies) >= 3:
         matches = []
+        rejected = False
+        allowed_delta = max(2, int(len(old_bodies) * 0.2))
         for first_index, first in enumerate(content_lines):
             if first[0] != old_bodies[0]:
                 continue
             for last_index in range(first_index + 1, len(content_lines)):
                 last = content_lines[last_index]
                 if last[0] == old_bodies[-1]:
+                    candidate_bodies = [line[0] for line in content_lines[first_index : last_index + 1]]
+                    if abs(len(candidate_bodies) - len(old_bodies)) > allowed_delta:
+                        rejected = True
+                        continue
+                    ratio = difflib.SequenceMatcher(
+                        None, "\n".join(old_bodies), "\n".join(candidate_bodies)
+                    ).ratio()
+                    if ratio < 0.6:
+                        rejected = True
+                        continue
                     matches.append((first[1], last[3] if include_final_newline else last[2]))
         if len(matches) == 1:
             return "anchored_block", matches
+        if rejected and not matches:
+            return "anchored_block_rejected", []
         return None, matches
     return None, []
+
+
+def _reindent_fuzzy_replacement(old_str: str, new_str: str, matched: str) -> str | None:
+    """Map replacement indentation onto the indentation used by *matched*.
+
+    Fuzzy indentation matching proves that the model used a different
+    whitespace convention.  Writing its text verbatim would create mixed
+    indentation, so use corresponding matched lines when possible and reject
+    an ambiguous style rather than guessing.
+    """
+    old_lines = old_str.splitlines(keepends=True)
+    new_lines = new_str.splitlines(keepends=True)
+    matched_lines = matched.splitlines(keepends=True)
+    if not new_lines:
+        return new_str
+
+    def indent(line: str) -> str:
+        return line[: len(line) - len(line.lstrip(" \t"))]
+
+    target_indents = [indent(line) for line in matched_lines]
+    if not any(target_indents):
+        return new_str if not any(indent(line) for line in new_lines) else None
+    uses_tabs = any("\t" in value for value in target_indents)
+    if uses_tabs and any(" " in value for value in target_indents if value):
+        return None
+    if len(new_lines) != len(old_lines) or len(matched_lines) != len(old_lines):
+        return None
+
+    result: list[str] = []
+    for old_line, new_line, target_indent in zip(old_lines, new_lines, target_indents):
+        old_indent = indent(old_line)
+        new_indent = indent(new_line)
+        if not new_indent:
+            result.append(new_line)
+            continue
+        if new_indent == old_indent:
+            result.append(target_indent + new_line[len(new_indent) :])
+            continue
+        # A changed relative depth is only safe when the target convention is
+        # unambiguous.  Four spaces is the conventional source indentation.
+        if uses_tabs:
+            depth = len(new_indent.expandtabs(4)) // 4
+            result.append("\t" * depth + new_line[len(new_indent) :])
+        else:
+            widths = [len(value) for value in target_indents if value]
+            width = min(widths) if widths else 0
+            if width <= 0:
+                return None
+            depth = len(new_indent) // 4
+            result.append(" " * (width * depth) + new_line[len(new_indent) :])
+    return "".join(result)
 
 
 def _fuzzy_find(content: str, old_str: str) -> list[tuple[int, int]]:
@@ -382,10 +455,17 @@ class FileTool(Tool):
             )
         if occurrences:
             count = occurrences if replace_all else 1
-            new_content = content.replace(old_str, new_str, count)
+            new_content = content.replace(old_str, _preserve_newline_style(new_str, content), count)
             metadata: dict[str, Any] = {"path": path, "count": count}
         else:
             strategy, matches = _fuzzy_find_details(content, old_str)
+            if strategy == "anchored_block_rejected":
+                return ToolResult(
+                    error=(
+                        "anchored_block fuzzy match rejected because the matched block "
+                        "is too different in size or middle content; use a more exact old_str"
+                    )
+                )
             if not matches:
                 return ToolResult(error="old_str not found in the file")
             if len(matches) > 1:
@@ -403,17 +483,41 @@ class FileTool(Tool):
                     )
                 )
             start, end = matches[0]
-            new_content = content[:start] + new_str + content[end:]
+            replacement = _preserve_newline_style(new_str, content)
+            if strategy == "indentation_normalized":
+                reindented = _reindent_fuzzy_replacement(
+                    old_str, replacement, content[start:end]
+                )
+                if reindented is None:
+                    return ToolResult(
+                        error=(
+                            "indentation_normalized fuzzy match rejected because replacement "
+                            "indentation could not be inferred safely"
+                        )
+                    )
+                replacement = reindented
+            new_content = content[:start] + replacement + content[end:]
             count = 1
-            metadata = {"path": path, "count": count, "match_strategy": strategy}
+            start_line = content.count("\n", 0, start) + 1
+            end_line = content.count("\n", 0, end) + (0 if end > start and content[end - 1 : end] == "\n" else 1)
+            metadata = {
+                "path": path,
+                "count": count,
+                "match_strategy": strategy,
+                "lines": f"{start_line}-{end_line}",
+            }
         self._write_locked(
             path,
             lambda: self._snapshot_and_write(path, content, new_content),
         )
         self._undo[path] = content
-        return ToolResult(
-            output=f"edited {path} ({count} replacement(s))", metadata=metadata
-        )
+        if "match_strategy" in metadata:
+            return ToolResult(
+                output=(f"edited {path} ({count} replacement, "
+                        f"fuzzy={metadata['match_strategy']}, lines {metadata['lines']})"),
+                metadata=metadata,
+            )
+        return ToolResult(output=f"edited {path} ({count} replacement(s))", metadata=metadata)
 
     def _insert(
         self,
@@ -431,8 +535,9 @@ class FileTool(Tool):
         lines = content.splitlines(keepends=True)
         if not 0 <= insert_line <= len(lines):
             return ToolResult(error=f"insert_line {insert_line} out of range 0..{len(lines)}")
+        new_str = _preserve_newline_style(new_str, content)
         new_lines = new_str.splitlines(keepends=True)
-        if new_str and not new_str.endswith("\n"):
+        if new_str and not new_str.endswith(("\n", "\r")):
             new_lines[-1] += "\n"
         lines[insert_line:insert_line] = new_lines
         self._write_locked(
