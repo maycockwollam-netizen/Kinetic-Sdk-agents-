@@ -40,6 +40,12 @@ All notable changes to `kinetic-agent-sdk`. Format loosely follows
 
 ### Fixed
 
+- **Docker run sandbox hardening (breaking default change)** —
+  `docker_run_wrapper` now creates containers with a read-only root
+  filesystem, all Linux capabilities dropped, and `no-new-privileges` by
+  default. Review workflows when upgrading: images that write directly to
+  their container filesystem must disable `read_only` or use an explicitly
+  mounted writable volume.
 - **Workspace execution boundaries** — `LocalWorkspace` now refuses host
   shell execution rather than presenting a `cwd` restriction as a sandbox;
   use Docker, Kubernetes, or a remote platform workspace for command text.
