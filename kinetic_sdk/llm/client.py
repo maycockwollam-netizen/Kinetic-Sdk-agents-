@@ -545,6 +545,22 @@ class LiteLLMClient(LLMClient):
         self._attach_cost(self._litellm, raw, response)
         return response
 
+    def count_tokens(self, text: str) -> int:
+        """Count text locally with LiteLLM's tokenizer, without a network call.
+
+        ``token_counter`` availability varies by LiteLLM version and model
+        registry.  Present a uniform optional-client contract to context
+        management: unsupported tokenizer failures become ``NotImplementedError``
+        so :class:`ProviderTokenCounter` can use its safe fallback.
+        """
+        try:
+            count = self._litellm.token_counter(model=self.model, text=text)
+        except Exception as exc:  # noqa: BLE001 - optional provider capability
+            raise NotImplementedError("LiteLLM token counting is unavailable") from exc
+        if not isinstance(count, int) or count < 0:
+            raise NotImplementedError("LiteLLM returned an invalid token count")
+        return count
+
     @staticmethod
     def _attach_cost(litellm_module: Any, raw: Any, response: LLMResponse) -> None:
         """Best-effort cost lookup via ``litellm.completion_cost``.

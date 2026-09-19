@@ -172,12 +172,13 @@ def _message_has_tool_content(msg: Message) -> bool:
 class StructuredSummary:
     """Additive findings retained across progressive compaction rounds."""
 
+    goal: list[str] = field(default_factory=list)
     decisions: list[str] = field(default_factory=list)
     files_touched: list[str] = field(default_factory=list)
     errors_encountered: list[str] = field(default_factory=list)
     open_questions: list[str] = field(default_factory=list)
 
-    _FIELDS = ("decisions", "files_touched", "errors_encountered", "open_questions")
+    _FIELDS = ("goal", "decisions", "files_touched", "errors_encountered", "open_questions")
 
     def merged(self, newer: "StructuredSummary") -> "StructuredSummary":
         """Return a de-duplicated additive merge, preserving earlier findings."""
@@ -204,6 +205,7 @@ class StructuredSummary:
     def to_prompt(self) -> str:
         """Render the structure compactly for the next model turn."""
         labels = {
+            "goal": "Mục tiêu và yêu cầu gốc",
             "decisions": "Quyết định",
             "files_touched": "Tệp đã chạm",
             "errors_encountered": "Lỗi gặp phải",
@@ -212,48 +214,121 @@ class StructuredSummary:
         lines = [f"{labels[name]}: " + ("; ".join(getattr(self, name)) or "Không có") for name in self._FIELDS]
         return "Tóm tắt luỹ tiến:\n" + "\n".join(lines)
 
+    def limited(self, max_chars: int, max_items_per_field: int) -> "StructuredSummary":
+        """Keep recent complete findings within the structured-summary budget.
+
+        Findings are never sliced: when a budget is exceeded, the oldest
+        complete item of a field is removed.  This prevents the newest error
+        or question from disappearing at the end of a character-truncated
+        prompt.
+        """
+        values = {
+            name: list(getattr(self, name)[-max_items_per_field:])
+            for name in self._FIELDS
+        }
+        result = StructuredSummary(**values)
+        while len(result.to_prompt()) > max_chars:
+            candidates = [name for name in self._FIELDS if values[name]]
+            if not candidates:
+                break
+            # Remove the oldest item from the most verbose eligible field.
+            name = max(candidates, key=lambda field_name: len(values[field_name]))
+            values[name].pop(0)
+            result = StructuredSummary(**values)
+        return result
+
 
 class ProgressiveSummarizer:
     """LLM-backed structured summarizer that additively merges prior findings."""
 
     alias = "kinetic-progressive-summarizer-v1"
 
-    def __init__(self, llm: LLMClient, max_tokens: int = 200) -> None:
+    MESSAGE_CONTENT_LIMIT = 2_000
+
+    def __init__(self, llm: LLMClient, max_tokens: int = 800, max_input_chars: int = 60_000) -> None:
         if max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
+        if max_input_chars < 1:
+            raise ValueError("max_input_chars must be >= 1")
         self.llm = llm
         self.max_tokens = max_tokens
+        self.max_input_chars = max_input_chars
 
     def summarize(
         self, elided: list[Message], previous: StructuredSummary | None
     ) -> StructuredSummary:
         """Extract new JSON findings and merge them without dropping *previous*."""
-        previous_json = {
-            name: getattr(previous, name) if previous is not None else []
-            for name in StructuredSummary._FIELDS
-        }
         instructions = (
             "Trích xuất thông tin mới từ đoạn hội thoại thành JSON hợp lệ, chỉ với "
-            "các mảng chuỗi: decisions, files_touched, errors_encountered, "
-            "open_questions. Không thêm thông tin mới. Không lặp lại tóm tắt cũ."
+            "các mảng chuỗi: goal, decisions, files_touched, errors_encountered, "
+            "open_questions. goal phải giữ nguyên văn mục tiêu/yêu cầu gốc của người dùng. "
+            "Không thêm thông tin mới. Không lặp lại tóm tắt cũ."
         )
-        response = self.llm.chat(
-            messages=[{"role": "user", "content": (
+        accumulated = previous or StructuredSummary()
+        for batch in self._batches(elided):
+            previous_json = {name: getattr(accumulated, name) for name in StructuredSummary._FIELDS}
+            body = (
                 "Tóm tắt có cấu trúc trước đó:\n"
                 + json.dumps(previous_json, ensure_ascii=False)
                 + "\nĐoạn hội thoại mới cần hợp nhất:\n"
-                + json.dumps(elided, ensure_ascii=False, default=str)
-            )}],
-            system=instructions,
-            max_tokens=self.max_tokens,
-        )
+                + json.dumps(batch, ensure_ascii=False, default=str)
+            )
+            response = self.llm.chat(
+                messages=[{"role": "user", "content": body}],
+                system=instructions,
+                max_tokens=self.max_tokens,
+            )
+            parsed = self._parse_response(response.content)
+            if parsed is None:
+                raise ValueError("progressive summarizer returned invalid JSON schema")
+            accumulated = accumulated.merged(parsed)
+        return accumulated
+
+    def _batches(self, messages: list[Message]) -> list[list[Message]]:
+        """Bound each message and divide consecutive messages into safe calls."""
+        bounded = [self._bounded_message(message) for message in messages]
+        # Reserve room for the accumulated JSON and fixed prompt labels.  A
+        # deliberately conservative 20k payload cap also leaves a generous
+        # completion/context margin for small summarizer models, rather than
+        # trying to fill their entire advertised context window.
+        batch_limit = max(1, min(self.max_input_chars - 8_000, 20_000))
+        batches: list[list[Message]] = []
+        batch: list[Message] = []
+        size = 0
+        for message in bounded:
+            message_size = len(json.dumps(message, ensure_ascii=False, default=str))
+            if batch and size + message_size > batch_limit:
+                batches.append(batch)
+                batch, size = [], 0
+            batch.append(message)
+            size += message_size
+        if batch:
+            batches.append(batch)
+        return batches
+
+    @classmethod
+    def _bounded_message(cls, message: Message) -> Message:
+        result = dict(message)
+        content = _stringify_content(message.get("content"))
+        if len(content) > cls.MESSAGE_CONTENT_LIMIT:
+            content = _head_tail(content, cls.MESSAGE_CONTENT_LIMIT)
+        result["content"] = content
+        return result
+
+    @staticmethod
+    def _parse_response(content: Any) -> StructuredSummary | None:
+        if not isinstance(content, str):
+            return None
+        # Providers commonly wrap otherwise valid JSON in markdown/prose.
+        clean = re.sub(r"```(?:json)?\s*|```", "", content, flags=re.IGNORECASE).strip()
+        start = clean.find("{")
+        if start < 0:
+            return None
         try:
-            parsed = StructuredSummary.from_value(json.loads(response.content or ""))
-        except (TypeError, json.JSONDecodeError):
-            parsed = None
-        if parsed is None:
-            raise ValueError("progressive summarizer returned invalid JSON schema")
-        return (previous or StructuredSummary()).merged(parsed)
+            value, _ = json.JSONDecoder().raw_decode(clean[start:])
+        except json.JSONDecodeError:
+            return None
+        return StructuredSummary.from_value(value)
 
 
 class ContextSummarizer(Protocol):
@@ -734,6 +809,8 @@ class SummarizingContextManager(SimpleTruncateContextManager):
         summarizer_client: LLMClient | None = None,
         event_bus: EventBus | None = None,
         max_summary_chars: int = 1_000,
+        max_structured_chars: int = 4_000,
+        max_items_per_field: int = 30,
         summary_max_tokens: int = 150,
         token_counter: Callable[[str], int] | None = None,
         max_tool_result_chars: int | None = None,
@@ -757,9 +834,15 @@ class SummarizingContextManager(SimpleTruncateContextManager):
             summarizer = LLMContextSummarizer(summarizer_client, max_tokens=summary_max_tokens)
         if max_summary_chars < 1:
             raise ValueError("max_summary_chars must be >= 1")
+        if max_structured_chars < 1:
+            raise ValueError("max_structured_chars must be >= 1")
+        if max_items_per_field < 1:
+            raise ValueError("max_items_per_field must be >= 1")
         self.summarizer = summarizer
         self.event_bus = event_bus
         self.max_summary_chars = max_summary_chars
+        self.max_structured_chars = max_structured_chars
+        self.max_items_per_field = max_items_per_field
 
     def _elided_message(self, elided: list[Message], removed: int) -> Message:
         summary = self._summarize(elided)
@@ -799,8 +882,10 @@ class SummarizingContextManager(SimpleTruncateContextManager):
                 structured = self.summarizer.summarize(
                     redacted, getattr(self, "_progressive_previous", None)
                 )
-                self._progressive_result = structured
-                summary = structured.to_prompt()
+                self._progressive_result = structured.limited(
+                    self.max_structured_chars, self.max_items_per_field
+                )
+                summary = self._progressive_result.to_prompt()
             else:
                 summary = self.summarizer.summarize(redacted)
         except Exception as exc:  # noqa: BLE001 - compaction must safely degrade
@@ -810,11 +895,12 @@ class SummarizingContextManager(SimpleTruncateContextManager):
         if not isinstance(summary, str):
             self._emit_failure("non_string_summary", messages, None)
             return ""
-        summary = " ".join(summary.split())
+        if not isinstance(self.summarizer, ProgressiveSummarizer):
+            summary = " ".join(summary.split())
         if not summary:
             self._emit_failure("empty_summary", messages, None)
             return ""
-        if len(summary) > self.max_summary_chars:
+        if not isinstance(self.summarizer, ProgressiveSummarizer) and len(summary) > self.max_summary_chars:
             summary = summary[: self.max_summary_chars].rstrip() + "…"
         return summary
 
