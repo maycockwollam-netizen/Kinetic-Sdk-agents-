@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+import fnmatch
+import logging
+import os
 import re
 import subprocess
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from kinetic_sdk.git import GitRunner
 from kinetic_sdk.workspace.base import WorkspaceBase, WorkspaceError
+
+try:  # ``fcntl`` is unavailable on Windows, where the in-process lock remains.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None  # type: ignore[assignment]
 
 
 class SnapshotStoreError(RuntimeError):
@@ -25,8 +36,12 @@ class SnapshotEntry:
 
 
 SNAPSHOT_DIRECTORY = ".kinetic/snapshots"
-_IGNORE_ENTRY = "/.kinetic/snapshots/"
+DEFAULT_EXCLUDE_GLOBS = (".env", ".env.*", "*.pem", "*.key", "id_rsa*", "*.p12", "credentials*", "secrets*")
 _SNAPSHOT_ID = re.compile(r"^[0-9a-f]{7,64}$")
+_LOG = logging.getLogger(__name__)
+_LOCKS_GUARD = threading.Lock()
+_REPOSITORY_LOCKS: dict[str, threading.RLock] = {}
+_EXCLUSION_WARNED: set[tuple[str, str]] = set()
 
 
 def is_internal_snapshot_path(path: str) -> bool:
@@ -35,15 +50,21 @@ def is_internal_snapshot_path(path: str) -> bool:
 
 
 class GitSnapshotStore:
-    """Not ``GitTool``: a private sidecar git store, never the user's repository.
+    """Private, isolated git storage for pre-edit workspace file contents.
 
-    The repository lives at ``<workspace>/.kinetic/snapshots`` and is created
-    lazily. It is an entirely separate repository, used solely as durable
-    storage for pre-edit file contents; it never runs git in, commits to, or
-    otherwise modifies the user's real repository, branches, or worktree.
+    The sidecar repository deliberately ignores both user git configuration and
+    hooks.  It is also hidden from the user's repository by a nested
+    ``.kinetic/.gitignore``, rather than by modifying the user's ``.gitignore``.
     """
 
-    def __init__(self, workspace: WorkspaceBase, runner: GitRunner | None = None) -> None:
+    def __init__(
+        self,
+        workspace: WorkspaceBase,
+        runner: GitRunner | None = None,
+        *,
+        exclude_globs: tuple[str, ...] = DEFAULT_EXCLUDE_GLOBS,
+        strict: bool = True,
+    ) -> None:
         self._workspace = workspace
         try:
             root = Path(workspace.resolve("."))
@@ -52,21 +73,38 @@ class GitSnapshotStore:
         self._root = root
         self._repo_dir = root / SNAPSHOT_DIRECTORY
         self._runner: GitRunner = runner if runner is not None else self._default_git_runner
+        self._exclude_globs = tuple(exclude_globs)
+        self._strict = strict
+        self._lock = self._lock_for_repo(self._repo_dir)
 
     def snapshot(self, path: str, content: str) -> str:
-        """Commit *content* as a durable version of workspace-relative *path*."""
+        """Commit *content* as a durable version of workspace-relative *path*.
+
+        Excluded paths return an empty id without ever writing their content.
+        In non-strict mode git failures are fail-open so a file edit can proceed.
+        """
         relative = self._validate_path(path)
-        self._ensure_repo()
-        target = self._repo_dir / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
-        self._run(["add", "--", relative.as_posix()])
-        self._run([
-            "-c", "user.name=Kinetic Snapshot Store",
-            "-c", "user.email=snapshots@kinetic.invalid",
-            "commit", "--quiet", "-m", f"Snapshot {relative.as_posix()}", "--", relative.as_posix(),
-        ])
-        return self._run(["rev-parse", "HEAD"]).stdout.strip()
+        if self._is_excluded(relative):
+            self._warn_excluded_once(relative)
+            return ""
+        with self._snapshot_lock():
+            try:
+                self._ensure_repo()
+                target = self._repo_dir / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+                self._run(["add", "--", relative.as_posix()])
+                self._run([
+                    "-c", "user.name=Kinetic Snapshot Store",
+                    "-c", "user.email=snapshots@kinetic.invalid",
+                    "commit", "--no-verify", "--quiet", "-m", f"Snapshot {relative.as_posix()}", "--", relative.as_posix(),
+                ])
+                return self._run(["rev-parse", "HEAD"]).stdout.strip()
+            except SnapshotStoreError:
+                if self._strict:
+                    raise
+                _LOG.warning("snapshot failed for %s; continuing because strict=False", relative)
+                return ""
 
     def restore(self, path: str, snapshot_id: str) -> str:
         """Read *path* at *snapshot_id* without changing the workspace file."""
@@ -92,23 +130,53 @@ class GitSnapshotStore:
                 entries.append(SnapshotEntry(snapshot_id, relative.as_posix(), int(timestamp)))
         return entries
 
+    @staticmethod
+    def _lock_for_repo(repo_dir: Path) -> threading.RLock:
+        key = os.path.realpath(repo_dir)
+        with _LOCKS_GUARD:
+            return _REPOSITORY_LOCKS.setdefault(key, threading.RLock())
+
+    @contextmanager
+    def _snapshot_lock(self) -> Iterator[None]:
+        """Serialize snapshots across threads and, where supported, processes."""
+        with self._lock:
+            lock_path = self._repo_dir.parent / "snapshots.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+") as lock_file:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def _ensure_repo(self) -> None:
         if (self._repo_dir / ".git").is_dir():
             return
         self._repo_dir.mkdir(parents=True, exist_ok=True)
+        # A nested ignore file hides the whole sidecar directory without
+        # changing the user's repository or its .gitignore.
+        ignore_file = self._repo_dir.parent / ".gitignore"
+        if not ignore_file.exists():
+            ignore_file.write_text("*\n")
         self._run(["init", "--quiet"])
-        ignore_file = self._root / ".gitignore"
-        if ignore_file.exists():
-            existing = ignore_file.read_text()
-            if _IGNORE_ENTRY not in existing.splitlines():
-                with ignore_file.open("a") as handle:
-                    if existing and not existing.endswith("\n"):
-                        handle.write("\n")
-                    handle.write(f"{_IGNORE_ENTRY}\n")
 
     def _ensure_exists(self) -> None:
         if not (self._repo_dir / ".git").is_dir():
             raise SnapshotStoreError("snapshot history not enabled for this workspace")
+
+    def _is_excluded(self, relative: Path) -> bool:
+        value = relative.as_posix()
+        return any(fnmatch.fnmatch(value, glob) or fnmatch.fnmatch(relative.name, glob) for glob in self._exclude_globs)
+
+    def _warn_excluded_once(self, relative: Path) -> None:
+        key = (os.path.realpath(self._repo_dir), relative.as_posix())
+        with _LOCKS_GUARD:
+            if key in _EXCLUSION_WARNED:
+                return
+            _EXCLUSION_WARNED.add(key)
+        _LOG.warning("not snapshotting excluded path %s", relative)
 
     def _validate_path(self, path: str) -> Path:
         if not isinstance(path, str) or not path:
@@ -121,10 +189,9 @@ class GitSnapshotStore:
         except WorkspaceError as exc:
             raise ValueError(f"path is not available in this workspace: {path!r}") from exc
         try:
-            relative = resolved.relative_to(self._root)
+            return resolved.relative_to(self._root)
         except ValueError as exc:
             raise ValueError("path resolves outside the workspace") from exc
-        return relative
 
     @staticmethod
     def _validate_snapshot_id(snapshot_id: str) -> None:
@@ -133,11 +200,22 @@ class GitSnapshotStore:
 
     @staticmethod
     def _default_git_runner(argv: list[str], cwd: str, timeout: float) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+        env = os.environ.copy()
+        # Git has several environment forms for injecting configuration and
+        # repository paths (including GIT_CONFIG_COUNT/KEY/VALUE).  Discard all
+        # of them before applying the sidecar's explicitly safe configuration.
+        for name in tuple(env):
+            if name.startswith("GIT_"):
+                env.pop(name)
+        env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
 
     def _run(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        isolated_args = [
+            "git", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args,
+        ]
         try:
-            completed = self._runner(["git", *args], str(self._repo_dir), 30.0)
+            completed = self._runner(isolated_args, str(self._repo_dir), 30.0)
         except FileNotFoundError as exc:
             raise SnapshotStoreError("git executable not found on PATH") from exc
         except subprocess.TimeoutExpired as exc:
