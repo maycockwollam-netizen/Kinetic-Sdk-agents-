@@ -40,6 +40,10 @@ All notable changes to `kinetic-agent-sdk`. Format loosely follows
 
 ### Fixed
 
+- **Docker run wrapper hardening** — read-only containers now receive a
+  writable `/tmp` tmpfs by default (pass `tmpfs=[]` to opt out), and unsafe
+  host mounts including Docker sockets, `/`, and sensitive system directories
+  are rejected unless explicitly opted in with `allow_unsafe_mounts=True`.
 - **Docker run sandbox hardening (breaking default change)** —
   `docker_run_wrapper` now creates containers with a read-only root
   filesystem, all Linux capabilities dropped, and `no-new-privileges` by

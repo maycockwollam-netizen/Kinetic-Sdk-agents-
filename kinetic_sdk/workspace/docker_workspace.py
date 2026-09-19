@@ -44,6 +44,10 @@ class DockerWorkspace(WorkspaceBase):
         env: Optional environment passthrough for ``run`` mode.
         network: Network mode for ``run`` mode (defaults to ``"none"``, same
             as :func:`~kinetic_sdk.terminal.docker.docker_run_wrapper`).
+        tmpfs: Optional tmpfs mount specifications for ``run`` mode; omitted
+            values use the wrapper's writable ``/tmp`` default.
+        allow_unsafe_mounts: Whether ``run`` mode may mount sensitive host
+            paths. Defaults to ``False``.
     """
 
     def __init__(
@@ -57,6 +61,8 @@ class DockerWorkspace(WorkspaceBase):
         volumes: list[str] | None = None,
         env: dict[str, str] | None = None,
         network: str | None = "none",
+        tmpfs: list[str] | None = None,
+        allow_unsafe_mounts: bool = False,
     ) -> None:
         if mode not in ("exec", "run"):
             raise ValueError(f"mode must be 'exec' or 'run', got {mode!r}")
@@ -70,7 +76,13 @@ class DockerWorkspace(WorkspaceBase):
             if not image:
                 raise ValueError("mode='run' requires an image name")
             self._wrapper = docker_run_wrapper(
-                image, workdir=workdir, volumes=volumes, env=env, network=network
+                image,
+                workdir=workdir,
+                volumes=volumes,
+                env=env,
+                network=network,
+                tmpfs=tmpfs,
+                allow_unsafe_mounts=allow_unsafe_mounts,
             )
 
     @property
