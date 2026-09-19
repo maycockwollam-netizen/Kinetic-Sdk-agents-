@@ -87,6 +87,12 @@ class ReplayRecorder:
         self.store.save(self._run)
 
     def _new_run(self, run_id: str) -> ReplayRun:
+        # A short-lived recorder (notably CheckpointManager) must append to an
+        # existing timeline instead of replacing it just because it is a new
+        # Python object.
+        existing = self.store.load()
+        if existing is not None and existing.run_id == run_id:
+            return existing
         return ReplayRun(
             run_id=run_id,
             parent_run_id=self.parent_run_id,

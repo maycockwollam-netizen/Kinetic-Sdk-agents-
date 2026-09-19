@@ -274,3 +274,30 @@ def test_deterministic_tools_require_protected_raw_snapshots():
     replay = ReplayRun("run", [_raw_snapshot(0, [{"role": "user", "content": "[REDACTED]"}])])
     with pytest.raises(DeterministicReplayError, match="capture_raw_snapshots"):
         DeterministicToolReplay.from_replay(replay)
+
+
+def test_checkpoint_resume_keeps_run_id_state_and_records_resume_event(tmp_path):
+    from kinetic_sdk.replay import CheckpointManager
+
+    manager = CheckpointManager(JsonFileReplayStore(tmp_path / "checkpoint.json"))
+    agent = Agent(
+        MockLLMClient([text_response("first")]),
+        permission_policy=PermissivePolicy(),
+    )
+    assert agent.run("remember this") == "first"
+    checkpoint_id = manager.save(agent)
+
+    resumed = manager.resume(
+        checkpoint_id,
+        MockLLMClient([text_response("continued")]),
+        [],
+        permission_policy=PermissivePolicy(),
+    )
+
+    assert resumed.run_id == checkpoint_id
+    assert resumed.state.messages == agent.state.messages
+    assert resumed.run() == "continued"
+    assert resumed.run_id == checkpoint_id
+    replay = manager._store.load()
+    assert replay is not None
+    assert "replay.resumed" in [step.event_type for step in replay.steps]

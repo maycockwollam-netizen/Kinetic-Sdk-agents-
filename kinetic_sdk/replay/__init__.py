@@ -1,5 +1,11 @@
 """Durable, step-by-step playback for debugging agent runs."""
 
+from kinetic_sdk.replay.checkpoint import (
+    CheckpointError,
+    CheckpointManager,
+    PendingConfirmationError,
+    resume_from_confirmation,
+)
 from kinetic_sdk.replay.debugger import ReplayDebugger
 from kinetic_sdk.replay.deterministic import (
     DeterministicReplayError,
@@ -26,6 +32,8 @@ from kinetic_sdk.replay.store import (
 
 __all__ = [
     "REPLAY_SCHEMA_VERSION",
+    "CheckpointError",
+    "CheckpointManager",
     "JsonFileReplayStore",
     "DeterministicReplayError",
     "DeterministicToolReplay",
@@ -42,5 +50,7 @@ __all__ = [
     "ReplayStore",
     "ReplayStoreError",
     "ReplayTool",
+    "PendingConfirmationError",
     "TimelineEntry",
+    "resume_from_confirmation",
 ]

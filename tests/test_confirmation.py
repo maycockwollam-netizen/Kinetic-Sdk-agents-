@@ -144,3 +144,105 @@ def test_raising_hook_falls_back_to_safe_denial():
     assert len(denied) == 1
     assert len(bus_errors) == 1
     assert bus_errors[0].payload["point"] == "on_permission_check"
+
+
+def test_declining_hook_does_not_create_checkpoint(tmp_path):
+    from kinetic_sdk.replay import CheckpointManager, JsonFileReplayStore
+
+    registry = HookRegistry()
+    registry.register(
+        HookPoint.ON_PERMISSION_CHECK, lambda ctx: HookResult(should_continue=False)
+    )
+    store = JsonFileReplayStore(tmp_path / "checkpoint.json")
+    agent, spy, denied = _make_agent(hooks=registry)
+    agent.checkpoint_manager = CheckpointManager(store)
+
+    assert agent.run("go") == "end"
+    assert spy.executions == 0
+    assert len(denied) == 1
+    assert store.load() is None
+
+
+def test_unresolved_confirmation_creates_checkpoint_and_can_be_approved(tmp_path):
+    import pytest
+
+    from kinetic_sdk.replay import (
+        CheckpointManager,
+        JsonFileReplayStore,
+        PendingConfirmationError,
+        resume_from_confirmation,
+    )
+
+    store = JsonFileReplayStore(tmp_path / "checkpoint.json")
+    manager = CheckpointManager(store)
+    agent, spy, _denied = _make_agent(hooks=None)
+    agent.checkpoint_manager = manager
+
+    with pytest.raises(PendingConfirmationError) as pending:
+        agent.run("go")
+
+    assert spy.executions == 0
+    checkpoint_id = pending.value.checkpoint_id
+    replay = store.load()
+    assert replay is not None
+    assert replay.run_id == checkpoint_id
+    assert "replay.snapshot" in [step.event_type for step in replay.steps]
+
+    resumed_spy = SpyTool()
+    assert resume_from_confirmation(
+        checkpoint_id,
+        True,
+        checkpoint_manager=manager,
+        llm=MockLLM([text_response("end")]),
+        tools=[resumed_spy],
+    ) == "end"
+    assert resumed_spy.executions == 1
+    replay = store.load()
+    assert replay is not None
+    assert [step.event_type for step in replay.steps].count("replay.resumed") == 1
+
+
+def test_observer_only_confirmation_hook_becomes_pending_checkpoint(tmp_path):
+    import pytest
+
+    from kinetic_sdk.replay import (
+        CheckpointManager,
+        JsonFileReplayStore,
+        PendingConfirmationError,
+    )
+
+    registry = HookRegistry()
+    registry.register(HookPoint.ON_PERMISSION_CHECK, lambda ctx: None)
+    agent, spy, _denied = _make_agent(hooks=registry)
+    agent.checkpoint_manager = CheckpointManager(JsonFileReplayStore(tmp_path / "checkpoint.json"))
+
+    with pytest.raises(PendingConfirmationError):
+        agent.run("go")
+    assert spy.executions == 0
+
+
+def test_unresolved_confirmation_can_be_declined_without_executing_tool(tmp_path):
+    import pytest
+
+    from kinetic_sdk.replay import (
+        CheckpointManager,
+        JsonFileReplayStore,
+        PendingConfirmationError,
+        resume_from_confirmation,
+    )
+
+    manager = CheckpointManager(JsonFileReplayStore(tmp_path / "checkpoint.json"))
+    agent, _spy, _denied = _make_agent(hooks=None)
+    agent.checkpoint_manager = manager
+    with pytest.raises(PendingConfirmationError) as pending:
+        agent.run("go")
+
+    resumed_spy = SpyTool()
+    assert resume_from_confirmation(
+        pending.value.checkpoint_id,
+        False,
+        checkpoint_manager=manager,
+        llm=MockLLM([text_response("end")]),
+        tools=[resumed_spy],
+    ) == "end"
+    assert resumed_spy.executions == 0
