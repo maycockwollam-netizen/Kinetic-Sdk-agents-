@@ -298,6 +298,36 @@ def test_docker_run_wrapper_defaults_offline():
     argv = docker_run_wrapper("python:3.12")
     assert argv[:4] == ["docker", "run", "--rm", "-i"]
     assert "--network" in argv and "none" in argv
+    assert "--read-only" in argv
+    assert "--cap-drop=ALL" in argv
+    assert "--security-opt=no-new-privileges:true" in argv
+
+
+def test_docker_run_wrapper_can_disable_read_only_filesystem():
+    argv = docker_run_wrapper("python:3.12", read_only=False)
+    assert "--read-only" not in argv
+
+
+def test_docker_run_wrapper_includes_opt_in_resource_and_user_limits():
+    argv = docker_run_wrapper(
+        "python:3.12",
+        memory_limit="512m",
+        cpu_limit=1.0,
+        pids_limit=256,
+        user="1000:1000",
+    )
+    assert ["--memory", "512m"] == argv[argv.index("--memory") : argv.index("--memory") + 2]
+    assert ["--cpus", "1.0"] == argv[argv.index("--cpus") : argv.index("--cpus") + 2]
+    assert ["--pids-limit", "256"] == argv[argv.index("--pids-limit") : argv.index("--pids-limit") + 2]
+    assert ["--user", "1000:1000"] == argv[argv.index("--user") : argv.index("--user") + 2]
+
+
+def test_docker_run_wrapper_omits_unconfigured_resource_and_user_limits():
+    argv = docker_run_wrapper("python:3.12")
+    assert "--memory" not in argv
+    assert "--cpus" not in argv
+    assert "--pids-limit" not in argv
+    assert "--user" not in argv
 
 
 def test_docker_run_wrapper_volumes_and_env():
