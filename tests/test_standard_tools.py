@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from kinetic_sdk.files import FileTool
+from kinetic_sdk.files import FileTool, GlobTool, GrepTool
 from kinetic_sdk.terminal import TerminalTool
 from kinetic_sdk.workspace.manager import Workspace
 
@@ -120,6 +120,21 @@ def test_file_view_range(workspace, tmp_path):
     assert "line6" not in result.output
 
 
+def test_file_view_truncation_explains_how_to_continue(workspace, tmp_path):
+    (tmp_path / "long.txt").write_text("\n".join(f"line{i}" for i in range(1, 13)))
+    result = FileTool(workspace, max_view_lines=10).execute(action="view", path="long.txt")
+    assert result.metadata["truncated"] is True
+    assert "còn 2 dòng nữa" in result.output
+    assert "view_range=[11, 12]" in result.output
+
+
+def test_file_view_cuts_overlong_physical_line(workspace, tmp_path):
+    (tmp_path / "minified.txt").write_text("x" * 600)
+    result = FileTool(workspace).execute(action="view", path="minified.txt")
+    assert "...(cut)" in result.output
+    assert len(result.output) < 550
+
+
 def test_file_view_directory(workspace, tmp_path):
     (tmp_path / "sub").mkdir()
     (tmp_path / "f.txt").write_text("x")
@@ -229,3 +244,49 @@ def test_file_unknown_action(workspace):
 def test_file_view_missing_file(workspace):
     result = FileTool(workspace).execute(action="view", path="ghost.txt")
     assert result.is_error and "no such file" in result.error
+
+
+# --- GrepTool / GlobTool ------------------------------------------------------
+
+
+def test_grep_finds_matching_lines_and_honors_max_results(workspace, tmp_path):
+    (tmp_path / "a.py").write_text("first needle\nsecond needle\n")
+    result = GrepTool(workspace).execute(pattern="needle", glob="*.py", max_results=1)
+    assert not result.is_error
+    assert result.output == "a.py:1:first needle"
+    assert result.metadata["count"] == 1
+
+
+def test_grep_fallback_works_without_ripgrep(workspace, tmp_path, monkeypatch):
+    (tmp_path / "notes.txt").write_text("Alpha\nbeta\n")
+    monkeypatch.setattr("kinetic_sdk.files.search.shutil.which", lambda _: None)
+    result = GrepTool(workspace).execute(pattern="alpha", case_sensitive=False)
+    assert not result.is_error
+    assert result.output == "notes.txt:1:Alpha"
+
+
+def test_grep_rejects_path_traversal(workspace):
+    result = GrepTool(workspace).execute(pattern="secret", path="../")
+    assert result.is_error
+    assert "outside the workspace" in result.error
+
+
+def test_grep_cuts_overlong_matching_line(workspace, tmp_path, monkeypatch):
+    (tmp_path / "log.txt").write_text("match " + "x" * 600)
+    monkeypatch.setattr("kinetic_sdk.files.search.shutil.which", lambda _: None)
+    result = GrepTool(workspace).execute(pattern="match")
+    assert "...(cut)" in result.output
+    assert len(result.output) < 530
+
+
+def test_glob_finds_python_files_and_excludes_symlink_escape(workspace, tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("pass\n")
+    outside = tmp_path.parent / "outside.py"
+    outside.write_text("secret\n")
+    (tmp_path / "escaped.py").symlink_to(outside)
+
+    result = GlobTool(workspace).execute(pattern="**/*.py")
+    assert not result.is_error
+    assert result.output == "src/main.py"
+    outside.unlink()

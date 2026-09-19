@@ -83,6 +83,7 @@ class FileTool(Tool):
     }
 
     DEFAULT_MAX_VIEW_LINES: ClassVar[int] = 2_000
+    MAX_VIEW_LINE_CHARS: ClassVar[int] = 500
 
     def __init__(
         self,
@@ -194,14 +195,27 @@ class FileTool(Tool):
             sliced = sliced[: self.max_view_lines]
             truncated = True
         numbered = "\n".join(
-            f"{i}\t{line}" for i, line in enumerate(sliced, start=start)
+            f"{i}\t{self._truncate_view_line(line)}"
+            for i, line in enumerate(sliced, start=start)
         )
         if truncated:
-            numbered += f"\n[... còn {end - start + 1 - self.max_view_lines} dòng nữa, bị cắt bớt ...]"
+            remaining = len(lines[start - 1 : end]) - len(sliced)
+            next_start = start + len(sliced)
+            numbered += (
+                f"\n[... còn {remaining} dòng nữa; dùng "
+                f"view_range=[{next_start}, {end}] để xem tiếp ...]"
+            )
         return ToolResult(
             output=numbered,
             metadata={"total_lines": len(lines), "truncated": truncated},
         )
+
+    @classmethod
+    def _truncate_view_line(cls, line: str) -> str:
+        """Cap one physical line so a minified/log line cannot flood context."""
+        if len(line) <= cls.MAX_VIEW_LINE_CHARS:
+            return line
+        return line[: cls.MAX_VIEW_LINE_CHARS] + "...(cut)"
 
     def _view_directory(self, path: str) -> ToolResult:
         """View one portable workspace directory level."""

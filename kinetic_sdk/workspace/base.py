@@ -75,6 +75,19 @@ class WorkspaceBase(ABC):
         remote path) — used for display/logging, not necessarily a path on
         the machine Python is running on."""
 
+    def resolve(self, relative_path: str) -> str:
+        """Resolve a local path while enforcing the workspace boundary.
+
+        Search tools that need host filesystem traversal require this
+        capability explicitly.  Remote and container workspaces deliberately
+        do not expose their internal paths to the SDK process, so the default
+        fails closed instead of encouraging a tool to bypass the backend.
+        """
+        del relative_path
+        raise WorkspaceError(
+            "workspace does not support local path resolution required by this operation"
+        )
+
     @abstractmethod
     def run_command(
         self, command: str, *, timeout: float | None = None, cwd: str | None = None
