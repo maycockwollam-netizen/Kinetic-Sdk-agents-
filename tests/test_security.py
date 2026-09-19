@@ -135,6 +135,27 @@ def test_rule_policy_matches_path_and_domain_from_url_or_domain():
     assert policy.check("browser", {"url": "https://evil.example.net"}).allowed is False
 
 
+def test_rule_policy_path_prefix_matches_complete_path_segments_only():
+    policy = RuleBasedPolicy(
+        [
+            PolicyRule(
+                tool_name="file_write",
+                path_prefix="/etc",
+                decision=PermissionDecision(False, "system path denied"),
+            ),
+            PolicyRule(
+                tool_name="file_write",
+                decision=PermissionDecision(True, "other paths allowed"),
+            ),
+        ]
+    )
+
+    assert policy.check("file_write", {"path": "/etcetera/x.txt"}).allowed is True
+    assert policy.check("file_write", {"path": "/etc/passwd"}).allowed is False
+    assert policy.check("file_write", {"path": "/etc"}).allowed is False
+    assert policy.check("file_write", {"path": "etc/passwd"}).allowed is True
+
+
 def test_rule_policy_missing_inputs_and_bad_regex_never_crash():
     policy = RuleBasedPolicy(
         [

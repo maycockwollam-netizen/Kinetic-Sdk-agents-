@@ -10,6 +10,7 @@ tools (terminal, filesystem, git, ...) are wired in.
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
@@ -58,6 +59,11 @@ class PolicyRule:
     use the small cross-tool vocabulary ``path``, ``url``/``domain`` and
     ``command``.  A missing or non-string value simply makes its selector not
     match; policies must never make an otherwise safe tool call crash.
+
+    ``path_prefix`` is matched on path segments after POSIX normalisation, not
+    as a raw string prefix.  For example, ``/etc`` matches ``/etc/passwd``
+    but not ``/etcetera/notes.txt``.  Paths and prefixes must both be absolute
+    or both be relative to match.
     """
 
     tool_name: str | None = None
@@ -102,6 +108,20 @@ def _matches_pattern(pattern: str, text: str) -> bool:
         return pattern in text
 
 
+def _path_matches_prefix(path: str, prefix: str) -> bool:
+    """Return whether *path* is *prefix* itself or is inside it by segment.
+
+    This treats paths as platform-independent logical POSIX paths.  Absolute
+    and relative paths never match each other, preventing an ambiguous rule
+    from granting access to a differently rooted path.
+    """
+    norm_path = posixpath.normpath(path)
+    norm_prefix = posixpath.normpath(prefix)
+    if posixpath.isabs(norm_path) != posixpath.isabs(norm_prefix):
+        return False
+    return norm_path == norm_prefix or norm_path.startswith(norm_prefix + "/")
+
+
 def _input_domain(tool_input: dict[str, Any]) -> str | None:
     """Return a normalised domain from the policy's supported input keys."""
     domain = tool_input.get("domain")
@@ -142,7 +162,9 @@ class RuleBasedPolicy(PermissionPolicy):
                 continue
             if rule.path_prefix is not None:
                 path = tool_input.get("path")
-                if not isinstance(path, str) or not path.startswith(rule.path_prefix):
+                if not isinstance(path, str) or not _path_matches_prefix(
+                    path, rule.path_prefix
+                ):
                     continue
             if rule.domain_pattern is not None:
                 domain = _input_domain(tool_input)
