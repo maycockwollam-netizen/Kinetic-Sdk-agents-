@@ -10,7 +10,8 @@ Actions (one ``action`` parameter, mirroring the curated ``GitTool`` design):
 * ``view`` — cat -n a file (optional ``view_range``), or list a directory one
   level deep.
 * ``create`` — write a new file; refuses to overwrite an existing one.
-* ``str_replace`` — replace a string that must match EXACTLY once.
+* ``str_replace`` — replace a uniquely matched string, with a conservative
+  whitespace/anchored-block fallback; exact matches may be replaced all at once.
 * ``insert`` — insert text after a given 1-based line number.
 * ``undo_edit`` — revert the last create/str_replace/insert on a path
   (single-level, in-memory backup; gone when the process exits).
@@ -32,6 +33,96 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 logger = logging.getLogger(__name__)
 
 
+def _line_contents_and_spans(text: str) -> list[tuple[str, int, int, int]]:
+    """Return physical-line text plus its start, body-end, and full-end offsets."""
+    result: list[tuple[str, int, int, int]] = []
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        body_end = offset + len(body)
+        result.append((body, offset, body_end, offset + len(line)))
+        offset += len(line)
+    # ``splitlines`` intentionally has no item for an empty string.  This is
+    # useful here: fuzzy matching an empty replacement target is unsafe.
+    return result
+
+
+def _normalise_indentation(line: str) -> str:
+    """Represent every non-empty leading space/tab run by one indentation unit."""
+    index = 0
+    while index < len(line) and line[index] in " \t":
+        index += 1
+    return (" " if index else "") + line[index:]
+
+
+def _fuzzy_find_details(content: str, old_str: str) -> tuple[str | None, list[tuple[int, int]]]:
+    """Find one conservative non-exact match and report its strategy.
+
+    Strategies become progressively looser.  A strategy only wins when it
+    produces exactly one candidate; otherwise the next strategy is tried.
+    """
+    content_lines = _line_contents_and_spans(content)
+    old_lines = _line_contents_and_spans(old_str)
+    if not content_lines or not old_lines:
+        return None, []
+
+    old_bodies = [line[0] for line in old_lines]
+    include_final_newline = old_str.endswith(("\n", "\r"))
+
+    def contiguous_matches(transform: Callable[[str], str]) -> list[tuple[int, int]]:
+        if len(old_bodies) > len(content_lines):
+            return []
+        wanted = [transform(line) for line in old_bodies]
+        matches: list[tuple[int, int]] = []
+        for start_index in range(len(content_lines) - len(wanted) + 1):
+            candidate = [
+                transform(line[0])
+                for line in content_lines[start_index : start_index + len(wanted)]
+            ]
+            if candidate == wanted:
+                last = content_lines[start_index + len(wanted) - 1]
+                matches.append((content_lines[start_index][1], last[3] if include_final_newline else last[2]))
+        return matches
+
+    strategies: tuple[tuple[str, Callable[[str], str]], ...] = (
+        # Keep tabs intact at this stage: tab-vs-space indentation belongs to
+        # the next, explicitly reported indentation-normalisation strategy.
+        ("line_whitespace_trimmed", lambda line: line.strip(" ")),
+        ("indentation_normalized", _normalise_indentation),
+    )
+    for name, transform in strategies:
+        matches = contiguous_matches(transform)
+        if len(matches) == 1:
+            return name, matches
+
+    # An anchored block deliberately ignores the middle: the exact first and
+    # last physical lines identify the block, allowing comments/blank lines to
+    # have changed since the model saw the code.
+    if len(old_bodies) >= 3:
+        matches = []
+        for first_index, first in enumerate(content_lines):
+            if first[0] != old_bodies[0]:
+                continue
+            for last_index in range(first_index + 1, len(content_lines)):
+                last = content_lines[last_index]
+                if last[0] == old_bodies[-1]:
+                    matches.append((first[1], last[3] if include_final_newline else last[2]))
+        if len(matches) == 1:
+            return "anchored_block", matches
+        return None, matches
+    return None, []
+
+
+def _fuzzy_find(content: str, old_str: str) -> list[tuple[int, int]]:
+    """Return conservative fuzzy-match spans, or no/ambiguous spans.
+
+    Exact matching remains the responsibility of :meth:`FileTool._str_replace`
+    and is always attempted first.
+    """
+    _, matches = _fuzzy_find_details(content, old_str)
+    return matches
+
+
 class FileTool(Tool):
     """Workspace-scoped file editor with undo support.
 
@@ -51,8 +142,9 @@ class FileTool(Tool):
     name: str = "file_editor"
     description: str = (
         "View and edit text files inside the workspace. Actions: view (with "
-        "optional view_range), create, str_replace (unique match), insert "
-        "after a line, undo_edit. Paths are workspace-relative."
+        "optional view_range), create, str_replace (exact match preferred; "
+        "conservative fuzzy fallback; optional replace_all for exact matches), "
+        "insert after a line, undo_edit. Paths are workspace-relative."
     )
     parameters: dict[str, Any] = {
         "type": "object",
@@ -67,8 +159,21 @@ class FileTool(Tool):
                 "description": "Workspace-relative path of the file (or directory for view).",
             },
             "file_text": {"type": "string", "description": "Content for create."},
-            "old_str": {"type": "string", "description": "Text to replace (str_replace)."},
+            "old_str": {
+                "type": "string",
+                "description": (
+                    "Text to replace (str_replace). Exact matching is preferred; "
+                    "a unique whitespace/indentation/anchored-block fallback may apply."
+                ),
+            },
             "new_str": {"type": "string", "description": "Replacement / inserted text."},
+            "replace_all": {
+                "type": "boolean",
+                "description": (
+                    "Replace every exact old_str match (str_replace only). Defaults "
+                    "to false and cannot be combined with fuzzy matching."
+                ),
+            },
             "insert_line": {
                 "type": "integer",
                 "description": "1-based line number to insert after (insert).",
@@ -243,6 +348,8 @@ class FileTool(Tool):
         path: str,
         old_str: str | None = None,
         new_str: str | None = None,
+        *,
+        replace_all: bool = False,
         **_: Any,
     ) -> ToolResult:
         if old_str is None or new_str is None:
@@ -252,18 +359,44 @@ class FileTool(Tool):
         except FileNotFoundError:
             return ToolResult(error=f"no such file: {path}")
         occurrences = content.count(old_str)
-        if occurrences == 0:
-            return ToolResult(error="old_str not found in the file")
-        if occurrences > 1:
+        if occurrences > 1 and not replace_all:
             return ToolResult(
-                error=f"old_str matches {occurrences} times; it must match exactly once"
+                error=(
+                    f"old_str matches {occurrences} times; pass replace_all=True to "
+                    "replace all of them, or narrow old_str to match exactly once"
+                )
             )
-        self._write_locked(
-            path,
-            lambda: self.workspace.write_text(path, content.replace(old_str, new_str, 1)),
-        )
+        if occurrences:
+            count = occurrences if replace_all else 1
+            new_content = content.replace(old_str, new_str, count)
+            metadata: dict[str, Any] = {"path": path, "count": count}
+        else:
+            strategy, matches = _fuzzy_find_details(content, old_str)
+            if not matches:
+                return ToolResult(error="old_str not found in the file")
+            if len(matches) > 1:
+                return ToolResult(
+                    error=(
+                        f"old_str fuzzy-matches {len(matches)} times; it must match "
+                        "exactly once"
+                    )
+                )
+            if replace_all:
+                return ToolResult(
+                    error=(
+                        "replace_all=True only supports exact matches; narrow old_str "
+                        "or disable replace_all to use fuzzy matching"
+                    )
+                )
+            start, end = matches[0]
+            new_content = content[:start] + new_str + content[end:]
+            count = 1
+            metadata = {"path": path, "count": count, "match_strategy": strategy}
+        self._write_locked(path, lambda: self.workspace.write_text(path, new_content))
         self._undo[path] = content
-        return ToolResult(output=f"edited {path}", metadata={"path": path})
+        return ToolResult(
+            output=f"edited {path} ({count} replacement(s))", metadata=metadata
+        )
 
     def _insert(
         self,

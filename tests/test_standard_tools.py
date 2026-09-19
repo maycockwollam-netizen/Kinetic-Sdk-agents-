@@ -177,6 +177,74 @@ def test_file_str_replace_unique_match(workspace, tmp_path):
     assert missing.is_error and "not found" in missing.error
 
 
+def test_file_str_replace_fuzzy_normalises_indentation(workspace, tmp_path):
+    (tmp_path / "a.py").write_text("def run():\n    return value\n")
+    result = FileTool(workspace).execute(
+        action="str_replace",
+        path="a.py",
+        old_str="def run():\n\treturn value",
+        new_str="def run():\n    return replacement",
+    )
+    assert not result.is_error
+    assert result.metadata["match_strategy"] == "indentation_normalized"
+    assert (tmp_path / "a.py").read_text() == "def run():\n    return replacement\n"
+
+
+def test_file_str_replace_fuzzy_anchored_block_allows_changed_middle(workspace, tmp_path):
+    (tmp_path / "a.py").write_text("start()\n# actual comment\nvalue = 1\nfinish()\n")
+    result = FileTool(workspace).execute(
+        action="str_replace",
+        path="a.py",
+        old_str="start()\nvalue = 1\nfinish()",
+        new_str="start()\nvalue = 2\nfinish()",
+    )
+    assert not result.is_error
+    assert result.metadata["match_strategy"] == "anchored_block"
+    assert (tmp_path / "a.py").read_text() == "start()\nvalue = 2\nfinish()\n"
+
+
+def test_file_str_replace_fuzzy_unrelated_text_does_not_edit(workspace, tmp_path):
+    path = tmp_path / "a.txt"
+    path.write_text("known content\n")
+    result = FileTool(workspace).execute(
+        action="str_replace", path="a.txt", old_str="entirely unrelated", new_str="x"
+    )
+    assert result.is_error and result.error == "old_str not found in the file"
+    assert path.read_text() == "known content\n"
+
+
+def test_file_str_replace_default_rejects_multiple_exact_matches(workspace, tmp_path):
+    (tmp_path / "a.txt").write_text("foo foo")
+    result = FileTool(workspace).execute(
+        action="str_replace", path="a.txt", old_str="foo", new_str="bar"
+    )
+    assert result.is_error
+    assert "pass replace_all=True" in result.error
+
+
+def test_file_str_replace_replace_all_replaces_exact_matches(workspace, tmp_path):
+    (tmp_path / "a.txt").write_text("foo foo foo")
+    result = FileTool(workspace).execute(
+        action="str_replace", path="a.txt", old_str="foo", new_str="bar", replace_all=True
+    )
+    assert not result.is_error
+    assert result.metadata["count"] == 3
+    assert (tmp_path / "a.txt").read_text() == "bar bar bar"
+
+
+def test_file_str_replace_replace_all_rejects_fuzzy_match(workspace, tmp_path):
+    (tmp_path / "a.py").write_text("def run():\n    return value\n")
+    result = FileTool(workspace).execute(
+        action="str_replace",
+        path="a.py",
+        old_str="def run():\n\treturn value",
+        new_str="x",
+        replace_all=True,
+    )
+    assert result.is_error
+    assert "only supports exact matches" in result.error
+
+
 def test_file_insert(workspace, tmp_path):
     (tmp_path / "a.txt").write_text("one\nthree\n")
     tool = FileTool(workspace)
