@@ -32,7 +32,7 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, Literal
 
 from kinetic_sdk.agent.budget import RunBudget, RunBudgetExceeded
 from kinetic_sdk.agent.classifier import DefaultClassifier, TaskClassifier
@@ -60,6 +60,7 @@ from kinetic_sdk.llm.client import LLMClient, LLMResponse, ToolCall
 from kinetic_sdk.llm.usage import UsageAccumulator
 from kinetic_sdk.memory.provider import MemoryProvider, MemorySource, MemoryTier
 from kinetic_sdk.observability.logger import ObservabilityLogger
+from kinetic_sdk.replay.checkpoint import PendingConfirmationError
 from kinetic_sdk.replay.recorder import ReplayRecorder
 from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
 from kinetic_sdk.security.policy import (
@@ -72,6 +73,9 @@ from kinetic_sdk.tool.base import Tool, ToolFailureCategory, ToolResult, ToolRis
 from kinetic_sdk.tool.validation import validate_tool_input
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from kinetic_sdk.replay.checkpoint import CheckpointManager
 
 
 def _utcnow() -> datetime:
@@ -149,6 +153,11 @@ class Agent:
             policy flags a call ``requires_confirmation=True``, the agent
             asks the ``ON_PERMISSION_CHECK`` hooks instead of denying
             outright — see :meth:`_execute_one`.
+        checkpoint_manager: Optional replay-backed manager for durable human
+            confirmation. When a confirmation has no synchronous decision,
+            the agent saves a checkpoint and raises
+            ``PendingConfirmationError`` instead of feeding a hard denial to
+            the model. Omit it to preserve the historical immediate denial.
         stuck_detector: Optional sliding-window guard for repeated tool calls.
             It stops a run early only when the same call has produced the
             same result repeatedly, emitting ``agent.stuck_detected`` then
@@ -216,6 +225,7 @@ class Agent:
         tool_timeout: float | None = None,
         state_store: ConversationStore | None = None,
         replay_recorder: ReplayRecorder | None = None,
+        checkpoint_manager: CheckpointManager | None = None,
         validate_tool_inputs: bool = True,
         parallel_tool_execution: bool = False,
         memory: MemoryProvider | None = None,
@@ -250,6 +260,10 @@ class Agent:
         self.replay_recorder = replay_recorder
         if replay_recorder is not None:
             replay_recorder.attach(self.event_bus)
+        #: Optional replay-backed recovery point for asynchronous human
+        #: confirmation. Without it the historical synchronous denial stays
+        #: exactly intact.
+        self.checkpoint_manager = checkpoint_manager
         self.classifier: TaskClassifier = classifier if classifier is not None else DefaultClassifier()
         self.context_manager: ContextManager = (
             context_manager if context_manager is not None else SimpleTruncateContextManager()
@@ -313,6 +327,9 @@ class Agent:
         #: UUID of the in-flight (or most recent) :meth:`run`; ``None`` before
         #: the first run. Every event emitted during a run carries it.
         self._run_id: str | None = None
+        self._resuming_checkpoint: bool = False
+        self._pending_confirmation: tuple[ToolCall, dict[str, Any], PermissionDecision] | None = None
+        self._pending_remaining_calls: list[ToolCall] = []
         # User override of the iteration cap. ``None`` => let routing pick per
         # mode. Stored separately so an escalation can re-derive the MAX cap.
         self._max_iterations_override: int | None = max_iterations
@@ -449,7 +466,10 @@ class Agent:
             the next LLM call, emits ``agent.budget_exceeded`` and returns a
             final text starting with ``"Run stopped: budget exceeded"``.
         """
+        resuming = self._resuming_checkpoint and user_message is None
         self.structured_output = None
+        if resuming and self._pending_confirmation is not None:
+            raise RuntimeError("Resolve the pending confirmation before continuing this checkpoint")
         if user_message is not None and self.memory is not None:
             self._recall_memory(user_message)
         composed = user_message
@@ -458,28 +478,29 @@ class Agent:
         if composed is not None:
             self.state.add_user_message(composed)
 
-        self._cancel_event.clear()  # a new run starts un-cancelled
-        self._stop_reason = None
-        self._run_id = str(uuid.uuid4())
-        self._trigger_hooks(
-            HookPoint.BEFORE_RUN,
-            HookContext(
-                point=HookPoint.BEFORE_RUN, run_id=self._run_id, user_message=user_message
-            ),
-        )
-        self._classify_and_route(user_message)
-        self.plan = self._create_plan(user_message)
-        if self.plan is not None:
-            # A plan is appended to the system prompt outside state.messages;
-            # retain it as budget-only metadata for ContextBudget reporting.
-            self.state.metadata["plan"] = self.plan.to_prompt()
-        else:
-            self.state.metadata.pop("plan", None)
+        if not resuming:
+            self._cancel_event.clear()  # a new run starts un-cancelled
+            self._stop_reason = None
+            self._run_id = str(uuid.uuid4())
+            self._trigger_hooks(
+                HookPoint.BEFORE_RUN,
+                HookContext(
+                    point=HookPoint.BEFORE_RUN, run_id=self._run_id, user_message=user_message
+                ),
+            )
+            self._classify_and_route(user_message)
+            self.plan = self._create_plan(user_message)
+            if self.plan is not None:
+                # A plan is appended to the system prompt outside state.messages;
+                # retain it as budget-only metadata for ContextBudget reporting.
+                self.state.metadata["plan"] = self.plan.to_prompt()
+            else:
+                self.state.metadata.pop("plan", None)
 
-        self._emit(
-            "agent.run_started",
-            {"mode": self.mode.value, "tools": list(self._tools), "max_iterations": self.max_iterations},
-        )
+            self._emit(
+                "agent.run_started",
+                {"mode": self.mode.value, "tools": list(self._tools), "max_iterations": self.max_iterations},
+            )
 
         final_text = ""
         try:
@@ -488,6 +509,9 @@ class Agent:
                 output_schema=output_schema,
                 structured_retries=structured_retries,
             )
+        except PendingConfirmationError:
+            # This is an intentional durable pause, not an agent failure.
+            raise
         except Exception as exc:
             self._trigger_hooks(
                 HookPoint.ON_ERROR,
@@ -502,6 +526,7 @@ class Agent:
                 self._clear_working_memory()
             raise
 
+        self._resuming_checkpoint = False
         self._trigger_hooks(
             HookPoint.AFTER_RUN,
             HookContext(
@@ -1078,14 +1103,18 @@ class Agent:
         if self.parallel_tool_execution and len(calls) > 1:
             return self._execute_tool_calls_parallel(calls)
         any_error = False
-        for call in calls:
+        for index, call in enumerate(calls):
             if self._cancel_event.is_set():
                 result = ToolResult(error="skipped: run cancelled")
                 self.state.add_tool_result(call.id, self._tool_output_for_state(call, result), is_error=True)
                 any_error = True
                 continue
             self._emit("agent.tool_call_started", {"name": call.name, "id": call.id})
-            result = self._execute_one(call)
+            try:
+                result = self._execute_one(call)
+            except PendingConfirmationError:
+                self._pending_remaining_calls = calls[index + 1 :]
+                raise
             any_error = any_error or result.is_error
             self._emit_tool_call_finished(call, result)
             self.state.add_tool_result(call.id, self._tool_output_for_state(call, result), is_error=result.is_error)
@@ -1319,9 +1348,12 @@ class Agent:
         self.audit_logger.log_tool_call(call.name, arguments, decision, _utcnow())
         if not decision.allowed:
             return None, arguments, self._deny_call(call, decision.reason, arguments)
-        if decision.requires_confirmation and not self._confirmed_by_hooks(
-            call, arguments, decision
-        ):
+        confirmation = self._confirmation_status(call, arguments, decision)
+        if decision.requires_confirmation and confirmation == "no_hook" and self.checkpoint_manager is not None:
+            self._pending_confirmation = (call, dict(arguments), decision)
+            checkpoint_id = self.checkpoint_manager.save(self)
+            raise PendingConfirmationError(call, arguments, decision, checkpoint_id)
+        if decision.requires_confirmation and confirmation != "approved":
             return None, arguments, self._deny_call(
                 call,
                 "requires manual confirmation, not yet supported in automated "
@@ -1473,18 +1505,19 @@ class Agent:
             return []
         return self.hooks.trigger(point, context)
 
-    def _confirmed_by_hooks(
+    def _confirmation_status(
         self, call: ToolCall, arguments: dict[str, Any], decision: PermissionDecision
-    ) -> bool:
+    ) -> Literal["approved", "denied", "no_hook"]:
         """Ask ``ON_PERMISSION_CHECK`` hooks to confirm a flagged tool call.
 
-        Returns ``True`` when at least one hook explicitly allows the call
-        (``should_continue=True``). No hooks configured, none registered at
-        this point, or all declining (``False``/``None``) means *not*
-        confirmed — the safe default.
+        Distinguishes an explicit decline from a UI that did not decide.  The
+        latter can safely become a durable pending checkpoint; the former
+        must retain the immediate-denial behaviour.
         """
         if self.hooks is None:
-            return False
+            return "no_hook"
+        if not self.hooks.hooks_for(HookPoint.ON_PERMISSION_CHECK):
+            return "no_hook"
         results = self._trigger_hooks(
             HookPoint.ON_PERMISSION_CHECK,
             HookContext(
@@ -1495,7 +1528,82 @@ class Agent:
                 permission_decision=decision,
             ),
         )
-        return any(r.should_continue for r in results)
+        if any(r.should_continue for r in results):
+            return "approved"
+        if any(not r.should_continue for r in results):
+            return "denied"
+        return "no_hook"
+
+    def _checkpoint_runtime_state(self) -> dict[str, Any]:
+        """Return JSON-compatible runtime fields absent from ConversationState."""
+        pending = self._pending_confirmation
+        return {
+            "mode": self.mode.value,
+            "sticky_max": self._sticky_max,
+            "max_iterations": self.max_iterations,
+            "max_iterations_override": self._max_iterations_override,
+            "enable_extended_reasoning": self.enable_extended_reasoning,
+            "pending_confirmation": None if pending is None else {
+                "call": {"id": pending[0].id, "name": pending[0].name, "arguments": pending[0].arguments},
+                "arguments": pending[1],
+                "decision": {"allowed": pending[2].allowed, "reason": pending[2].reason, "requires_confirmation": pending[2].requires_confirmation},
+            },
+            "pending_remaining_calls": [
+                {"id": call.id, "name": call.name, "arguments": call.arguments}
+                for call in self._pending_remaining_calls
+            ],
+        }
+
+    def _restore_checkpoint_runtime_state(self, run_id: str, runtime: dict[str, Any]) -> None:
+        """Restore a checkpoint without classifying again or allocating a new id."""
+        try:
+            self.mode = AgentMode(runtime["mode"])
+            self._sticky_max = bool(runtime["sticky_max"])
+            self.max_iterations = int(runtime["max_iterations"])
+            override = runtime.get("max_iterations_override")
+            self._max_iterations_override = override if isinstance(override, int) else None
+            self.enable_extended_reasoning = bool(runtime["enable_extended_reasoning"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid checkpoint runtime state: {exc}") from exc
+        pending = runtime.get("pending_confirmation")
+        if isinstance(pending, dict):
+            call_data, args_data, decision_data = pending.get("call"), pending.get("arguments"), pending.get("decision")
+            if not isinstance(call_data, dict) or not isinstance(args_data, dict) or not isinstance(decision_data, dict):
+                raise ValueError("Invalid pending confirmation checkpoint data")
+            self._pending_confirmation = (
+                ToolCall(str(call_data["id"]), str(call_data["name"]), dict(call_data["arguments"])),
+                dict(args_data),
+                PermissionDecision(**decision_data),
+            )
+        remaining = runtime.get("pending_remaining_calls", [])
+        if not isinstance(remaining, list):
+            raise ValueError("Invalid pending remaining calls checkpoint data")
+        self._pending_remaining_calls = [ToolCall(str(item["id"]), str(item["name"]), dict(item["arguments"])) for item in remaining if isinstance(item, dict)]
+        self._run_id = run_id
+        self._resuming_checkpoint = True
+
+    def _resolve_pending_confirmation(self, approved: bool) -> None:
+        """Apply a human verdict to the saved call before the next LLM turn."""
+        if self._pending_confirmation is None:
+            raise ValueError("Checkpoint has no pending confirmation")
+        call, arguments, _decision = self._pending_confirmation
+        self._pending_confirmation = None
+        tool = self._tools.get(call.name)
+        if approved and tool is not None:
+            result = self._run_tool(tool, arguments)
+            result = self._retry_transient_tool(call, tool, arguments, result)
+            self._finalize_call(call, arguments, result)
+        elif approved:
+            result = ToolResult(error=f"Unknown tool: {call.name}")
+        else:
+            result = self._deny_call(call, "confirmation declined by user", arguments)
+        self._emit_tool_call_finished(call, result)
+        self.state.add_tool_result(call.id, self._tool_output_for_state(call, result), is_error=result.is_error)
+        remaining = self._pending_remaining_calls
+        self._pending_remaining_calls = []
+        if remaining:
+            self._execute_tool_calls(remaining)
+        self._persist_state()
 
     def _deny_call(
         self, call: ToolCall, reason: str, tool_input: dict[str, Any] | None = None
