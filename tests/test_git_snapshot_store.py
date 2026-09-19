@@ -5,12 +5,15 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from kinetic_sdk.files import (
     FileHistoryTool,
     FileTool,
     GitSnapshotStore,
     GlobTool,
     GrepTool,
+    SnapshotStoreError,
 )
 from kinetic_sdk.workspace import LocalWorkspace
 
@@ -31,18 +34,32 @@ def test_snapshot_history_restores_each_durable_version(tmp_path: Path):
 
 def test_sidecar_is_private_ignored_and_in_a_different_git_repository(tmp_path: Path):
     git(tmp_path, "init", "--quiet")
-    (tmp_path / ".gitignore").write_text("*.pyc\n")
+    user_ignore = tmp_path / ".gitignore"
+    user_ignore.write_text("*.pyc\n")
+    before_ignore = user_ignore.read_bytes()
     workspace = LocalWorkspace(tmp_path)
     store = GitSnapshotStore(workspace)
     store.snapshot("a.txt", "before")
 
     assert (tmp_path / ".kinetic" / "snapshots" / ".git").is_dir()
     assert (tmp_path / ".kinetic" / "snapshots" / ".git") != tmp_path / ".git"
-    assert "/.kinetic/snapshots/" in (tmp_path / ".gitignore").read_text().splitlines()
+    assert (tmp_path / ".kinetic" / ".gitignore").read_text() == "*\n"
+    assert user_ignore.read_bytes() == before_ignore
     assert ".kinetic" not in GlobTool(workspace).execute(pattern="**/*").output
     assert "before" not in GrepTool(workspace).execute(pattern="before").output
     assert ".kinetic" not in FileTool(workspace).execute(action="view", path=".").output
     assert ".kinetic" not in git(tmp_path, "status", "--short").stdout
+
+
+def test_sidecar_does_not_create_or_modify_user_gitignore(tmp_path: Path):
+    git(tmp_path, "init", "--quiet")
+    store = GitSnapshotStore(LocalWorkspace(tmp_path))
+
+    store.snapshot("a.txt", "before")
+    store.snapshot("a.txt", "after")
+
+    assert not (tmp_path / ".gitignore").exists()
+    assert ".kinetic" not in git(tmp_path, "status", "--porcelain").stdout
 
 
 def test_file_tool_snapshots_pre_edit_content_and_history_tool_restores(tmp_path: Path):
@@ -70,3 +87,17 @@ def test_snapshot_history_is_strictly_opt_in(tmp_path: Path):
     assert not result.is_error
     assert not (tmp_path / ".kinetic").exists()
     assert FileHistoryTool(workspace).execute(action="list", path="a.txt").error == "snapshot history not enabled for this workspace"
+
+
+def test_snapshot_rejects_path_traversal_and_invalid_snapshot_ids(tmp_path: Path):
+    store = GitSnapshotStore(LocalWorkspace(tmp_path))
+    snapshot = store.snapshot("a.txt", "before")
+
+    with pytest.raises(ValueError):
+        store.snapshot("../secret", "no")
+    with pytest.raises(ValueError):
+        store.snapshot(".kinetic/private", "no")
+    with pytest.raises(ValueError):
+        store.restore("a.txt", "not-a-commit")
+    with pytest.raises(SnapshotStoreError):
+        store.restore("missing.txt", snapshot)
