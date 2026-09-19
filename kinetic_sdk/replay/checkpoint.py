@@ -136,10 +136,11 @@ def resume_from_confirmation(
     checkpoint_manager: CheckpointManager,
     llm: "LLMClient",
     tools: list["Tool"],
+    **agent_kwargs: Any,
 ) -> str:
     """Resolve a pending confirmation then continue its original run."""
     agent = checkpoint_manager.resume(
-        checkpoint_id, llm, tools, checkpoint_manager=checkpoint_manager
+        checkpoint_id, llm, tools, checkpoint_manager=checkpoint_manager, **agent_kwargs
     )
     agent._resolve_pending_confirmation(approved)
     return agent.run()
@@ -148,10 +149,11 @@ def resume_from_confirmation(
 async def resume_async_from_confirmation(
     checkpoint_id: str, approved: bool, *, checkpoint_manager: CheckpointManager,
     llm: "AsyncLLMClient", tools: list["Tool"],
+    **agent_kwargs: Any,
 ) -> str:
     """Resolve an async confirmation checkpoint and continue its original run."""
     agent = checkpoint_manager.resume_async(
-        checkpoint_id, llm, tools, checkpoint_manager=checkpoint_manager
+        checkpoint_id, llm, tools, checkpoint_manager=checkpoint_manager, **agent_kwargs
     )
     await agent._resolve_pending_confirmation(approved)
     return await agent.run()
