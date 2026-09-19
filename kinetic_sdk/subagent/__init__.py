@@ -92,6 +92,11 @@ from kinetic_sdk.subagent.manifest import (
     SubagentSpec,
     load_subagent_spec,
 )
+from kinetic_sdk.subagent.pool import (
+    SubagentPool,
+    SubagentResultMerger,
+    spawn_subagent_pool,
+)
 from kinetic_sdk.subagent.tool import DELEGATE_TOOL_NAME, DelegateTool
 
 __all__ = [
@@ -115,6 +120,8 @@ __all__ = [
     "RepetitionLimitError",
     "SpawnBudget",
     "SubagentError",
+    "SubagentPool",
+    "SubagentResultMerger",
     "SubagentSpec",
     "SubagentSpecError",
     "load_subagent_spec",
@@ -126,4 +133,5 @@ __all__ = [
     "run_subagent",
     "spawn_async_subagent",
     "spawn_subagent",
+    "spawn_subagent_pool",
 ]
