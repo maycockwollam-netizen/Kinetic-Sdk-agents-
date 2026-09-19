@@ -211,6 +211,7 @@ def spawn_subagent(
     *,
     max_consecutive_repeats: int = DEFAULT_MAX_CONSECUTIVE_REPEATS,
     llm_factory: LLMFactory | None = None,
+    _base_llm_override: LLMClient | None = None,
 ) -> Agent:
     """Build the sub-agent for *spec* (does NOT run it — see ``run_subagent``).
 
@@ -226,33 +227,40 @@ def spawn_subagent(
             sub-agent spawns in turn) — never copied.
         max_consecutive_repeats: Per-agent circuit-breaker limit for the new
             sub-agent (its OWN breaker, not shared with the parent).
-        llm_factory: Required only when ``spec.model`` names a model other
-            than the parent's; called with the model string to build the
-            sub-agent's client. Without it, a mismatched ``spec.model``
-            raises :class:`SubagentError` rather than silently running on
-            the parent's model.
+        llm_factory: When supplied, called with ``spec.model`` (or the
+            parent's model when it is omitted) to build this sub-agent's
+            client. This lets concurrent callers create one client per
+            worker even when every worker inherits the same model. Without
+            it, a mismatched ``spec.model`` raises :class:`SubagentError`
+            rather than silently running on the parent's model.
 
     Every spawn is audit-logged (``subagent_spawn``) on the parent's
     (shared) audit logger — including spawns whose run later gets blocked
     by the budget or breaker, which are paired with a ``subagent_finished``
     entry naming the outcome.
     """
-    base_llm = parent_agent.llm
+    base_llm = _base_llm_override if _base_llm_override is not None else parent_agent.llm
     if isinstance(base_llm, _GuardedLLMClient):
         # Never stack guards: when a sub-agent spawns its own sub-agent, the
         # parent's client is already guarded — wrapping it again would charge
         # every call twice and would feed the child's calls into the parent's
         # circuit breaker (breakers must stay strictly per-agent).
         base_llm = base_llm.inner
-    if spec.model is not None and spec.model != getattr(base_llm, "model", None):
+    requested_model = spec.model or getattr(base_llm, "model", None)
+    if llm_factory is not None:
+        if requested_model is None:
+            raise SubagentError(
+                f"Sub-agent {spec.name!r} cannot use llm_factory because the "
+                "parent client has no model name"
+            )
+        base_llm = llm_factory(requested_model)
+    elif spec.model is not None and spec.model != getattr(base_llm, "model", None):
         if llm_factory is None:
             raise SubagentError(
                 f"Sub-agent {spec.name!r} requests model {spec.model!r}, which "
                 "differs from the parent's model; pass llm_factory to build a "
                 "client for it (or leave spec.model=None to inherit)"
             )
-        base_llm = llm_factory(spec.model)
-
     agent_id = uuid.uuid4().hex
     guarded_llm = _GuardedLLMClient(
         base_llm,
@@ -341,6 +349,7 @@ def run_subagent(
     *,
     max_consecutive_repeats: int = DEFAULT_MAX_CONSECUTIVE_REPEATS,
     llm_factory: LLMFactory | None = None,
+    _base_llm_override: LLMClient | None = None,
 ) -> DelegationResult:
     """Spawn the sub-agent and run it to completion on *task_prompt*.
 
@@ -357,6 +366,7 @@ def run_subagent(
         budget,
         max_consecutive_repeats=max_consecutive_repeats,
         llm_factory=llm_factory,
+        _base_llm_override=_base_llm_override,
     )
     agent_id = agent_id_for(sub_agent)
     try:
