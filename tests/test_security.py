@@ -11,6 +11,7 @@ from typing import Any
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.event.bus import Event, EventBus
 from kinetic_sdk.security import (
+    REDACTED,
     AllowListPolicy,
     InMemoryAuditLogger,
     JSONLAuditLogger,
@@ -183,6 +184,40 @@ def test_redact_leaves_normal_text_untouched():
 def test_redact_empty_and_short_inputs():
     assert redact_secrets("") == ""
     assert redact_secrets("hi") == "hi"
+
+
+def test_redact_additional_secret_shapes():
+    bearer_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJraW5ldGljLXVzZXItMTIzNDU2Nzg5MCJ9.signature1234567890"
+    slack_token = "xoxb-" + "1234567890-abcdefghijklmnop"
+    google_api_key = "AIza" + "A" * 35
+    pem_key = "-----BEGIN PRIVATE KEY-----\nprivate-key-material\n-----END PRIVATE KEY-----"
+    database_url = "postgres://admin:SuperSecret123@db.internal:5432/prod"
+    aws_secret = "AWS_SECRET_ACCESS_KEY=abcdefghijklmnopqrstuvwxyz1234567890+/ABCD"
+    short_password = "password: hunter2"
+
+    cases = (
+        (f"Authorization: Bearer {bearer_token}", bearer_token),
+        (f"Slack token {slack_token}", slack_token),
+        (f"Google key {google_api_key}", google_api_key),
+        (f"PEM key: {pem_key}", pem_key),
+        (f"Database URL: {database_url}", "SuperSecret123"),
+        (aws_secret, "abcdefghijklmnopqrstuvwxyz1234567890+/ABCD"),
+        (short_password, "hunter2"),
+    )
+
+    for text, secret in cases:
+        redacted = redact_secrets(text)
+        assert secret not in redacted
+        assert REDACTED in redacted
+
+
+def test_redact_additional_patterns_leave_normal_text_untouched():
+    for text in (
+        "cache_key = 'homepage'",
+        "the secret to success is hard work",
+        "release version 1.2.3",
+    ):
+        assert redact_secrets(text) == text
 
 
 # --- Audit loggers ---------------------------------------------------------
