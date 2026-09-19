@@ -139,13 +139,20 @@ class LocalWorkspace(WorkspaceBase):
 
     def read_text(self, relative_path: str) -> str:
         """Read a text file inside the workspace root."""
-        return Path(self.resolve(relative_path)).read_text()
+        # ``newline=""`` prevents Python's universal-newline translation.
+        # Editors and patch application must round-trip CRLF files byte-for-byte
+        # except for the intended edit.
+        with open(self.resolve(relative_path), "r", newline="") as handle:
+            return handle.read()
 
     def write_text(self, relative_path: str, content: str) -> None:
         """Write a text file inside the workspace root, creating parents as needed."""
         target = Path(self.resolve(relative_path))
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
+        # See ``read_text``: preserve the caller's newline convention rather
+        # than translating CRLF to LF on write.
+        with open(target, "w", newline="") as handle:
+            handle.write(content)
 
     def delete_file(self, relative_path: str) -> None:
         """Delete a file in the workspace, rejecting directories."""
