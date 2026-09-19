@@ -19,7 +19,8 @@ from kinetic_sdk.security.policy import PermissionDecision
 
 if TYPE_CHECKING:
     from kinetic_sdk.agent.agent import Agent
-    from kinetic_sdk.llm.client import LLMClient
+    from kinetic_sdk.agent.async_agent import AsyncAgent
+    from kinetic_sdk.llm.client import AsyncLLMClient, LLMClient
     from kinetic_sdk.tool.base import Tool
 
 
@@ -98,6 +99,35 @@ class CheckpointManager:
         recorder.handle(Event("replay.resumed", {"run_id": checkpoint_id, "checkpoint_id": checkpoint_id}))
         return agent
 
+    def resume_async(
+        self, checkpoint_id: str, llm: "AsyncLLMClient", tools: list["Tool"], **agent_kwargs: Any
+    ) -> "AsyncAgent":
+        """Rebuild an :class:`AsyncAgent` from a confirmation checkpoint."""
+        replay = self._store.load()
+        if replay is None or replay.run_id != checkpoint_id:
+            raise CheckpointError(f"Checkpoint {checkpoint_id!r} was not found")
+        snapshot = next((step for step in reversed(replay.steps) if step.event_type == "replay.snapshot"), None)
+        metadata = next((step for step in reversed(replay.steps) if step.event_type == "replay.checkpoint"), None)
+        if snapshot is None or metadata is None:
+            raise CheckpointError(f"Checkpoint {checkpoint_id!r} is incomplete")
+        state_data, runtime = snapshot.payload.get("state"), metadata.payload.get("agent")
+        if not isinstance(state_data, dict) or not isinstance(runtime, dict):
+            raise CheckpointError(f"Checkpoint {checkpoint_id!r} is invalid")
+        if "state" in agent_kwargs:
+            raise ValueError("CheckpointManager owns state; do not pass state=")
+        try:
+            state = state_from_dict(copy.deepcopy(state_data))
+        except (TypeError, ValueError, KeyError) as exc:
+            raise CheckpointError(f"Checkpoint {checkpoint_id!r} has invalid state: {exc}") from exc
+        from kinetic_sdk.agent.async_agent import AsyncAgent
+
+        agent = AsyncAgent(llm=llm, tools=tools, state=state, **agent_kwargs)
+        agent._restore_checkpoint_runtime_state(checkpoint_id, runtime)
+        ReplayRecorder(self._store, capture_raw_snapshots=True).handle(
+            Event("replay.resumed", {"run_id": checkpoint_id, "checkpoint_id": checkpoint_id})
+        )
+        return agent
+
 
 def resume_from_confirmation(
     checkpoint_id: str,
@@ -113,3 +143,15 @@ def resume_from_confirmation(
     )
     agent._resolve_pending_confirmation(approved)
     return agent.run()
+
+
+async def resume_async_from_confirmation(
+    checkpoint_id: str, approved: bool, *, checkpoint_manager: CheckpointManager,
+    llm: "AsyncLLMClient", tools: list["Tool"],
+) -> str:
+    """Resolve an async confirmation checkpoint and continue its original run."""
+    agent = checkpoint_manager.resume_async(
+        checkpoint_id, llm, tools, checkpoint_manager=checkpoint_manager
+    )
+    await agent._resolve_pending_confirmation(approved)
+    return await agent.run()
