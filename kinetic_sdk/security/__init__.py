@@ -39,6 +39,8 @@ from kinetic_sdk.security.policy import (
     PermissionDecision,
     PermissionPolicy,
     PermissivePolicy,
+    PolicyRule,
+    RuleBasedPolicy,
 )
 from kinetic_sdk.security.redact import REDACTED, redact_secrets, redact_value
 
@@ -50,7 +52,9 @@ __all__ = [
     "PermissionDecision",
     "PermissionPolicy",
     "PermissivePolicy",
+    "PolicyRule",
     "REDACTED",
+    "RuleBasedPolicy",
     "redact_secrets",
     "redact_value",
 ]
