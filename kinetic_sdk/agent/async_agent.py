@@ -1035,7 +1035,6 @@ class AsyncAgent:
         in-flight executions, and skipped calls still receive their error
         ``tool_result`` so the history stays valid.
         """
-        any_error = False
         early_or_skip: dict[int, ToolResult] = {}
         skipped: set[int] = set()
         pending: list[tuple[int, ToolCall, Tool, dict[str, Any]]] = []
@@ -1046,13 +1045,34 @@ class AsyncAgent:
                 skipped.add(i)
                 continue
             await self._emit("agent.tool_call_started", {"name": call.name, "id": call.id})
-            tool, arguments, early = await self._prepare_call(call)
+            try:
+                tool, arguments, early = await self._prepare_call(call)
+            except PendingConfirmationError:
+                # Gating deliberately precedes concurrent dispatch.  Complete
+                # and record calls that have passed it before pausing, then
+                # checkpoint the pending call plus the unprocessed suffix so
+                # every tool_use has exactly one tool_result after resume.
+                await self._dispatch_and_record(calls[:i], pending, early_or_skip, skipped)
+                self._pending_remaining_calls = calls[i:]
+                await self._save_pending_confirmation_checkpoint()
+                raise
             if early is not None:
                 early_or_skip[i] = early
             else:
                 assert tool is not None
                 pending.append((i, call, tool, arguments))
 
+        return await self._dispatch_and_record(calls, pending, early_or_skip, skipped)
+
+    async def _dispatch_and_record(
+        self,
+        calls: list[ToolCall],
+        pending: list[tuple[int, ToolCall, Tool, dict[str, Any]]],
+        early_or_skip: dict[int, ToolResult],
+        skipped: set[int],
+    ) -> bool:
+        """Run already-gated calls and record their results in call order."""
+        any_error = False
         executed: dict[int, ToolResult] = {}
         executed_args: dict[int, dict[str, Any]] = {}
         if pending:
@@ -1086,6 +1106,11 @@ class AsyncAgent:
                 call.id, self._tool_output_for_state(call, result), is_error=result.is_error
             )
         return any_error
+
+    async def _save_pending_confirmation_checkpoint(self) -> None:
+        """Refresh a checkpoint after parallel batch bookkeeping is complete."""
+        if self.checkpoint_manager is not None:
+            await asyncio.to_thread(self.checkpoint_manager.save, self)  # type: ignore[arg-type]
 
     async def _execute_one(self, call: ToolCall) -> ToolResult:
         """Dispatch a single tool call, gated by hooks + permission policy.
@@ -1427,6 +1452,11 @@ class AsyncAgent:
         self.state.add_tool_result(call.id, self._tool_output_for_state(call, result), is_error=result.is_error)
         remaining = self._pending_remaining_calls
         self._pending_remaining_calls = []
+        # Parallel checkpoints retain the complete unfinalized suffix,
+        # including the call just resolved from the human verdict.  Sequential
+        # checkpoints retain only its trailing calls, so support both forms.
+        if remaining and remaining[0].id == call.id:
+            remaining = remaining[1:]
         if remaining:
             await self._execute_tool_calls(remaining)
         await self._persist_state()
