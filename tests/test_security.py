@@ -16,6 +16,8 @@ from kinetic_sdk.security import (
     JSONLAuditLogger,
     PermissionDecision,
     PermissivePolicy,
+    PolicyRule,
+    RuleBasedPolicy,
     redact_secrets,
 )
 from kinetic_sdk.tool.base import Tool, ToolResult
@@ -88,6 +90,71 @@ def test_permissive_policy_allows_anything():
 
 def test_permissive_policy_never_requires_confirmation():
     assert PermissivePolicy().check("git", {"args": ["push"]}).requires_confirmation is False
+
+
+# --- RuleBasedPolicy -------------------------------------------------------
+
+
+def test_rule_policy_first_matching_rule_wins_for_command():
+    policy = RuleBasedPolicy(
+        [
+            PolicyRule(
+                tool_name="terminal",
+                command_pattern=r"\brm\s+-rf\b",
+                decision=PermissionDecision(False, "destructive command denied"),
+            ),
+            PolicyRule(tool_name="terminal", decision=PermissionDecision(True, "terminal allowed")),
+        ]
+    )
+
+    assert policy.check("terminal", {"command": "ls -la"}).allowed is True
+    denied = policy.check("terminal", {"command": "rm -rf /tmp/data"})
+    assert denied.allowed is False
+    assert denied.reason == "destructive command denied"
+
+
+def test_rule_policy_matches_path_and_domain_from_url_or_domain():
+    policy = RuleBasedPolicy(
+        [
+            PolicyRule(
+                path_prefix="/workspace/",
+                decision=PermissionDecision(True, "workspace path allowed"),
+            ),
+            PolicyRule(
+                tool_name="browser",
+                domain_pattern=r"(^|\.)example\.com$",
+                decision=PermissionDecision(True, "trusted domain allowed"),
+            ),
+        ]
+    )
+
+    assert policy.check("files", {"path": "/workspace/a.txt"}).allowed is True
+    assert policy.check("files", {"path": "/etc/passwd"}).allowed is False
+    assert policy.check("browser", {"url": "https://api.example.com/v1"}).allowed is True
+    assert policy.check("browser", {"domain": "example.com"}).allowed is True
+    assert policy.check("browser", {"url": "https://evil.example.net"}).allowed is False
+
+
+def test_rule_policy_missing_inputs_and_bad_regex_never_crash():
+    policy = RuleBasedPolicy(
+        [
+            PolicyRule(
+                command_pattern="[not a regex",
+                decision=PermissionDecision(True, "literal fallback"),
+            )
+        ]
+    )
+
+    assert policy.check("terminal", {}).allowed is False
+    assert policy.check("terminal", {"command": "echo [not a regex"}).allowed is True
+
+
+def test_rule_policy_returns_decision_copy_and_honours_default():
+    default = PermissionDecision(True, "default allowed")
+    policy = RuleBasedPolicy([], default)
+    decision = policy.check("anything", {})
+    decision.reason = "mutated by caller"
+    assert policy.check("anything", {}).reason == "default allowed"
 
 
 # --- redact_secrets --------------------------------------------------------
