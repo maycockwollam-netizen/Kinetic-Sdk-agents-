@@ -37,12 +37,12 @@ _KEYWORD_TOKEN_RE = re.compile(
     r"(['\"]?)"
 )
 
-#: Bearer tokens and standalone three-part JWTs. Requiring ten characters in
-#: every JWT part avoids treating ordinary version strings (for example 1.2.3)
-#: as credentials.
+#: Bearer tokens and JWTs. JWTs must start with the base64url JSON prefix
+#: ``eyJ`` in both their header and payload, which avoids redacting unrelated
+#: dotted identifiers such as Python module paths.
 _BEARER_JWT_RE = re.compile(
     r"\bBearer\s+[A-Za-z0-9_\-\.]{20,}"
-    r"|\b[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"
+    r"|\beyJ[A-Za-z0-9_\-]*\.eyJ[A-Za-z0-9_\-]*\.[A-Za-z0-9_\-]+\b"
 )
 
 #: Slack bot, user, app, configuration, refresh, and service tokens.
@@ -51,15 +51,15 @@ _SLACK_TOKEN_RE = re.compile(r"\bxox[bpaors]-[A-Za-z0-9\-]{10,}")
 #: Google API keys begin with ``AIza`` followed by exactly 35 base64url chars.
 _GOOGLE_API_KEY_RE = re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")
 
-#: PEM private-key blocks may span multiple lines. Non-greedy matching keeps
-#: adjacent blocks separate.
+#: PEM private-key blocks may span multiple lines. The body explicitly stops
+#: at a hyphen, so truncated blocks and many unterminated BEGIN lines remain
+#: linear-time while adjacent blocks are handled independently.
 _PEM_KEY_RE = re.compile(
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
-    re.DOTALL,
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[^-]*(?:-----END [A-Z ]*PRIVATE KEY-----)?"
 )
 
 #: Credentials in URLs; only the password (group 2) is sensitive.
-_URL_CREDENTIAL_RE = re.compile(r"(://[^:/\s]+:)([^@\s]+)(@)")
+_URL_CREDENTIAL_RE = re.compile(r"(://[^:/@\s]+:)([^@\s/]+)(@)")
 
 #: Common secret-bearing environment variables. Values are redacted regardless
 #: of length because environment assignment syntax is explicit.
@@ -77,6 +77,28 @@ _SHORT_ASSIGNED_SECRET_RE = re.compile(
     r"(['\"]?)"
     r"([^\s'\"]{4,19})"
     r"(['\"]?)"
+)
+
+#: Quoted JSON-like fields whose names identify their string values as
+#: secrets. This covers both JSON and Python-dict representations embedded in
+#: log strings without treating ordinary prose containing "secret" as a leak.
+_JSON_SECRET_VALUE_RE = re.compile(
+    r"(?i)(?P<prefix>(?:\"[A-Za-z0-9_-]*(?:password|passwd|secret|token|"
+    r"api_key|apikey|authorization|private_key)[A-Za-z0-9_-]*\"|"
+    r"'[A-Za-z0-9_-]*(?:password|passwd|secret|token|api_key|apikey|"
+    r"authorization|private_key)[A-Za-z0-9_-]*')\s*:\s*)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+)
+
+_SENSITIVE_KEY_PARTS = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "private_key",
 )
 
 
@@ -97,6 +119,10 @@ def redact_secrets(text: str) -> str:
     def _short_assigned_secret_sub(match: re.Match[str]) -> str:
         return f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED}{match.group(5)}"
 
+    def _json_secret_value_sub(match: re.Match[str]) -> str:
+        quote = match.group("value")[0]
+        return f"{match.group('prefix')}{quote}{REDACTED}{quote}"
+
     text = _PEM_KEY_RE.sub(REDACTED, text)
     text = _BEARER_JWT_RE.sub(REDACTED, text)
     text = _SLACK_TOKEN_RE.sub(REDACTED, text)
@@ -105,20 +131,28 @@ def redact_secrets(text: str) -> str:
     text = _URL_CREDENTIAL_RE.sub(_url_credential_sub, text)
     text = _KEYWORD_TOKEN_RE.sub(_keyword_sub, text)
     text = _ENV_SECRET_RE.sub(_env_secret_sub, text)
-    return _SHORT_ASSIGNED_SECRET_RE.sub(_short_assigned_secret_sub, text)
+    text = _SHORT_ASSIGNED_SECRET_RE.sub(_short_assigned_secret_sub, text)
+    return _JSON_SECRET_VALUE_RE.sub(_json_secret_value_sub, text)
 
 
 def redact_value(value: Any) -> Any:
     """Recursively redact secrets inside a JSON-like structure.
 
     Strings are scrubbed with :func:`redact_secrets`; dicts and lists are
-    walked (dict keys are left intact — they are field names, not values);
-    everything else is returned unchanged.
+    walked. String values under sensitive dict keys are redacted in full;
+    dict keys themselves and all other values are returned unchanged.
     """
     if isinstance(value, str):
         return redact_secrets(value)
     if isinstance(value, dict):
-        return {k: redact_value(v) for k, v in value.items()}
+        return {
+            k: REDACTED
+            if isinstance(k, str)
+            and isinstance(v, str)
+            and any(part in k.lower() for part in _SENSITIVE_KEY_PARTS)
+            else redact_value(v)
+            for k, v in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [redact_value(v) for v in value]
     return value
