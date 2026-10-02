@@ -1,0 +1,56 @@
+name: Benchmark nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: matrix
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import tomllib
+          config = tomllib.load(open("benchmarks/matrix.toml", "rb"))
+          print("matrix=" + json.dumps({"model": config["models"], "profile": config["profiles"]}))
+          PY
+  nightly:
+    needs: matrix
+    if: ${{ secrets.KINETIC_BENCH_API_KEY != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install optional LLM benchmark backend
+        run: pip install -e ".[dev,llm]"
+      - name: Run real model benchmark
+        env:
+          KINETIC_BENCH_API_KEY: ${{ secrets.KINETIC_BENCH_API_KEY }}
+        run: |
+          python scripts/bench_run.py --model "${{ matrix.model }}" --profile "${{ matrix.profile }}" \
+            --api-key "$KINETIC_BENCH_API_KEY" --output "benchmarks/results-${{ matrix.profile }}.json"
+          python - <<'PY' >> benchmarks/history.jsonl
+          import json
+          from datetime import datetime, timezone
+          path = "benchmarks/results-${{ matrix.profile }}.json"
+          result = json.load(open(path, encoding="utf-8"))
+          print(json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(), "model": "${{ matrix.model }}", **result}))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-nightly-${{ matrix.profile }}
+          path: |
+            benchmarks/results-${{ matrix.profile }}.json
+            benchmarks/history.jsonl

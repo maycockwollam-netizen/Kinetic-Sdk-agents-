@@ -1,0 +1,28 @@
+name: Benchmark smoke
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install SDK and test dependencies
+        run: pip install -e ".[dev]"
+      - name: Run deterministic offline smoke cassettes
+        run: python scripts/bench_run.py --mock-script benchmarks/cassettes --output benchmarks/results-smoke.json
+      - name: Enforce benchmark quality gate
+        run: python scripts/bench_compare.py benchmarks/baselines/baseline.mock.json benchmarks/results-smoke.json --gate benchmarks/gate.toml | tee bench-summary.md
+      - name: Publish benchmark report
+        if: always()
+        run: cat bench-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-smoke-results
+          path: benchmarks/results-smoke.json

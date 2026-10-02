@@ -1,0 +1,5 @@
+# PR quality gate thresholds. Success comparisons use a Wilson 95% interval.
+success_rate_drop = 0.05
+cost_per_success_increase = 0.20
+max_infra_error_increase = 0
+confidence_level = 0.95

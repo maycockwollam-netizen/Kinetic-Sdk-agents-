@@ -1,0 +1,3 @@
+# Real-provider nightly matrix. Model names are supplied only to the nightly runner.
+models = ["openai/openhands/glm-5.2"]
+profiles = ["FLASH", "MAX"]

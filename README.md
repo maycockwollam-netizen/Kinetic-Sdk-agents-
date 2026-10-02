@@ -244,3 +244,11 @@ before being persisted or published.
   and resources/prompts capabilities.
 - Plugin follow-ups: `hook` capability, unload/hot-reload, and (research
   only — never a promise) real isolation such as subprocess-hosted plugins.
+
+## Benchmark CI
+
+Every PR runs deterministic, offline cassette smoke benchmarks and a quality
+gate; no model API key is used in this path. Nightly CI measures the configured
+real model × FLASH/MAX profile matrix only when `KINETIC_BENCH_API_KEY` exists.
+See [the benchmark guide](docs/benchmark.md) for the gate rules, mock baseline,
+and local commands.

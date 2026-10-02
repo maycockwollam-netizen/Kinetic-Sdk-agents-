@@ -1,0 +1,8 @@
+{
+  "id": "offline-tool-loop", "groups": ["general"], "uses_echo": true,
+  "prompt": "Dùng echo rồi trả lời.", "expected": "Tool đã chạy đúng.",
+  "responses": [
+    {"tool_call": {"id": "cassette-echo", "name": "echo", "arguments": {"message": "hi"}}},
+    {"text": "Tool đã chạy đúng."}
+  ]
+}

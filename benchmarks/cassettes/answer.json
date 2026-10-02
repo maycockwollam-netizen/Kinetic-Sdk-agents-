@@ -1,0 +1,5 @@
+{
+  "id": "offline-answer", "groups": ["general"],
+  "prompt": "Trả lời lời chào.", "expected": "Xin chào từ cassette.",
+  "responses": [{"text": "Xin chào từ cassette."}]
+}
