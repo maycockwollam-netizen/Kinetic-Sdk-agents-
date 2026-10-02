@@ -83,6 +83,7 @@ from kinetic_sdk.llm.client import (
 from kinetic_sdk.llm.usage import UsageAccumulator
 from kinetic_sdk.memory.provider import MemoryProvider, MemorySource, MemoryTier
 from kinetic_sdk.observability.logger import ObservabilityLogger
+from kinetic_sdk.project.manifest import ProjectManifest
 from kinetic_sdk.replay.checkpoint import PendingConfirmationError
 from kinetic_sdk.replay.recorder import ReplayRecorder
 from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
@@ -94,6 +95,7 @@ from kinetic_sdk.security.policy import (
 from kinetic_sdk.security.redact import redact_secrets
 from kinetic_sdk.tool.base import Tool, ToolFailureCategory, ToolResult, ToolRiskLevel
 from kinetic_sdk.tool.validation import validate_tool_input
+from kinetic_sdk.verify.contract import VerificationContract
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +190,18 @@ class AsyncAgent:
         max_transient_retries: int = 2,
         transient_retry_backoff_seconds: float = 0.25,
         injection_guard: InjectionGuard | bool | None = None,
+        project_manifest: "ProjectManifest | None" = None,
+        require_verification: bool = False,
     ) -> None:
+        self.require_verification = require_verification
+        self.last_verification: "VerificationContract | None" = None
+        self._verification_events: list[dict[str, Any]] | None = None
+        self._project_manifest = project_manifest
+        if require_verification and project_manifest is None:
+            from kinetic_sdk.project import load_project_manifest
+
+            loaded = load_project_manifest()
+            self._project_manifest = loaded if not hasattr(loaded, "manifest") else None
         if isinstance(llm, AsyncLLMClient):
             self.llm: AsyncLLMClient = llm
         elif isinstance(llm, LLMClient):
@@ -213,6 +226,9 @@ class AsyncAgent:
         else:
             self.state = ConversationState()
         self.event_bus = event_bus if event_bus is not None else EventBus()
+        if require_verification:
+            self._verification_events = []
+            self.event_bus.subscribe("*", self._capture_verification_event)
         #: Optional durable event recorder for offline replay debugging.
         self.replay_recorder = replay_recorder
         if replay_recorder is not None:
@@ -443,11 +459,14 @@ class AsyncAgent:
                 point=HookPoint.AFTER_RUN, run_id=self._run_id, final_text=final_text
             ),
         )
+        await self._complete_verification(final_text)
         await self._emit("agent.run_finished", {"final_text": final_text, "mode": self.mode.value})
         if user_message is not None and self.memory is not None:
             await self._store_memory(user_message, final_text)
         if self.memory is not None:
             await self._clear_working_memory()
+        if self.require_verification and self.last_verification is not None and self.last_verification.status.value != "VERIFIED":
+            return f"UNVERIFIED: {final_text}"
         return final_text
 
     def escalate(self) -> bool:
@@ -1004,7 +1023,7 @@ class AsyncAgent:
                 )
                 any_error = True
                 continue
-            await self._emit("agent.tool_call_started", {"name": call.name, "id": call.id})
+            await self._emit("agent.tool_call_started", {"name": call.name, "id": call.id, "arguments": dict(call.arguments)})
             try:
                 result = await self._execute_one(call)
             except PendingConfirmationError:
@@ -1044,7 +1063,7 @@ class AsyncAgent:
                 early_or_skip[i] = ToolResult(error="skipped: run cancelled")
                 skipped.add(i)
                 continue
-            await self._emit("agent.tool_call_started", {"name": call.name, "id": call.id})
+            await self._emit("agent.tool_call_started", {"name": call.name, "id": call.id, "arguments": dict(call.arguments)})
             try:
                 tool, arguments, early = await self._prepare_call(call)
             except PendingConfirmationError:
@@ -1468,6 +1487,8 @@ class AsyncAgent:
                 "name": call.name,
                 "id": call.id,
                 "is_error": result.is_error,
+                "output": redact_secrets(self._format_tool_output(result)),
+                "metadata": dict(result.metadata),
                 "output_preview": redact_secrets(self._preview(result.output)),
             },
         )
@@ -1478,6 +1499,21 @@ class AsyncAgent:
                 "agent.stuck_detected", {"tool_name": call.name, "window": self.stuck_detector.window}
             )
             self._stop_reason = "unproductive_loop"
+
+    def _capture_verification_event(self, event: Event) -> None:
+        if self._verification_events is None:
+            return
+        from kinetic_sdk.observability.logger import ObservabilityLogger
+
+        self._verification_events.append(ObservabilityLogger.build_entry(event))
+
+    async def _complete_verification(self, final_text: str) -> None:
+        from kinetic_sdk.observability.trace import RunTrace
+        from kinetic_sdk.verify import VerificationContract
+
+        trace = RunTrace.collect(self._verification_events or [], self._run_id or "")
+        self.last_verification = VerificationContract.from_trace(trace, self._project_manifest, final_text)
+        await self._emit("verification.completed", {"status": self.last_verification.status.value, "edits_after_last_verification": self.last_verification.edits_after_last_verification, "claims_mismatch": self.last_verification.claims_mismatch})
 
     @staticmethod
     def _format_tool_output(result: ToolResult) -> str:
