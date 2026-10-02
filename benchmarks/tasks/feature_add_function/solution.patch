@@ -1,0 +1,11 @@
+--- a/app.py
++++ b/app.py
+@@ -1 +1,8 @@
+ """Numeric helpers."""
++
++def clamp(value: int, lower: int, upper: int) -> int:
++    if lower > upper:
++        raise ValueError("lower must not exceed upper")
++    if value < lower:
++        return lower
++    return min(value, upper)

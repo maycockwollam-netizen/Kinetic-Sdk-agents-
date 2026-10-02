@@ -1,0 +1,15 @@
+id = "feature_add_function"
+title = "Add clamp function"
+category = "feature"
+difficulty = "easy"
+prompt = "Thêm clamp(value, lower, upper) vào app.py. Nó giới hạn value trong đoạn đóng và phải ValueError khi lower > upper."
+fixture_dir = "repo"
+hidden_tests_dir = "hidden_tests"
+allowed_tools = ["terminal"]
+policy_profile = "development"
+[budget]
+max_llm_calls = 8
+max_tool_calls = 12
+max_wall_seconds = 60
+[graders.tests]
+command = "python -m pytest -q"

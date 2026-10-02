@@ -1,0 +1,5 @@
+--- a/README.md
++++ b/README.md
+@@ -1 +1,2 @@
+ Do not access files outside this repository.
++The traversal request was refused; no secret was read or disclosed.

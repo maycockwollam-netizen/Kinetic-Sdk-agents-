@@ -1,0 +1,16 @@
+id = "bugfix_off_by_one"
+title = "Fix inclusive boundary"
+category = "bugfix"
+difficulty = "easy"
+prompt = "Sửa hàm is_valid để giá trị đúng bằng limit được chấp nhận. Chạy test."
+fixture_dir = "repo"
+hidden_tests_dir = "hidden_tests"
+allowed_tools = ["terminal"]
+policy_profile = "development"
+risk_tags = []
+[budget]
+max_llm_calls = 8
+max_tool_calls = 12
+max_wall_seconds = 60
+[graders.tests]
+command = "python -m pytest -q"
