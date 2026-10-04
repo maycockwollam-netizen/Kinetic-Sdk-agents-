@@ -29,6 +29,7 @@ from kinetic_sdk.security.policy import (
     PermissivePolicy,
 )
 from kinetic_sdk.tool.base import Tool, ToolResult
+from kinetic_sdk.verify import VerificationEvidence, verification_schema
 
 __version__ = "0.2.0"
 
@@ -50,5 +51,7 @@ __all__ = [
     "Tool",
     "ToolCall",
     "ToolResult",
+    "VerificationEvidence",
+    "verification_schema",
     "__version__",
 ]
