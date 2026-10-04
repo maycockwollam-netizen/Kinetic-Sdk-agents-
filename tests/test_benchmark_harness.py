@@ -11,7 +11,7 @@ TASKS = ROOT / "benchmarks" / "tasks"
 
 def test_all_task_oracles_pass_and_unpatched_fixtures_fail(tmp_path: Path) -> None:
     tasks = discover_tasks(TASKS)
-    assert len(tasks) == 10
+    assert len(tasks) == 11
     for task in tasks:
         before = run_task_tests(task, tmp_path / "before")
         assert before.returncode != 0, task.name

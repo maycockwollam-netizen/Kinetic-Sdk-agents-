@@ -20,9 +20,9 @@ def test_mock_baseline_and_compact_summary(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     results = output / "results.json"
-    assert len(json.loads(results.read_text())["results"]) == 10
+    assert len(json.loads(results.read_text())["results"]) == 11
     compact = output / "baseline.json"
     assert subprocess.run(["python", "scripts/make_baseline.py", str(results), "--output", str(compact)], cwd=ROOT).returncode == 0
     data = json.loads(compact.read_text())
     assert data["success_rate"] == 1.0
-    assert len(data["per_task"]) == 10
+    assert len(data["per_task"]) == 11

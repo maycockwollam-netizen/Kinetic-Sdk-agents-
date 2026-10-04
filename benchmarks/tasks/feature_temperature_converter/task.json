@@ -1,0 +1,30 @@
+{
+  "id": "feature_temperature_converter",
+  "title": "Thêm hàm chuyển nhiệt độ",
+  "instructions": "Thêm hàm celsius_to_fahrenheit vào src/temp.py chuyển độ C sang độ F.",
+  "budget": {
+    "max_steps": 10,
+    "max_minutes": 10
+  },
+  "risk_tags": [
+    "feature"
+  ],
+  "existing_tests": [
+    "python -m pytest -q tests"
+  ],
+  "grader": {
+    "commands": [
+      "python -m pytest -q tests _grader_hidden_tests"
+    ],
+    "diff_constraints": {
+      "forbidden_paths": [
+        "tests/**",
+        "hidden_tests/**"
+      ]
+    }
+  },
+  "agent_workspace_files": [
+    "src/temp.py",
+    "tests"
+  ]
+}
