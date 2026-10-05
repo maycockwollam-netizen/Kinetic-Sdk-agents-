@@ -30,6 +30,9 @@ browser = ["playwright>=1.40"]
 otel = ["opentelemetry-sdk>=1.25"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
 
+[project.scripts]
+kinetic = "kinetic_sdk.cli.main:main"
+
 [tool.ruff]
 target-version = "py310"
 # Deliberately narrow: pyflakes (F), syntax-level pycodestyle (E9) and import
