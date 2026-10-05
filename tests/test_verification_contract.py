@@ -52,3 +52,29 @@ def test_agent_settings_can_opt_into_verification() -> None:
     data = settings.to_dict()
     assert data["verification_required"] is True
     assert AgentSettings.from_dict(data).verification_required is True
+
+
+def test_agent_retries_until_verification_evidence_is_complete() -> None:
+    import json
+
+    from kinetic_sdk.agent.agent import Agent
+    from kinetic_sdk.testing import MockLLMClient, text_response
+
+    weak = {
+        "changed_files": [],
+        "commands_run": ["pytest"],
+        "test_results": {"pytest": "failed"},
+        "remaining_risks": ["not done"],
+    }
+    strong = {
+        "changed_files": ["src/app.py"],
+        "commands_run": ["python -m pytest -q"],
+        "test_results": {"pytest": "passed"},
+        "remaining_risks": [],
+    }
+    llm = MockLLMClient([text_response(json.dumps(weak)), text_response(json.dumps(strong))])
+    agent = Agent(llm=llm, verification_required=True)
+    answer = agent.run("fix the bug")
+    assert agent.verification_evidence is not None
+    assert agent.verification_evidence.is_verified()
+    assert answer == json.dumps(strong)
