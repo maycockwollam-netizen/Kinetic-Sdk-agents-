@@ -11,7 +11,7 @@ from typing import Any
 
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.git import GitTool
-from kinetic_sdk.llm.client import LiteLLMClient
+from kinetic_sdk.llm.client import LLMClient, LiteLLMClient
 from kinetic_sdk.memory import InMemoryMemory, MemoryTool
 from kinetic_sdk.security.policy import PermissivePolicy
 from kinetic_sdk.terminal import TerminalTool
@@ -56,6 +56,7 @@ def get_config(key: str, default: Any = None) -> Any:
 
 def build_agent(model: str | None = None, api_key: str | None = None, base_url: str | None = None) -> Agent:
     model = model or get_config("model", DEFAULT_MODEL)
+    llm: LLMClient
     api_key = api_key or get_config("api_key", os.environ.get("OPENAI_API_KEY"))
     base_url = base_url or get_config("base_url")
 
