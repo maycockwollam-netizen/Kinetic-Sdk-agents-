@@ -920,6 +920,19 @@ class Agent:
                 except Exception:
                     self.verification_evidence = None
             self._emit("agent.structured_output_parsed", {"schema": schema})
+            if getattr(self, "_effective_verify", False):
+                problems = self._verification_problems()
+                if problems:
+                    self._emit("agent.verification_unverified", {"problems": problems})
+                    if retries_left > 0:
+                        self.state.add_user_message(
+                            "Your final answer does not prove the task is complete. "
+                            f"Problems: {'; '.join(problems)}. "
+                            "Reply with ONLY a corrected JSON object."
+                        )
+                        self._emit("agent.verification_retry", {"problems": problems})
+                        return "retry"
+                    return "break"
             return "break"
         if retries_left > 0:
             self.state.add_user_message(
@@ -929,6 +942,20 @@ class Agent:
             return "retry"
         self._emit("agent.structured_output_invalid", {"problems": problems})
         return "break"
+
+    def _verification_problems(self) -> list[str]:
+        evidence = self.verification_evidence
+        if evidence is None:
+            return ["missing verification evidence"]
+        problems: list[str] = []
+        if not evidence.changed_files:
+            problems.append("changed_files is empty")
+        if not evidence.commands_run:
+            problems.append("commands_run is empty")
+        passing = {"passed", "pass", "ok", "success", "green"}
+        if not any(str(v).lower() in passing for v in evidence.test_results.values()):
+            problems.append("no successful test result")
+        return problems
 
     def _create_plan(self, user_message: str | None) -> Plan | None:
         """Create one opt-in plan, failing open if an extension is unhealthy."""
