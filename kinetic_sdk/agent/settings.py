@@ -31,6 +31,7 @@ class AgentSettings:
     parallel_tool_execution: bool = False
     memory_recall_limit: int = 3
     run_budget: dict[str, int | None] | None = None
+    verification_required: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -75,6 +76,7 @@ class AgentSettings:
             parallel_tool_execution=self.parallel_tool_execution,
             memory_recall_limit=self.memory_recall_limit,
             run_budget=budget,
+            verification_required=self.verification_required,
             **runtime,
         )
         agent.state.system_prompt = self.system_prompt

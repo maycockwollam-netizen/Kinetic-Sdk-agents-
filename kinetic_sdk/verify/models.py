@@ -23,6 +23,29 @@ class VerificationEvidence:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "VerificationEvidence":
+        """Build from a JSON-like dict, ignoring unknown keys and coercing
+        list/dict types to the expected shapes."""
+        files = data.get("changed_files") or []
+        commands = data.get("commands_run") or []
+        results = data.get("test_results") or {}
+        risks = data.get("remaining_risks") or []
+        if not isinstance(files, list):
+            files = [str(files)]
+        if not isinstance(commands, list):
+            commands = [str(commands)]
+        if not isinstance(results, dict):
+            results = {}
+        if not isinstance(risks, list):
+            risks = [str(risks)]
+        return cls(
+            changed_files=[str(p) for p in files],
+            commands_run=[str(c) for c in commands],
+            test_results={str(k): str(v) for k, v in results.items()},
+            remaining_risks=[str(r) for r in risks],
+        )
+
     def is_verified(self) -> bool:
         """A run is only "verified" with files touched, commands run and a
         successful test result — otherwise it must not be reported complete."""

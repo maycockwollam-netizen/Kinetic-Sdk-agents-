@@ -71,6 +71,7 @@ from kinetic_sdk.security.policy import (
 from kinetic_sdk.security.redact import redact_secrets
 from kinetic_sdk.tool.base import Tool, ToolFailureCategory, ToolResult, ToolRiskLevel
 from kinetic_sdk.tool.validation import validate_tool_input
+from kinetic_sdk.verify import VerificationEvidence, verification_schema
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +239,7 @@ class Agent:
         max_transient_retries: int = 2,
         transient_retry_backoff_seconds: float = 0.25,
         injection_guard: InjectionGuard | bool | None = None,
+        verification_required: bool = False,
     ) -> None:
         self.llm = llm
         #: Optional persistence backend. When set (and no explicit ``state``
@@ -347,6 +349,9 @@ class Agent:
         #: Parsed final answer of the last ``run(output_schema=...)`` call
         #: (None when no schema was requested or validation ultimately failed).
         self.structured_output: Any = None
+        #: Parsed verification evidence from the last run when the agent
+        #: was required to prove it completed its work.
+        self.verification_evidence: VerificationEvidence | None = None
         #: Optional long-term memory. When set, a run recalls relevant
         #: entries BEFORE the user turn (emits ``agent.memory_recalled``) and
         #: stores the Q/A pair AFTER it (emits ``agent.memory_stored``).
@@ -380,6 +385,7 @@ class Agent:
         self.plan: Plan | None = None
         #: Tool output is untrusted by default.  ``False`` is the explicit
         #: opt-out for controlled, purely internal tools.
+        self.verification_required: bool = verification_required
         self.injection_guard: InjectionGuard | None = (
             None if injection_guard is False else injection_guard if isinstance(injection_guard, InjectionGuard) else InjectionGuard()
         )
@@ -413,6 +419,7 @@ class Agent:
         stream: bool = False,
         output_schema: dict[str, Any] | None = None,
         structured_retries: int | None = None,
+        verify: bool | None = None,
     ) -> str:
         """Run the agent loop until the model stops calling tools.
 
@@ -468,6 +475,11 @@ class Agent:
         """
         resuming = self._resuming_checkpoint and user_message is None
         self.structured_output = None
+        self.verification_evidence = None
+        _effective_verify = self.verification_required if verify is None else verify
+        self._effective_verify = _effective_verify
+        if _effective_verify and output_schema is None:
+            output_schema = verification_schema()
         if resuming and self._pending_confirmation is not None:
             raise RuntimeError("Resolve the pending confirmation before continuing this checkpoint")
         if user_message is not None and self.memory is not None:
@@ -656,6 +668,7 @@ class Agent:
         stream: bool = False,
         output_schema: dict[str, Any] | None = None,
         structured_retries: int | None = None,
+        verify: bool | None = None,
     ) -> str:
         """The tool-calling loop, with mid-run FLASH -> MAX escalation."""
         final_text = ""
@@ -899,6 +912,13 @@ class Agent:
         ok, value, problems = check_final_answer(schema, text)
         if ok:
             self.structured_output = value
+            # build verification evidence when this final answer was required
+            # to match the verification schema.
+            if getattr(self, "_effective_verify", False) and isinstance(value, dict):
+                try:
+                    self.verification_evidence = VerificationEvidence.from_dict(value)
+                except Exception:
+                    self.verification_evidence = None
             self._emit("agent.structured_output_parsed", {"schema": schema})
             return "break"
         if retries_left > 0:
