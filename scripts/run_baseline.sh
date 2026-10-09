@@ -4,4 +4,4 @@ set -euo pipefail
 : "${PROFILE:=mock}"
 : "${RUNS:=1}"
 export MODEL PROFILE RUNS
-exec python scripts/run_baseline.py
+exec "${PYTHON:-python}" scripts/run_baseline.py

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,5 +59,5 @@ def run_task_tests(task: BenchmarkTask, workspace: Path) -> subprocess.Completed
         shutil.rmtree(hidden_destination)
     shutil.copytree(task.hidden_tests_dir, hidden_destination)
     return subprocess.run(
-        ["python", "-m", "pytest", "-q", "tests", "_grader_hidden_tests"], cwd=workspace, text=True, capture_output=True, check=False
+        [sys.executable, "-m", "pytest", "-q", "tests", "_grader_hidden_tests"], cwd=workspace, text=True, capture_output=True, check=False
     )
