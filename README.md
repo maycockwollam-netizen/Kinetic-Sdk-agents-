@@ -1,171 +1,50 @@
-# kinetic-agent-sdk
+# Kinetic Agent SDK
 
-A modular agent SDK for the KINETIC coding agent. The SDK provides a
-provider-neutral, synchronous tool-calling loop with full Python type hints and
-clean interface/implementation separation so providers, tools, context
-strategies, security policies, and observability sinks can be swapped without
-rewriting the agent loop.
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## Current status
+A modular Python SDK and command-line agent for building tool-calling AI applications. Kinetic supports sync and async agents, provider-neutral LLM clients, secure tool permissions, memory, MCP, subagents, observability, and workspace operations.
 
-- **Stage 1 — Core: done.** Includes the `Agent` loop, `Tool` / `ToolResult`,
-  `ConversationState`, `EventBus`, the `LLMClient` interface, and the optional
-  LiteLLM-backed client.
-- **Stage 2 — Context & Memory: done for the current scope.** FLASH/MAX task
-  routing, the model-backed `LiteLLMClassifier`, truncation-based context
-  compaction, LLM-summarized context compaction with safe truncation fallback,
-  and secret management are implemented.
-- **Stage 3 — Quality & Ops: done.** Permission policies, audit logging,
-  secret redaction, structured observability logging, per-run trace summaries,
-  lifecycle hooks, public testing utilities, and hook-based confirmation UX
-  are implemented. Richer policy sets, metrics, and external tracing exporters
-  are still future work.
-- **Stage 4 — Extensions: done.** Git integration (`GitTool`), workspace
-  path safety (`Workspace`), agent profiles (dev/production presets), full
-  MCP support (client + server), skills (discovery + vetting), plugins
-  (dynamic loading with static scanning), and subagents (delegation with
-  inherited permissions plus budget/circuit-breaker guardrails) are all
-  implemented.
-- **Hardening pass — done.** Runtime resilience on top of the four stages:
-  LLM retry/backoff + timeout, per-tool wall-clock timeout, parallel-group-safe
-  context compaction (no orphaned `tool_result`, oversized tool outputs are
-  trimmed head/tail), pluggable token counters (`tiktoken` extra), sticky-MAX
-  routing across runs, conversation persistence (`JsonFileConversationStore`),
-  cooperative cancellation (`agent.cancel()`), tool-input schema validation,
-  optional parallel tool execution, and the standard `terminal` +
-  `file_editor` tools.
-- **Stage 5 — Production readiness: done.** Structured output
-  (`run(output_schema=...)`), usage/cost tracking, OpenTelemetry export
-  (`otel` extra), metrics aggregation, ask-user human-in-the-loop tool,
-  long-term memory (keyword-ranked, JSON-file durable), a stdlib REST
-  `AgentServer`, checkpoint fork/rewind helpers, an eval harness, docker
-  sandbox adapters for `TerminalTool`, async sub-agent delegation, and MCP
-  reconnect. See `CHANGELOG.md` for the full detail.
-- **Replay debugger — full branch workflow.** `ReplayDebugSession` supplies
-  UI-ready timelines, snapshot-safe forks, model/tool/input substitution,
-  run-to-run diffs, and opt-in deterministic replay tools. Raw snapshots are
-  required for live forks or deterministic tool results and must be stored as
-  protected secrets.
-- **Async layer — done.** `AsyncAgent` mirrors every sync capability
-  (routing, compaction, hooks, policy, structured output, memory, usage).
+## Features
 
-## Module map
+- **Flexible agents** — synchronous and asynchronous agent loops with streaming
+- **Tool calling** — terminal, files, git, memory, todo, codebase mapping, MCP, and custom tools
+- **Safe by default** — deny-by-default permissions, confirmation hooks, and secret redaction
+- **Provider-neutral** — use LiteLLM or implement the `LLMClient` interface
+- **Production-ready primitives** — retries, timeouts, context compaction, usage tracking, and OpenTelemetry
+- **Extensible** — plugins, skills, agent profiles, subagents, and MCP clients/servers
+- **CLI included** — interactive chat and one-shot coding tasks
 
-- `kinetic_sdk/agent/` — `Agent` tool-calling loop, `AgentMode` FLASH/MAX
-  routing, task classification, mid-run FLASH -> MAX escalation.
-- `kinetic_sdk/conversation/` — conversation history using an Anthropic-style
-  typed message shape, plus pluggable persistence (`ConversationStore` ABC,
-  `JsonFileConversationStore`) for save/resume across processes.
-- `kinetic_sdk/context/` — context-window management: zero-dependency token
-  estimate or pluggable real tokenizers (`TiktokenCounter`), parallel-safe
-  truncation compaction, oversized tool-result trimming, and optional
-  LLM-summarised compaction with safe fallback.
-- `kinetic_sdk/event/` — synchronous/async event bus with wildcard subscribers.
-- `kinetic_sdk/files/` — workspace-confined editing tools: `FileTool` for
-  view/create/str_replace/insert/undo_edit and `ApplyPatchTool` for atomic,
-  multi-file standard unified diffs (all paths traversal-safe via `Workspace`).
-- `kinetic_sdk/terminal/` — `TerminalTool`: shell commands with process-group
-  kill on timeout and head/tail output truncation.
-- `kinetic_sdk/git/` — `GitTool`: curated git operations (status/diff/add/
-  commit/branch/checkout/push/pull/log) as a first-class, policy-gated tool.
-- `kinetic_sdk/hooks/` — lifecycle hooks (`BEFORE_RUN`, `BEFORE_TOOL_CALL`,
-  `ON_PERMISSION_CHECK`, ...) with fail-safe semantics.
-- `kinetic_sdk/llm/` — provider-neutral `LLMClient` interface plus optional
-  `LiteLLMClient` for Anthropic/OpenAI-compatible providers.
-- `kinetic_sdk/mcp/` — Model Context Protocol in both directions: client
-  (connect to external MCP servers — Unity, filesystem, GitHub — and use
-  their tools as Kinetic `Tool`s via stdio/SSE transports) and server
-  (expose Kinetic tools to external MCP clients, with the same permission
-  policy + audit log as the internal agent loop).
-- `kinetic_sdk/observability/` — structured event loggers, metrics, and
-  `RunTrace` helpers. `OTelObservabilityLogger` remains the stable, simple
-  export of one run span with event annotations; attach `Tracer` separately
-  when a full in-memory run → turn → tool → retry/compaction span tree and
-  per-level durations are needed.
-- `kinetic_sdk/plugin/` — dynamic loading of external Python packages that
-  register extra tools: metadata-only discovery (entry points + PLUGIN.md
-  directory convention), an AST-based static scanner (a tripwire, NOT a
-  sandbox — see the package docstring), scan-before-import loading with full
-  audit logging, and collision-rejecting tool merge.
-- `kinetic_sdk/profiles/` — ready-made agent configuration presets
-  (`dev_profile`, `production_profile`).
-- `kinetic_sdk/secret/` — secret value wrapper, providers, and registry for
-  safe credential resolution.
-- `kinetic_sdk/security/` — permission policies, audit loggers, and recursive
-  secret redaction.
-- `kinetic_sdk/skills/` — Markdown skill packages: metadata-first discovery,
-  zip loading with extraction guards, and static + LLM-assisted vetting for
-  untrusted sources.
-- `kinetic_sdk/subagent/` — sub-agent delegation: `DelegateTool` spawns
-  sub-agents that inherit the parent's full tool set and permission policy
-  (each with its own system prompt and fresh context), guarded by a shared
-  tree-wide tool-call budget and per-agent repetition circuit breakers. Root
-  calls can opt into the same budget with `charge_root_tool_calls=True`; both
-  normal and streaming turns are guarded.
-- `kinetic_sdk/testing/` — public test utilities: `MockLLMClient`, `MockTool`,
-  and trace assertions.
-- `kinetic_sdk/ask_user/` — `AskUserTool`: the agent asks the operator a
-  question mid-run through an injectable handler (human-in-the-loop).
-- `kinetic_sdk/todo/` — `TodoReadTool` / `TodoWriteTool`: an agent-maintained
-  scratchpad for focused multi-step plans, with in-memory or atomic JSON
-  persistence.
-- `kinetic_sdk/codemap/` — `CodebaseMapTool`: cached, AST-derived Python
-  import maps for assessing downstream impact before edits.
-- `kinetic_sdk/eval/` — eval harness: cases, callable scorers, and an
-  `EvalRunner` with per-case `RunTrace` reporting.
-- `kinetic_sdk/memory/` — long-term memory providers (in-memory + JSON
-  file), `MemoryTool`, and the `Agent(memory=...)` auto recall/store wiring.
-- `kinetic_sdk/server/` — `AgentServer`: stdlib-only REST API for one-shot
-  agent runs plus optional server-managed workspace endpoints (bearer-token
-  auth optional).
-- `kinetic_sdk/tool/` — abstract tool interface and `ToolResult` dataclass.
-- `kinetic_sdk/workspace/` — `WorkspaceBase` with local, Docker and remote
-  backends; `Workspace` remains the root-confined local implementation.
+## Requirements
 
-## Install (editable)
+- Python 3.10+
+- An API key for a supported LiteLLM provider (optional for offline/mock usage)
 
-Install the core development dependencies:
+## Installation
+
+Install the SDK and development tools:
 
 ```bash
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 ```
 
-Install both development and LiteLLM backend dependencies when running the full
-test suite or using `LiteLLMClient` / `LiteLLMClassifier`:
+To use LiteLLM providers:
 
 ```bash
-pip install -e ".[dev,llm]"
+python -m pip install -e ".[dev,llm]"
 ```
 
-Add the `tokens` extra for a real tokenizer (tiktoken) backing context-window
-estimation instead of the built-in heuristic:
+Optional extras:
 
 ```bash
-pip install -e ".[tokens]"
+pip install -e ".[tokens]"    # Real tokenizer support
+pip install -e ".[browser]"   # Browser tools
+pip install -e ".[otel]"      # OpenTelemetry export
+pip install -e ".[memory]"    # LiteLLM memory dependencies
+pip install -e ".[dev,llm]"   # Development and LLM dependencies
 ```
 
-The core SDK intentionally has no required third-party runtime dependencies;
-`litellm` and `tiktoken` are optional and imported lazily only when a
-component backed by them is instantiated.
-
-## Run tests
-
-Run the full suite after installing both extras:
-
-```bash
-python -m pytest -q
-```
-
-If only `.[dev]` is installed, tests that import or instantiate the LiteLLM
-backend will fail because `litellm` is not present. Install `.[dev,llm]` before
-using the LiteLLM backend tests.
-
-## Minimal example
-
-`LiteLLMClient` uses `litellm` under the hood, so one class reaches many
-providers via the LiteLLM model string. The conversation history stays in
-Anthropic message format (typed content blocks); the client translates
-to/from the OpenAI shape that `litellm.completion` expects.
+## Quick Start
 
 ```python
 from kinetic_sdk.agent import Agent
@@ -176,7 +55,7 @@ from kinetic_sdk.tool.base import Tool, ToolResult
 
 class EchoTool(Tool):
     name = "echo"
-    description = "Echo a message."
+    description = "Echo a message"
     parameters = {
         "type": "object",
         "properties": {"message": {"type": "string"}},
@@ -187,62 +66,95 @@ class EchoTool(Tool):
         return ToolResult(output=message)
 
 
-llm = LiteLLMClient(model="anthropic/claude-sonnet-4-5", api_key="sk-ant-...")
-
+llm = LiteLLMClient(model="gpt-4o", api_key="YOUR_API_KEY")
 agent = Agent(
     llm=llm,
     tools=[EchoTool()],
-    # The default policy is deny-by-default. Allow tools explicitly.
     permission_policy=AllowListPolicy(always_allow=["echo"]),
 )
+
 print(agent.run("Echo back: hello"))
 ```
 
-For an OpenAI-compatible endpoint, provide both the LiteLLM model string and
-`api_base`:
+For a runnable offline example:
 
-```python
-llm = LiteLLMClient(
-    model="openai/openhands/glm-5.2",
-    api_key="...",
-    api_base="https://llm-proxy.app.all-hands.dev",
-)
+```bash
+python examples/01_quickstart.py
 ```
 
-## Todo planning
+More examples are available in [`examples/`](examples).
 
-Use `TodoWriteTool` and `TodoReadTool` for non-trivial, multi-step tasks where
-the agent benefits from tracking one active task at a time. The offline
-[`examples/04_todo_planning.py`](examples/04_todo_planning.py) script shows an
-agent using both tools with `InMemoryTodoStore`; no API key is required.
+## CLI
 
-## Codebase mapping
+After installation, the `kinetic` command is available:
 
-Use `CodebaseMapTool` before editing an unfamiliar module to inspect its direct
-imports, reverse importers, or transitive `impact_of` dependency view. It is a
-cached, static import-level map rather than a call graph, so dynamic loading and
-other implicit coupling remain unknown. The offline
-[`examples/05_codebase_map.py`](examples/05_codebase_map.py) script builds a
-small temporary project and runs every query mode without an API key.
+```bash
+kinetic init
+kinetic run "Explain this repository"
+kinetic chat
+kinetic verify
+kinetic version
+kinetic --help
+```
 
-## Security defaults
+Configure a model or API key:
 
-Tool execution is safe-by-default: when no `permission_policy` is provided,
-`Agent` uses an empty `AllowListPolicy`, so every tool call is denied until the
-SDK user explicitly allows that tool. Use `PermissivePolicy` only for local
-development, sandboxed demos, or tests.
+```bash
+kinetic config --set model=gpt-4o
+kinetic config --set api_key=YOUR_API_KEY
+kinetic config --set base_url=https://api.example.com
+kinetic config --get model
+```
 
-Tool inputs, outputs, audit entries, and observability payloads are redacted
-before being persisted or published.
+Or provide values per command:
 
-## Roadmap
+```bash
+kinetic run "Fix the failing tests" --model gpt-4o --api-key YOUR_API_KEY --safe --stream
+```
 
-- Add richer policy presets for filesystem, terminal, git, and network tools.
-- Add external tracing exporters beyond the included OpenTelemetry support,
-  such as Jaeger.
-- Subagent follow-ups: parallel sub-agent execution (the shared budget is
-  already thread-safe), optional tool-narrowing overrides on `SubagentSpec`.
-- MCP follow-ups: tool-list caching, server-initiated requests (sampling),
-  and resources/prompts capabilities.
-- Plugin follow-ups: `hook` capability, unload/hot-reload, and (research
-  only — never a promise) real isolation such as subprocess-hosted plugins.
+Useful CLI options:
+
+- `--safe` — use a confirmation-oriented deny-by-default policy
+- `--yes` — automatically confirm permission prompts
+- `--stream` — stream text output
+- `--verify` — require verification evidence
+- `--base-url` — use an OpenAI-compatible API endpoint
+
+Project settings are stored in `.kinetic/project.json`. Global CLI settings are stored in `~/.kinetic/config.json`.
+
+## Security
+
+- Tools are denied by default unless explicitly allowed
+- Use `PermissivePolicy` only in controlled development environments
+- Sensitive values are redacted from tool inputs, outputs, logs, and observations
+- Never commit API keys or credentials
+- Prefer environment variables or the local CLI configuration for secrets
+
+Example:
+
+```bash
+export OPENAI_API_KEY="YOUR_API_KEY"
+kinetic run "Review the current changes" --safe
+```
+
+## Testing
+
+```bash
+python -m pytest -q
+python -m ruff check kinetic_sdk
+python -m mypy kinetic_sdk
+```
+
+Integration tests that call real providers require an API key and are not run by default.
+
+## Documentation
+
+- [`CHANGELOG.md`](CHANGELOG.md) — release changes
+- [`AGENTS.md`](AGENTS.md) — repository-specific agent guidance
+- [`docs/`](docs) — benchmark and baseline documentation
+- [`examples/`](examples) — runnable SDK examples
+- [`benchmarks/`](benchmarks) — benchmark tasks and evaluation fixtures
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
