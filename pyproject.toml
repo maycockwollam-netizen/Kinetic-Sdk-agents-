@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "kinetic-agent-sdk"
@@ -32,6 +32,12 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
 
 [project.scripts]
 kinetic = "kinetic_sdk.cli.main:main"
+
+[tool.maturin]
+python-source = "."
+module-name = "kinetic_sdk._patch_rs"
+bindings = "pyo3"
+features = ["pyo3/extension-module"]
 
 [tool.ruff]
 target-version = "py310"
