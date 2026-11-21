@@ -495,6 +495,63 @@ def test_chat_stream_retries_stream_creation(monkeypatch, no_sleep):
     assert len(completion.calls) == 2
 
 
+class _FakeQuotaError(Exception):
+    status_code = 402
+
+
+class _FakeAuthError(Exception):
+    status_code = 401
+
+
+class _FakeContentPolicyError(Exception):
+    status_code = 403
+
+
+def test_classify_llm_error_taxonomy() -> None:
+    from kinetic_sdk.llm.client import classify_llm_error
+
+    assert classify_llm_error(_FakeRateLimitError("slow down")) == "transient"
+    assert classify_llm_error(_FakeServerError("boom")) == "transient"
+    assert classify_llm_error(_FakeBadRequestError("bad")) == "invalid"
+    assert classify_llm_error(_FakeAuthError("unauthorized")) == "auth"
+    assert classify_llm_error(_FakeQuotaError("quota exceeded")) == "quota"
+    assert classify_llm_error(_FakeContentPolicyError("content policy violation")) == "content_policy"
+    assert classify_llm_error(_FakeTimeoutError("timed out")) == "transient"
+    context = _FakeBadRequestError("this model's maximum context length is 200000 tokens")
+    assert classify_llm_error(context) == "context_overflow"
+
+
+def test_chat_falls_back_to_next_model_on_quota(monkeypatch, no_sleep) -> None:
+    resp = _make_text_response("ok")
+    completion = _flaky_completion(monkeypatch, [_FakeQuotaError("quota exceeded")], resp)
+    client = _new_client(fallback_models=["gpt-4o-mini"])
+
+    out = client.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert out.content == "ok"
+    assert len(completion.calls) == 2
+    assert completion.calls[0]["model"] == "openai/openhands/glm-5.2"
+    assert completion.calls[1]["model"] == "gpt-4o-mini"
+
+
+def test_chat_does_not_fallback_on_invalid(monkeypatch, no_sleep) -> None:
+    completion = _flaky_completion(monkeypatch, [_FakeBadRequestError("bad")], None)
+    client = _new_client(fallback_models=["gpt-4o-mini"])
+
+    with pytest.raises(_FakeBadRequestError):
+        client.chat(messages=[{"role": "user", "content": "hi"}])
+    assert len(completion.calls) == 1
+
+
+def test_chat_raises_after_all_fallbacks_fail(monkeypatch, no_sleep) -> None:
+    completion = _flaky_completion(monkeypatch, [_FakeQuotaError("q"), _FakeQuotaError("q")], None)
+    client = _new_client(fallback_models=["gpt-4o-mini"])
+
+    with pytest.raises(_FakeQuotaError):
+        client.chat(messages=[{"role": "user", "content": "hi"}])
+    assert len(completion.calls) == 2
+
+
 def test_timeout_is_forwarded_to_litellm(fake_completion):
     fake_completion.return_value = _make_text_response("ok")
     client = _new_client(timeout=12.5)
