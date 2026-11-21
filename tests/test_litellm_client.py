@@ -513,3 +513,49 @@ def test_invalid_retry_config_rejected():
     for kwargs in ({"timeout": 0}, {"max_retries": -1}, {"retry_base_delay": 0}):
         with pytest.raises(ValueError):
             _new_client(**kwargs)
+
+
+def test_prompt_cache_adds_breakpoints_for_anthropic(fake_completion):
+    client = LiteLLMClient(model="anthropic/claude-3-5-sonnet", api_key="xk")
+    client.chat(
+        [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        system="system prompt",
+    )
+    messages = fake_completion.calls[0]["messages"]
+    # system content becomes a cacheable text block.
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    # the first (only) user message is cached too.
+    assert messages[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_prompt_cache_marks_first_and_last_message(fake_completion):
+    client = LiteLLMClient(model="anthropic.claude-3-7-sonnet", api_key="xk")
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "one"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+        {"role": "user", "content": [{"type": "text", "text": "three"}]},
+    ]
+    client.chat(messages, system="sys")
+    cached = fake_completion.calls[0]["messages"]
+    # system, first non-system message, and last message all get a breakpoint.
+    assert cached[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert cached[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert cached[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_prompt_cache_skips_non_anthropic(fake_completion):
+    client = LiteLLMClient(model="gpt-4o", api_key="xk")
+    client.chat([{"role": "user", "content": "hi"}], system="sys")
+    messages = fake_completion.calls[0]["messages"]
+    assert isinstance(messages[0]["content"], str)
+    assert "cache_control" not in messages[0]
+    assert "cache_control" not in messages[1]
+
+
+def test_prompt_cache_can_be_disabled(fake_completion):
+    client = LiteLLMClient(model="anthropic/claude-3-5-sonnet", api_key="xk", prompt_cache=False)
+    client.chat([{"role": "user", "content": "hi"}], system="sys")
+    messages = fake_completion.calls[0]["messages"]
+    assert isinstance(messages[0]["content"], str)
+    assert all("cache_control" not in message for message in messages)
