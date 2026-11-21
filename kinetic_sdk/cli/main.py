@@ -251,8 +251,21 @@ def cmd_run(task: str, model: str | None, api_key: str | None, base_url: str | N
         return 1
 
 
+def _tui_available() -> bool:
+    try:
+        import textual  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def cmd_chat(model: str | None, api_key: str | None, base_url: str | None, verify: bool, auto_yes: bool, safe: bool, stream: bool) -> int:
     agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe)
+    if _tui_available():
+        from kinetic_sdk.cli.tui_app import KineticTuiApp
+
+        KineticTuiApp(agent).run()
+        return 0
     tui.print_banner()
     while True:
         try:
