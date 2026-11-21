@@ -11,6 +11,7 @@ from typing import Any
 
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.ask_user import AskUserTool
+from kinetic_sdk.cli import ui as tui
 from kinetic_sdk.codemap import CodebaseMapTool
 from kinetic_sdk.conversation.store import JsonFileConversationStore
 from kinetic_sdk.files import (
@@ -207,16 +208,7 @@ def _save_evidence(agent: Agent, task: str, result: str) -> None:
 
 
 def print_evidence(agent: Agent) -> None:
-    ev = agent.verification_evidence
-    if ev is None:
-        print("Evidence: none")
-        return
-    print("Evidence:")
-    print(f"  changed_files: {ev.changed_files}")
-    print(f"  commands_run: {ev.commands_run}")
-    print(f"  test_results: {ev.test_results}")
-    print(f"  remaining_risks: {ev.remaining_risks}")
-    print(f"  verified: {ev.is_verified()}")
+    tui.print_evidence_panel(agent.verification_evidence)
 
 
 def _stream_into_agent(agent: Agent, task: str, verify: bool) -> str:
@@ -225,7 +217,7 @@ def _stream_into_agent(agent: Agent, task: str, verify: bool) -> str:
     def _on_event(event):  # type: ignore[no-untyped-def]
         if event.event_type == "agent.text_delta":
             delta = event.payload.get("delta", "")
-            print(delta, end="", flush=True)
+            tui.stream_delta(str(delta))
             chunks.append(str(delta))
 
     agent.event_bus.subscribe("agent.text_delta", _on_event)
@@ -241,69 +233,74 @@ def _stream_into_agent(agent: Agent, task: str, verify: bool) -> str:
 def cmd_run(task: str, model: str | None, api_key: str | None, base_url: str | None, verify: bool, stream: bool, auto_yes: bool, safe: bool) -> int:
     agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe)
     try:
-        result = _stream_into_agent(agent, task, verify) if stream else agent.run(task, verify=verify)
-        print(result)
+        if stream:
+            result = _stream_into_agent(agent, task, verify)
+        else:
+            with tui.status("Running"):
+                result = agent.run(task, verify=verify)
+        tui.print_assistant(result)
         print_evidence(agent)
         _save_evidence(agent, task, result)
         try:
-            print(f"Usage: {agent.usage.snapshot()}")
+            tui.print_ok(f"Usage: {agent.usage.snapshot()}")
         except Exception:
             pass
         return 0
     except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        tui.print_error(str(exc))
         return 1
 
 
 def cmd_chat(model: str | None, api_key: str | None, base_url: str | None, verify: bool, auto_yes: bool, safe: bool, stream: bool) -> int:
     agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe)
-    print("Kinetic interactive chat. Type /help for commands, /exit to quit.")
+    tui.print_banner()
     while True:
         try:
             line = input("kinetic> ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nBye!")
+            tui.print_ok("Bye!")
             return 0
         if not line:
             continue
         if line in ("/exit", "/quit"):
-            print("Bye!")
+            tui.print_ok("Bye!")
             return 0
         if line in ("/help", "/h"):
-            print("Commands: /exit, /reset, /verify, /evidence, /config, /model <name>, /usage")
+            tui.print_system("Commands: /exit, /reset, /verify, /evidence, /config, /model <name>, /usage")
             continue
         if line == "/reset":
             agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe)
-            print("Conversation reset.")
+            tui.print_system("Conversation reset.")
             continue
         if line == "/verify":
-            print(f"verification_required = {agent.verification_required}")
+            tui.print_system(f"verification_required = {agent.verification_required}")
             continue
         if line == "/evidence":
             print_evidence(agent)
             continue
         if line == "/usage":
             try:
-                print(agent.usage.snapshot())
+                tui.print_assistant(str(agent.usage.snapshot()))
             except Exception as exc:
-                print(f"Usage unavailable: {exc}")
+                tui.print_error(f"Usage unavailable: {exc}")
             continue
         if line == "/config":
             for k, v in load_config().items():
-                print(f"  {k}: {v}")
+                tui.print_system(f"{k}: {v}")
             continue
         if line.startswith("/model "):
             model = line.split(maxsplit=1)[1].strip()
             agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe)
-            print(f"Switched to model: {model}")
+            tui.print_system(f"Switched to model: {model}")
             continue
+        tui.print_user(line)
         try:
             result = _stream_into_agent(agent, line, verify) if stream else agent.run(line, verify=verify)
-            print(result)
+            tui.print_assistant(result)
             print_evidence(agent)
             _save_evidence(agent, line, result)
         except Exception as exc:
-            print(f"Error: {exc}", file=sys.stderr)
+            tui.print_error(str(exc))
     return 0
 
 
