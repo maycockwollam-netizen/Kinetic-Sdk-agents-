@@ -28,12 +28,13 @@ jobs:
         uses: pypa/cibuildwheel@v2.22.0
         env:
           CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
-          CIBW_SKIP: "*musllinux* *win32* *pp*"
-          CIBW_ARCHS_MACOS: "x86_64 arm64"
-          # manylinux containers do not ship Rust; install it and expose it
-          # to the maturin build step.
-          CIBW_BEFORE_ALL: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
-          CIBW_ENVIRONMENT: 'PATH="$HOME/.cargo/bin:$PATH"'
+          CIBW_SKIP: "*musllinux* *win32* *pp* *macosx_x86_64*"
+          CIBW_ARCHS_MACOS: "arm64"
+          # macOS/Windows runners ship Rust; only add the needed targets.
+          CIBW_BEFORE_BUILD_MACOS: "rustup target add aarch64-apple-darwin"
+          # manylinux containers do not ship Rust - install it and expose it.
+          CIBW_BEFORE_ALL_LINUX: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+          CIBW_ENVIRONMENT_LINUX: 'PATH="$HOME/.cargo/bin:$PATH"'
 
       - uses: actions/upload-artifact@v4
         with:
