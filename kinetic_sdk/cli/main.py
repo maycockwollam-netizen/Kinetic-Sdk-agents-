@@ -236,7 +236,7 @@ def _stream_into_agent(agent: Agent, task: str, verify: bool) -> str:
     return result
 
 
-def cmd_run(task: str, model: str | None, api_key: str | None, base_url: str | None, verify: bool, stream: bool, auto_yes: bool, safe: bool) -> int:
+def cmd_run(task: str, model: str | None, api_key: str | None, base_url: str | None, verify: bool, stream: bool, auto_yes: bool, safe: bool, show_diff: bool = False) -> int:
     agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe)
     try:
         if stream:
@@ -247,6 +247,8 @@ def cmd_run(task: str, model: str | None, api_key: str | None, base_url: str | N
         tui.print_assistant(result)
         print_evidence(agent)
         _save_evidence(agent, task, result)
+        if show_diff:
+            cmd_diff(Path.cwd())
         try:
             tui.print_ok(f"Usage: {agent.usage.snapshot()}")
         except Exception:
@@ -326,7 +328,10 @@ def cmd_chat(model: str | None, api_key: str | None, base_url: str | None, verif
             tui.print_ok("Bye!")
             return 0
         if line in ("/help", "/h"):
-            tui.print_system("Commands: /exit, /reset, /verify, /evidence, /config, /model <name>, /usage")
+            tui.print_system("Commands: /exit, /reset, /verify, /evidence, /config, /diff, /model <name>, /usage")
+            continue
+        if line == "/diff":
+            cmd_diff(Path.cwd())
             continue
         if line == "/reset":
             agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe, session_id=session_id)
@@ -429,6 +434,36 @@ def cmd_verify() -> int:
     return 0
 
 
+def _workspace_diff(root: str | Path) -> str:
+    """Return the working-tree diff vs HEAD (stat + body), or '' when clean."""
+    root_path = Path(root)
+    if not (root_path / ".git").is_dir():
+        return ""
+    try:
+        stat = subprocess.run(
+            ["git", "-C", str(root_path), "diff", "--stat", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        body = subprocess.run(
+            ["git", "-C", str(root_path), "diff", "HEAD", "--color", "never"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (stat.stdout + "\n" + body.stdout).strip()
+
+
+def cmd_diff(path: str | Path = ".") -> int:
+    """Show working-tree changes vs HEAD for *path* (default: current dir)."""
+    diff = _workspace_diff(path)
+    if not diff:
+        tui.print_system("No working-tree changes (or not a git repository).")
+        return 0
+    tui.print_system(f"Working-tree changes in {Path(path).resolve()}:")
+    print(diff)
+    return 0
+
+
 def cmd_explore(path: str = ".") -> int:
     """Scan *path* and write a ``repo`` skill (SKILL.md) for it."""
     from kinetic_sdk.codemap.skill import build_repo_skill
@@ -468,6 +503,7 @@ def main() -> int:
 
     p_run = sub.add_parser("run", help="Run a one-shot task")
     p_run.add_argument("task", help="Task description")
+    p_run.add_argument("--diff", action="store_true", help="Show working-tree diff after running")
     _add_common(p_run)
 
     p_chat = sub.add_parser("chat", help="Interactive chat session")
@@ -489,6 +525,8 @@ def main() -> int:
     sub.add_parser("version", help="Show version")
     p_explore = sub.add_parser("explore", help="Auto-generate a repo skill (SKILL.md) for a project")
     p_explore.add_argument("path", nargs="?", default=".")
+    p_diff = sub.add_parser("diff", help="Show working-tree changes vs HEAD")
+    p_diff.add_argument("path", nargs="?", default=".")
     p_session = sub.add_parser("session", help="Manage conversation sessions")
     sess_sub = p_session.add_subparsers(dest="session_action")
     sess_sub.add_parser("list", help="List saved sessions")
@@ -500,7 +538,7 @@ def main() -> int:
     args, unknown = parser.parse_known_args()
 
     if args.command == "run":
-        return cmd_run(args.task, args.model, args.api_key, args.base_url, args.verify, args.stream, args.yes, args.safe)
+        return cmd_run(args.task, args.model, args.api_key, args.base_url, args.verify, args.stream, args.yes, args.safe, args.diff)
     if args.command == "chat":
         return cmd_chat(args.model, args.api_key, args.base_url, args.verify, args.yes, args.safe, args.stream, args.session)
     if args.command == "config":
@@ -517,6 +555,8 @@ def main() -> int:
         return cmd_explore(args.path)
     if args.command == "session":
         return cmd_session(args)
+    if args.command == "diff":
+        return cmd_diff(args.path)
 
     if unknown and not unknown[0].startswith("-"):
         task = " ".join(unknown)
