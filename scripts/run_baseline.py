@@ -17,6 +17,14 @@ from kpi_sdk.bench.harness import apply_solution, discover_tasks, run_task_tests
 from kpi_sdk.bench.schema import BenchmarkReport, TaskResult, classify_real_status
 
 
+def git_sha() -> str:
+    """Current HEAD, or ``unknown`` for a non-git checkout (e.g. an sdist)."""
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "unknown"
+
+
 def main() -> int:
     model = os.environ.get("MODEL", "mock")
     profile = os.environ.get("PROFILE", "mock")
@@ -29,7 +37,7 @@ def main() -> int:
         model=model,
         profile=profile,
         runs=runs,
-        git_sha=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        git_sha=git_sha(),
         date=date.today().isoformat(),
     )
     for task in discover_tasks(ROOT / "benchmarks" / "tasks"):
