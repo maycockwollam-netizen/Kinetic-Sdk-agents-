@@ -523,6 +523,72 @@ def cmd_diff(path: str | Path = ".") -> int:
     return 0
 
 
+def _doctor_tick(ok: bool, label: str, detail: str = "") -> None:
+    mark = "✓" if ok else "✗"
+    suffix = f" — {detail}" if detail else ""
+    print(f"{mark} {label}{suffix}")
+
+
+def cmd_doctor() -> int:
+    """Check the environment/runtime and print a pass/fail health report."""
+    import importlib.metadata
+    import importlib.util
+    import platform
+
+    _doctor_tick(
+        sys.version_info >= (3, 10),
+        f"Python {platform.python_version()} (needs >=3.10)",
+    )
+    try:
+        installed = importlib.metadata.version("kinetic-agent-sdk")
+    except importlib.metadata.PackageNotFoundError:
+        installed = "n/a (source checkout)"
+    _doctor_tick(True, f"kinetic-agent-sdk {installed}")
+
+    try:
+        from kinetic_sdk import _kinetic_rs  # type: ignore[attr-defined]
+
+        tokens = _kinetic_rs.count_tokens("xin chào", "cl100k_base")
+        _doctor_tick(True, "Rust extension _kinetic_rs", f"count_tokens OK ({tokens})")
+    except Exception as exc:  # noqa: BLE001 - report, don't raise
+        _doctor_tick(
+            False,
+            "Rust extension _kinetic_rs",
+            f"unavailable ({type(exc).__name__}) — reinstall with the Rust toolchain",
+        )
+
+    for package in ("litellm", "rich", "textual", "tiktoken"):
+        found = importlib.util.find_spec(package) is not None
+        _doctor_tick(found, f"{package}", "installed" if found else "not installed (optional)")
+
+    is_git = (Path.cwd() / ".git").is_dir() or (
+        subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )
+    _doctor_tick(is_git, "git repository", "cwd is a git work tree" if is_git else "not a git work tree")
+
+    env_key = next(
+        (
+            name
+            for name in (
+                "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+                "GROQ_API_KEY", "OPENHANDS_API_KEY",
+            )
+            if os.environ.get(name)
+        ),
+        None,
+    )
+    _doctor_tick(env_key is not None, "LLM API key", env_key or "none set (use --api-key or config)")
+
+    cargo = importlib.util.find_spec("maturin") is not None
+    _doctor_tick(cargo, "maturin", "installed (dev/build)" if cargo else "not installed")
+    return 0
+
+
 def cmd_explore(path: str = ".") -> int:
     """Scan *path* and write a ``repo`` skill (SKILL.md) for it."""
     from kinetic_sdk.codemap.skill import build_repo_skill
@@ -583,6 +649,7 @@ def main() -> int:
     p_bench.add_argument("--runs", type=int, default=1)
 
     sub.add_parser("verify", help="Show verification evidence from last run")
+    sub.add_parser("doctor", help="Check environment/runtime health")
     sub.add_parser("version", help="Show version")
     p_explore = sub.add_parser("explore", help="Auto-generate a repo skill (SKILL.md) for a project")
     p_explore.add_argument("path", nargs="?", default=".")
@@ -618,6 +685,8 @@ def main() -> int:
         return cmd_session(args)
     if args.command == "diff":
         return cmd_diff(args.path)
+    if args.command == "doctor":
+        return cmd_doctor()
 
     if unknown and not unknown[0].startswith("-"):
         task = " ".join(unknown)
