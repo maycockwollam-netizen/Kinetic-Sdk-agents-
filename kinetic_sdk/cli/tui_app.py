@@ -22,7 +22,7 @@ from textual.widgets import Footer, Header, Input, Static
 
 from kinetic_sdk.agent.agent import Agent
 
-SPLASH_NAME = "opencode"
+SPLASH_NAME = "gow"
 
 
 class ChatView(VerticalScroll):
