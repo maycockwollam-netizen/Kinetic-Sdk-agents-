@@ -517,3 +517,84 @@ def test_parallel_disabled_by_default_uses_sequential():
     elapsed = time.monotonic() - started
     assert elapsed >= 0.45  # 3 x 0.15s strictly sequential
     assert agent._executor is None  # pool never created
+
+
+def _messages_text(messages):
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    yield block.get("text", "")
+        elif isinstance(content, str):
+            yield content
+
+
+def test_agent_injects_strategy_guidance_after_consecutive_tool_errors():
+    from kinetic_sdk.testing import MockTool
+    from kinetic_sdk.tool.base import ToolResult
+
+    def always_flaky(messages, tools, system):
+        return tool_response("call", "flaky", {})
+
+    llm = MockLLM([always_flaky] * 12)
+    agent = Agent(
+        llm=llm,
+        tools=[MockTool(name="flaky", result=ToolResult(error="boom"))],
+        permission_policy=PermissivePolicy(),
+        consecutive_tool_error_guidance=3,
+        max_iterations=9,
+    )
+    agent.run("do it")
+
+    guidance_appears = any(
+        any("consecutive tool errors" in text for text in _messages_text(call["messages"]))
+        for call in llm.calls
+    )
+    assert guidance_appears
+
+
+def test_consecutive_tool_error_guidance_emits_event():
+    from kinetic_sdk.testing import MockTool
+    from kinetic_sdk.tool.base import ToolResult
+
+    def always_flaky(messages, tools, system):
+        return tool_response("call", "flaky", {})
+
+    observed: list[Event] = []
+    llm = MockLLM([always_flaky] * 12)
+    agent = Agent(
+        llm=llm,
+        tools=[MockTool(name="flaky", result=ToolResult(error="boom"))],
+        permission_policy=PermissivePolicy(),
+        event_bus=EventBus(),
+        consecutive_tool_error_guidance=2,
+        max_iterations=7,
+    )
+    agent.event_bus.subscribe("agent.tool_error_guidance", observed.append)
+    agent.run("do it")
+
+    assert any(event.type == "agent.tool_error_guidance" for event in observed)
+
+
+def test_consecutive_tool_error_guidance_can_be_disabled():
+    from kinetic_sdk.testing import MockTool
+    from kinetic_sdk.tool.base import ToolResult
+
+    def always_flaky(messages, tools, system):
+        return tool_response("call", "flaky", {})
+
+    llm = MockLLM([always_flaky] * 12)
+    agent = Agent(
+        llm=llm,
+        tools=[MockTool(name="flaky", result=ToolResult(error="boom"))],
+        permission_policy=PermissivePolicy(),
+        consecutive_tool_error_guidance=0,
+        max_iterations=6,
+    )
+    agent.run("do it")
+
+    assert not any(
+        any("consecutive tool errors" in text for text in _messages_text(call["messages"]))
+        for call in llm.calls
+    )
