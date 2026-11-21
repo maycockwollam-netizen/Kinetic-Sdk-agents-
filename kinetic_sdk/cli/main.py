@@ -99,6 +99,7 @@ def build_agent(
     safe: bool = False,
     workspace_root: str | Path | None = None,
     stream_logger: bool = False,
+    session_id: str | None = None,
 ) -> Agent:
     model = model or str(get_config("model", DEFAULT_MODEL))
     llm: LLMClient
@@ -167,8 +168,13 @@ def build_agent(
     store: JsonFileConversationStore | None = None
     if PROJECT_DIR.exists():
         try:
-            store = JsonFileConversationStore(str(HISTORY_FILE))
-        except Exception:
+            if session_id is None:
+                store = JsonFileConversationStore(str(HISTORY_FILE))
+            else:
+                from kinetic_sdk.conversation.sessions import SessionStore
+
+                store = SessionStore(str(PROJECT_DIR / "sessions")).open(session_id)
+        except Exception:  # noqa: BLE001 - session persistence is best-effort
             store = None
 
     return Agent(
@@ -259,8 +265,49 @@ def _tui_available() -> bool:
     return True
 
 
-def cmd_chat(model: str | None, api_key: str | None, base_url: str | None, verify: bool, auto_yes: bool, safe: bool, stream: bool) -> int:
-    agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe)
+def cmd_session(args: argparse.Namespace) -> int:
+    """Manage named conversation sessions (list / show / delete)."""
+    from kinetic_sdk.conversation.sessions import SessionStore
+
+    store = SessionStore(str(PROJECT_DIR / "sessions"))
+    action = args.session_action
+    if action == "list":
+        sessions = store.list()
+        if not sessions:
+            print("No saved sessions yet. Start a chat with `kinetic chat --session <name>`.")
+            return 0
+        print("SESSION\tMSGS\tUPDATED (UTC)")
+        for info in sessions:
+            print(f"{info.id}\t{info.message_count}\t{info.updated_at}")
+        return 0
+    if action == "show":
+        state = store.load(args.session_id)
+        if state is None:
+            tui.print_error(f"session {args.session_id!r} not found")
+            return 1
+        tui.print_ok(f"Session {args.session_id}: {len(state.messages)} message(s)")
+        for message in state.messages:
+            role = message.get("role", "?")
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(block.get("text", block.get("name", ""))) for block in content
+                )
+            preview = str(content)[:160]
+            print(f"[{role}] {preview}")
+        return 0
+    if action == "delete":
+        deleted = store.delete(args.session_id)
+        if not deleted:
+            tui.print_error(f"session {args.session_id!r} not found")
+            return 1
+        tui.print_ok(f"Deleted session {args.session_id}")
+        return 0
+    return 0
+
+
+def cmd_chat(model: str | None, api_key: str | None, base_url: str | None, verify: bool, auto_yes: bool, safe: bool, stream: bool, session_id: str | None = None) -> int:
+    agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe, session_id=session_id)
     if _tui_available():
         from kinetic_sdk.cli.tui_app import KineticTuiApp
 
@@ -282,7 +329,7 @@ def cmd_chat(model: str | None, api_key: str | None, base_url: str | None, verif
             tui.print_system("Commands: /exit, /reset, /verify, /evidence, /config, /model <name>, /usage")
             continue
         if line == "/reset":
-            agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe)
+            agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe, session_id=session_id)
             tui.print_system("Conversation reset.")
             continue
         if line == "/verify":
@@ -303,7 +350,7 @@ def cmd_chat(model: str | None, api_key: str | None, base_url: str | None, verif
             continue
         if line.startswith("/model "):
             model = line.split(maxsplit=1)[1].strip()
-            agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe)
+            agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe, session_id=session_id)
             tui.print_system(f"Switched to model: {model}")
             continue
         tui.print_user(line)
@@ -424,6 +471,7 @@ def main() -> int:
     _add_common(p_run)
 
     p_chat = sub.add_parser("chat", help="Interactive chat session")
+    p_chat.add_argument("--session", metavar="ID", help="Named session to resume or create")
     _add_common(p_chat)
 
     p_config = sub.add_parser("config", help="Manage configuration")
@@ -441,13 +489,20 @@ def main() -> int:
     sub.add_parser("version", help="Show version")
     p_explore = sub.add_parser("explore", help="Auto-generate a repo skill (SKILL.md) for a project")
     p_explore.add_argument("path", nargs="?", default=".")
+    p_session = sub.add_parser("session", help="Manage conversation sessions")
+    sess_sub = p_session.add_subparsers(dest="session_action")
+    sess_sub.add_parser("list", help="List saved sessions")
+    _sess_show = sess_sub.add_parser("show", help="Show a session's messages")
+    _sess_show.add_argument("session_id")
+    _sess_delete = sess_sub.add_parser("delete", help="Delete a session")
+    _sess_delete.add_argument("session_id")
 
     args, unknown = parser.parse_known_args()
 
     if args.command == "run":
         return cmd_run(args.task, args.model, args.api_key, args.base_url, args.verify, args.stream, args.yes, args.safe)
     if args.command == "chat":
-        return cmd_chat(args.model, args.api_key, args.base_url, args.verify, args.yes, args.safe, args.stream)
+        return cmd_chat(args.model, args.api_key, args.base_url, args.verify, args.yes, args.safe, args.stream, args.session)
     if args.command == "config":
         return cmd_config(args)
     if args.command == "init":
@@ -460,6 +515,8 @@ def main() -> int:
         return cmd_version()
     if args.command == "explore":
         return cmd_explore(args.path)
+    if args.command == "session":
+        return cmd_session(args)
 
     if unknown and not unknown[0].startswith("-"):
         task = " ".join(unknown)
