@@ -26,12 +26,17 @@ def _sample_tree(tmp_path):
 
 def _grep_with_engine(workspace, monkeypatch, engine):
     monkeypatch.setattr("kinetic_sdk.files.search.shutil.which", lambda _: "rg" if engine == "rg" else None)
+    if engine == "python":
+        monkeypatch.setattr("kinetic_sdk.files.search._kinetic_rs", None)
+    elif engine == "rust":
+        pytest.importorskip("kinetic_sdk._kinetic_rs")
     return GrepTool(workspace).execute(pattern="needle")
 
 
 def test_python_regex_redos_times_out_without_hanging(search_workspace, tmp_path, monkeypatch):
     (tmp_path / "slow.txt").write_text("a" * 26)
     monkeypatch.setattr("kinetic_sdk.files.search.shutil.which", lambda _: None)
+    monkeypatch.setattr("kinetic_sdk.files.search._kinetic_rs", None)
     monkeypatch.setattr(GrepTool, "SEARCH_TIMEOUT_SECONDS", 1.0)
 
     started = time.monotonic()
@@ -87,11 +92,34 @@ def test_grep_limit_is_total_across_files(search_workspace, tmp_path, monkeypatc
     for name in ("a.txt", "b.txt", "c.txt"):
         (tmp_path / name).write_text("needle\n")
     monkeypatch.setattr("kinetic_sdk.files.search.shutil.which", lambda _: None)
+    monkeypatch.setattr("kinetic_sdk.files.search._kinetic_rs", None)
 
     result = GrepTool(search_workspace).execute(pattern="needle", max_results=2)
 
     assert result.output.splitlines() == ["a.txt:1:needle", "b.txt:1:needle"]
     assert result.metadata["count"] == 2
+
+
+def test_rust_engine_matches_python_fallback(search_workspace, tmp_path, monkeypatch):
+    pytest.importorskip("kinetic_sdk._kinetic_rs")
+    _sample_tree(tmp_path)
+
+    rust_result = _grep_with_engine(search_workspace, monkeypatch, "rust")
+
+    assert rust_result.metadata["engine"] == "rust"
+    assert rust_result.output == "visible.txt:1:needle"
+
+
+def test_rust_engine_respects_gitignore(search_workspace, tmp_path, monkeypatch):
+    pytest.importorskip("kinetic_sdk._kinetic_rs")
+    (tmp_path / "keep.txt").write_text("needle\n")
+    (tmp_path / "ignored.txt").write_text("needle\n")
+    (tmp_path / ".gitignore").write_text("ignored.txt\n")
+
+    result = _grep_with_engine(search_workspace, monkeypatch, "rust")
+
+    assert "ignored.txt" not in result.output
+    assert "keep.txt:1:needle" in result.output
 
 
 @pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep is not installed")

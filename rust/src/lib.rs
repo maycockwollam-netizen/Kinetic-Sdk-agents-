@@ -1,9 +1,14 @@
+use std::fs;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 static CL100K_BPE: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
+
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const BINARY_CHECK_BYTES: usize = 8 * 1024;
 
 #[derive(Debug)]
 struct Hunk {
@@ -232,10 +237,86 @@ fn count_tokens(text: &str, encoding: Option<&str>) -> PyResult<usize> {
     Ok(bpe.encode_with_special_tokens(text).len())
 }
 
+/// Search file contents with a regex, honouring ``.gitignore`` and hidden
+/// files via the ``ignore`` crate.
+///
+/// Mirrors the Python fallback's safety bounds (2 MB file cap, binary
+/// detection, line limit) but runs at near-ripgrep speed without needing an
+/// external ``rg`` binary. Returns ``(relative_path, line_number, line)``.
+#[pyfunction]
+#[pyo3(signature = (pattern, root, glob=None, case_sensitive=true, limit=100))]
+fn grep_contents(
+    pattern: &str,
+    root: &str,
+    glob: Option<&str>,
+    case_sensitive: bool,
+    limit: usize,
+) -> PyResult<Vec<(String, usize, String)>> {
+    let matcher = regex::RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|err| PyValueError::new_err(format!("invalid regex: {err}")))?;
+    let glob_matcher = match glob {
+        Some(glob) => Some(
+            globset::Glob::new(glob)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?
+                .compile_matcher(),
+        ),
+        None => None,
+    };
+    let root_path = Path::new(root);
+    let mut results: Vec<(String, usize, String)> = Vec::new();
+    // `require_git(false)` honours .gitignore even when the root is not a git
+    // repository, mirroring `rg --no-require-git` and the Python fallback's
+    // intent of skipping generated/vendored files.
+    for entry in ignore::WalkBuilder::new(root_path).require_git(false).build() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        let relative = match path.strip_prefix(root_path) {
+            Ok(relative) => relative,
+            Err(_) => continue,
+        };
+        if let Some(matcher) = &glob_matcher {
+            if !matcher.is_match(relative) {
+                continue;
+            }
+        }
+        match fs::metadata(path) {
+            Ok(metadata) if metadata.len() <= MAX_FILE_BYTES => {}
+            _ => continue,
+        }
+        let data = match fs::read(path) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        if data[..data.len().min(BINARY_CHECK_BYTES)].contains(&0) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&data);
+        let relative = relative.to_string_lossy();
+        for (idx, line) in text.lines().enumerate() {
+            if matcher.is_match(line) {
+                results.push((relative.to_string(), idx + 1, line.to_string()));
+                if results.len() >= limit {
+                    return Ok(results);
+                }
+            }
+        }
+    }
+    Ok(results)
+}
+
 #[pymodule]
 fn _kinetic_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(parse_patch, module)?)?;
     module.add_function(wrap_pyfunction!(apply_file_patch, module)?)?;
     module.add_function(wrap_pyfunction!(count_tokens, module)?)?;
+    module.add_function(wrap_pyfunction!(grep_contents, module)?)?;
     Ok(())
 }

@@ -11,3 +11,6 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }
 tiktoken-rs = "0.12"
+globset = "0.4"
+ignore = "0.4"
+regex = "1"
