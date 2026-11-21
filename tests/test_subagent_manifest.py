@@ -120,3 +120,31 @@ def test_load_subagent_specs_missing_dir_raises(tmp_path) -> None:
 
     with pytest.raises(ValueError):
         load_subagent_specs(tmp_path / "does-not-exist")
+
+
+def test_tools_allowlist_round_trips_through_markdown(tmp_path) -> None:
+    from kinetic_sdk.subagent.manifest import load_subagent_spec
+
+    spec = SubagentSpec(
+        name="reviewer",
+        system_prompt="Review diffs.",
+        tools=("glob", "grep", "file_editor"),
+    )
+    path = tmp_path / "reviewer.md"
+    path.write_text(spec.to_markdown(), encoding="utf-8")
+
+    loaded = load_subagent_spec(path)
+    assert loaded == spec
+    assert loaded.tools == ("glob", "grep", "file_editor")
+
+
+def test_tools_allowlist_parsed_from_frontmatter(tmp_path) -> None:
+    from kinetic_sdk.subagent.manifest import load_subagent_spec
+
+    path = tmp_path / "reader.md"
+    path.write_text(
+        "---\nname: reader\ndescription: read only\ntools: glob, grep\n---\n\nRead files.\n",
+        encoding="utf-8",
+    )
+    loaded = load_subagent_spec(path)
+    assert loaded.tools == ("glob", "grep")

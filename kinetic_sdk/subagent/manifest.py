@@ -7,10 +7,12 @@ module encodes:
 1. **Every sub-agent has its own system prompt.** ``system_prompt`` is
    REQUIRED (never inherited from the parent) — this is the single
    deliberate difference from "an exact copy of the parent".
-2. **Tools/permissions are NOT declared here.** Sub-agents inherit the
-   parent's full tool set and ``permission_policy`` by default (the
-   controller/executor pattern stays possible). A future version may add
-   optional override fields to narrow that set; none are implemented now.
+2. **Tools default to full inheritance, with an optional allowlist.**
+   Sub-agents inherit the parent's full tool set and ``permission_policy``
+   by default (the controller/executor pattern stays possible). The
+   optional ``tools`` field on a spec is a single authentication layer:
+   when set, the spawned agent gets EXACTLY the named tools and nothing
+   else.
 """
 
 from __future__ import annotations
@@ -55,12 +57,18 @@ class SubagentSpec:
             non-``None`` value only takes effect when the spawner is given
             an ``llm_factory`` able to build a client for it (see
             :func:`~kinetic_sdk.subagent.delegation.spawn_subagent`).
+        tools: Optional allow-listed tool names. When empty (default) the
+            sub-agent inherits the parent's full tool set. When set, the
+            spawned agent receives ONLY these tools — the tool names refer
+            to tools registered on the parent (e.g. ``glob``, ``grep``,
+            ``file_editor``, ``delegate``).
     """
 
     name: str
     system_prompt: str
     description: str = ""
     model: str | None = None
+    tools: tuple[str, ...] = ()
 
     def to_markdown(self) -> str:
         """Serialize this spec back to flat-frontmatter Markdown.
@@ -74,6 +82,8 @@ class SubagentSpec:
             lines.append(f"description: {self.description}")
         if self.model:
             lines.append(f"model: {self.model}")
+        if self.tools:
+            lines.append("tools: " + ",".join(self.tools))
         return "---\n" + "\n".join(lines) + "\n---\n\n" + self.system_prompt.rstrip() + "\n"
 
     def __post_init__(self) -> None:
@@ -111,6 +121,9 @@ def load_subagent_spec(path: str | Path) -> SubagentSpec:
         name=frontmatter.get("name", ""),
         description=frontmatter.get("description", ""),
         model=frontmatter.get("model") or None,
+        tools=tuple(
+            tool.strip() for tool in frontmatter.get("tools", "").split(",") if tool.strip()
+        ),
         system_prompt=body.strip(),
     )
 

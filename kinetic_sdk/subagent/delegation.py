@@ -298,6 +298,13 @@ def spawn_subagent(
         else:
             tools.append(tool)
 
+    if spec.tools:
+        # Single authentication layer: this sub-agent may only touch the
+        # tools explicitly named in the spec; everything else inherited
+        # from the parent is dropped.
+        allowed = set(spec.tools)
+        tools = [tool for tool in tools if getattr(tool, "name", "") in allowed]
+
     sub_agent = Agent(
         llm=guarded_llm,
         tools=tools,
