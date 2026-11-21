@@ -1,20 +1,23 @@
 """Atomic application of workspace-confined unified diffs.
 
-The implementation intentionally uses only the standard library.  A patch is
-parsed and applied to in-memory copies of every target before any workspace
-write is attempted; this keeps the SDK core dependency-free and makes a
-multi-file edit all-or-nothing in the normal case.
+The Rust extension handles pure diff parsing and in-memory application when
+installed. The Python implementation remains a source-tree fallback, while
+workspace resolution, locking, writes, and rollback stay in Python.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from kinetic_sdk.subagent.filelock import FileLockRegistry
 from kinetic_sdk.tool.base import Tool, ToolResult
 from kinetic_sdk.workspace.base import WorkspaceBase, WorkspaceError
+
+try:
+    from kinetic_sdk import _patch_rs  # type: ignore[attr-defined]  # extension built by maturin
+except ImportError:  # Source checkout or Python-only environment without extension.
+    _patch_rs = None
 
 
 class PatchApplyError(ValueError):
@@ -29,6 +32,9 @@ class _Hunk:
     new_count: int
     lines: tuple[str, ...]
 
+    def as_rust(self) -> tuple[int, int, int, int, list[str]]:
+        return (self.old_start, self.old_count, self.new_start, self.new_count, list(self.lines))
+
 
 @dataclass(frozen=True)
 class _FilePatch:
@@ -36,29 +42,8 @@ class _FilePatch:
     hunks: tuple[_Hunk, ...]
 
 
-_HUNK_HEADER = re.compile(
-    r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
-    r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?:.*)$"
-)
-
-
 class ApplyPatchTool(Tool):
-    """Apply a unified-diff patch to existing workspace files atomically.
-
-    The ``patch`` argument must contain standard unified-diff file and hunk
-    headers (``--- a/path``, ``+++ b/path``, and ``@@ ... @@``).  For example::
-
-        --- a/src/example.py
-        +++ b/src/example.py
-        @@ -1 +1 @@
-        -old_value = 1
-        +new_value = 2
-
-    Every target is resolved through the configured workspace.  All hunks are
-    dry-run against in-memory content first; a context mismatch or unsafe path
-    leaves every file untouched.  A rare write failure after that dry-run
-    rolls back files already written.
-    """
+    """Apply a unified-diff patch to existing workspace files atomically."""
 
     name: str = "apply_patch"
     description: str = (
@@ -92,9 +77,6 @@ class ApplyPatchTool(Tool):
         self._lock_registry = lock_registry
         self.lock_timeout = lock_timeout
         self._owner_id: str | None = None
-        # Keep one previous value per path, matching FileTool's undo storage
-        # shape.  This makes the pre-patch text available to callers that
-        # coordinate editor undo state around tool instances.
         self._undo: dict[str, str] = {}
 
     def _write_locked(self, path: str, operation: Callable[[], None]) -> None:
@@ -123,8 +105,6 @@ class ApplyPatchTool(Tool):
         for file_patch in file_patches:
             path = file_patch.path
             try:
-                # Always make the explicit boundary check before a backend
-                # read, including backends whose read_text checks internally.
                 self.workspace.resolve(path)
                 original = resolved.get(path)
                 if original is None:
@@ -147,10 +127,7 @@ class ApplyPatchTool(Tool):
                 def write(path: str = path, new_content: str = new_content) -> None:
                     self.workspace.write_text(path, new_content)
 
-                self._write_locked(
-                    path,
-                    write,
-                )
+                self._write_locked(path, write)
                 written.append(path)
         except Exception as exc:
             rollback_errors: list[str] = []
@@ -159,10 +136,7 @@ class ApplyPatchTool(Tool):
                     def rollback(path: str = path) -> None:
                         self.workspace.write_text(path, originals[path])
 
-                    self._write_locked(
-                        path,
-                        rollback,
-                    )
+                    self._write_locked(path, rollback)
                 except Exception as rollback_exc:  # pragma: no cover - catastrophic I/O
                     rollback_errors.append(f"{path}: {rollback_exc}")
             detail = f"apply_patch failed mid-write, rolled back: {exc}"
@@ -186,6 +160,22 @@ class ApplyPatchTool(Tool):
 
     @classmethod
     def _parse_patch(cls, patch: str) -> list[_FilePatch]:
+        if _patch_rs is not None:
+            try:
+                parsed = _patch_rs.parse_patch(patch)
+                return [
+                    _FilePatch(
+                        path,
+                        tuple(
+                            _Hunk(hunk[0], hunk[1], hunk[2], hunk[3], tuple(hunk[4]))
+                            for hunk in hunks
+                        ),
+                    )
+                    for path, hunks in parsed
+                ]
+            except ValueError as exc:
+                raise PatchApplyError(str(exc)) from exc
+
         if not isinstance(patch, str) or not patch.strip():
             raise PatchApplyError("no patch content")
         lines = patch.splitlines(keepends=True)
@@ -209,7 +199,12 @@ class ApplyPatchTool(Tool):
             index += 1
             hunks: list[_Hunk] = []
             while index < len(lines) and not lines[index].startswith("--- "):
-                header = _HUNK_HEADER.match(lines[index].rstrip("\r\n"))
+                import re
+                header = re.match(
+                    r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
+                    r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?:.*)$",
+                    lines[index].rstrip("\r\n"),
+                )
                 if header is None:
                     if lines[index].startswith(("diff --git ", "index ")):
                         break
@@ -221,16 +216,11 @@ class ApplyPatchTool(Tool):
                 old_seen = new_seen = 0
                 while index < len(lines):
                     hunk_line = lines[index]
-                    # A subsequent file header also begins with ``-`` / ``+``;
-                    # recognise it before interpreting ordinary hunk lines.
-                    if hunk_line.startswith("--- ") or hunk_line.startswith("diff --git "):
+                    if hunk_line.startswith(("--- ", "diff --git ")):
                         break
                     if hunk_line.startswith("\\ No newline at end of file"):
                         if not hunk_lines:
                             raise PatchApplyError("newline marker has no preceding hunk line")
-                        # The marker applies to the preceding old or new line.
-                        # Strip only its line ending so application can retain
-                        # the intentional missing final newline.
                         hunk_lines[-1] = hunk_lines[-1].rstrip("\r\n")
                         index += 1
                         continue
@@ -245,12 +235,10 @@ class ApplyPatchTool(Tool):
                     break
                 if old_seen != old_count or new_seen != new_count:
                     raise PatchApplyError("hunk line counts do not match its header")
-                hunks.append(
-                    _Hunk(
-                        int(header.group("old_start")), old_count,
-                        int(header.group("new_start")), new_count, tuple(hunk_lines)
-                    )
-                )
+                hunks.append(_Hunk(
+                    int(header.group("old_start")), old_count,
+                    int(header.group("new_start")), new_count, tuple(hunk_lines)
+                ))
             if not hunks:
                 raise PatchApplyError(f"no hunks for {path}")
             patches.append(_FilePatch(path, tuple(hunks)))
@@ -258,16 +246,21 @@ class ApplyPatchTool(Tool):
 
     @staticmethod
     def _apply_file_patch(original: str, file_patch: _FilePatch) -> str:
+        if _patch_rs is not None:
+            try:
+                return _patch_rs.apply_file_patch(original, [hunk.as_rust() for hunk in file_patch.hunks])
+            except ValueError as exc:
+                raise PatchApplyError(str(exc)) from exc
+
         lines = original.splitlines(keepends=True)
         offset = 0
         newline = "\r\n" if "\r\n" in original else "\n"
         for hunk in file_patch.hunks:
-            # Unified diffs use ``-0,0`` when inserting before the first
-            # line, where subtracting one would point before the file.
             old_index = hunk.old_start if hunk.old_count == 0 else hunk.old_start - 1
             start = old_index + offset
             if start < 0 or start > len(lines):
                 raise PatchApplyError("hunk position is outside the file")
+
             def file_newline(line: str) -> str:
                 body = line.rstrip("\r\n")
                 return body + (newline if line.endswith(("\n", "\r")) else "")
@@ -279,8 +272,7 @@ class ApplyPatchTool(Tool):
                 lower = max(0, start - 20)
                 upper = min(len(lines) - len(expected), start + 20)
                 candidates = [
-                    candidate
-                    for candidate in range(lower, upper + 1)
+                    candidate for candidate in range(lower, upper + 1)
                     if lines[candidate : candidate + len(expected)] == expected
                 ]
                 if len(candidates) != 1:
