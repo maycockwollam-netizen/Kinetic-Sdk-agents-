@@ -16,7 +16,7 @@ from typing import Any, cast
 
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Input, Static
 
@@ -91,11 +91,28 @@ class ChatScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield ChatView(id="chat-view")
-        yield Input(placeholder="Ask anything… (/help, /reset, /exit)", id="prompt")
+        # opencode-style frame: sidebar (sessions) + chat pane + composer.
+        yield Horizontal(
+            VerticalScroll(
+                Static("Sessions", classes="sidebar-title"),
+                Static("▸ default session", classes="sidebar-item"),
+                id="sidebar-view",
+                classes="sidebar-view",
+            ),
+            Vertical(
+                ChatView(id="chat-view"),
+                Static("", id="composer-model", classes="composer-model"),
+                Input(placeholder="Ask anything… (/help, /reset, /exit)", id="prompt"),
+                id="chat-pane",
+                classes="chat-pane",
+            ),
+        )
         yield Footer()
 
     def on_mount(self) -> None:
+        app = cast(KineticTuiApp, self.app)
+        model = str(getattr(app.agent.llm, "model", "") or "unknown")
+        self.query_one("#composer-model", Static).update(f"model: {model}")
         self.query_one("#prompt", Input).focus()
         view = self.query_one("#chat-view", ChatView)
         view.add_system("Connected. /help for commands, /exit to quit.")
@@ -163,19 +180,45 @@ class KineticTuiApp(App[None]):
         height: auto;
         color: $text-muted;
     }
+    .sidebar-view {
+        width: 24;
+        height: 1fr;
+        border-right: heavy;
+        background: $surface;
+    }
+    .sidebar-title {
+        width: 100%;
+        padding: 1 1 0 1;
+        text-style: bold;
+        color: $text-muted;
+    }
+    .sidebar-item {
+        width: 100%;
+        padding: 0 1;
+    }
+    #chat-pane {
+        height: 1fr;
+        width: 1fr;
+    }
     #chat-view {
         height: 1fr;
+        width: 1fr;
         border: round $primary;
-        margin: 1;
+        margin: 1 1 0 1;
         padding: 0 1;
     }
     .msg { width: 100%; padding-top: 1; }
     .msg.user { color: $text; text-style: bold; }
     .msg.system { color: $text-muted; }
     .msg.error { color: $error; }
+    #composer-model {
+        width: 100%;
+        padding: 0 1 0 2;
+        color: $text-muted;
+    }
     #prompt {
-        dock: bottom;
-        margin: 1 1 1 1;
+        border: round $accent;
+        margin: 0 1 1 1;
     }
     """
 
