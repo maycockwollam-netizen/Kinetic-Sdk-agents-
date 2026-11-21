@@ -1,12 +1,13 @@
 [package]
-name = "kinetic-patch-rs"
+name = "kinetic-rs"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "_patch_rs"
+name = "_kinetic_rs"
 path = "rust/src/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }
+tiktoken-rs = "0.12"

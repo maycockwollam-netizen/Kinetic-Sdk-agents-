@@ -15,7 +15,9 @@ from kinetic_sdk.tool.base import Tool, ToolResult
 from kinetic_sdk.workspace.base import WorkspaceBase, WorkspaceError
 
 try:
-    from kinetic_sdk import _patch_rs  # type: ignore[attr-defined]  # extension built by maturin
+    from kinetic_sdk import _kinetic_rs  # type: ignore[attr-defined]  # extension built by maturin
+
+    _patch_rs = _kinetic_rs
 except ImportError:  # Source checkout or Python-only environment without extension.
     _patch_rs = None
 

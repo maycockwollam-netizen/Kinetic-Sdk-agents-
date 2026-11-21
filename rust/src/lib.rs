@@ -1,5 +1,9 @@
+use std::sync::OnceLock;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+
+static CL100K_BPE: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
 
 #[derive(Debug)]
 struct Hunk {
@@ -209,9 +213,29 @@ fn apply_file_patch(original: &str, raw_hunks: Vec<(usize, usize, usize, usize, 
     apply_impl(original, &hunks).map_err(PyValueError::new_err)
 }
 
+/// Count BPE tokens with the bundled ``cl100k_base`` encoding.
+///
+/// The same data family as Python's optional ``tiktoken`` package (GPT-4/3.5
+/// family), embedded in the extension so no Python dependency is needed.
+#[pyfunction]
+fn count_tokens(text: &str, encoding: Option<&str>) -> PyResult<usize> {
+    if let Some(name) = encoding {
+        if name != "cl100k_base" {
+            return Err(PyValueError::new_err(format!("unsupported encoding: {name}")));
+        }
+    }
+    if CL100K_BPE.get().is_none() {
+        let bpe = tiktoken_rs::cl100k_base().map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let _ = CL100K_BPE.set(bpe);
+    }
+    let bpe = CL100K_BPE.get().expect("cl100k_base initialized above");
+    Ok(bpe.encode_with_special_tokens(text).len())
+}
+
 #[pymodule]
-fn _patch_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _kinetic_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(parse_patch, module)?)?;
     module.add_function(wrap_pyfunction!(apply_file_patch, module)?)?;
+    module.add_function(wrap_pyfunction!(count_tokens, module)?)?;
     Ok(())
 }
