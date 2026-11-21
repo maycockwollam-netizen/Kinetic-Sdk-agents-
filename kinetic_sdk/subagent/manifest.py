@@ -15,6 +15,7 @@ module encodes:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +26,8 @@ from kinetic_sdk.skills.skill import (
     _split_frontmatter,
 )
 from kinetic_sdk.subagent.exceptions import SubagentSpecError
+
+logger = logging.getLogger(__name__)
 
 #: Sub-agent names follow the exact same shape as skill/plugin names
 #: (lowercase alphanumeric words joined by single hyphens) — one naming
@@ -58,6 +61,20 @@ class SubagentSpec:
     system_prompt: str
     description: str = ""
     model: str | None = None
+
+    def to_markdown(self) -> str:
+        """Serialize this spec back to flat-frontmatter Markdown.
+
+        Round-trips through :func:`load_subagent_spec`, so a profile can be
+        written to a file, edited, and reloaded by name (the opencode
+        ``.opencode/agent/*.md`` workflow). Empty fields are omitted.
+        """
+        lines = [f"name: {self.name}"]
+        if self.description:
+            lines.append(f"description: {self.description}")
+        if self.model:
+            lines.append(f"model: {self.model}")
+        return "---\n" + "\n".join(lines) + "\n---\n\n" + self.system_prompt.rstrip() + "\n"
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or (
@@ -94,5 +111,27 @@ def load_subagent_spec(path: str | Path) -> SubagentSpec:
         name=frontmatter.get("name", ""),
         description=frontmatter.get("description", ""),
         model=frontmatter.get("model") or None,
-        system_prompt=body,
+        system_prompt=body.strip(),
     )
+
+
+def load_subagent_specs(agents_dir: str | Path) -> dict[str, SubagentSpec]:
+    """Load every ``*.md`` in *agents_dir* as a :class:`SubagentSpec`.
+
+    Files that fail to parse (bad frontmatter, invalid name, blank prompt)
+    are skipped with a warning so one broken profile does not break the
+    whole registry. Returns a mapping keyed by spec ``name``, ready to
+    hand to :class:`~kinetic_sdk.subagent.tool.DelegateTool`.
+    """
+    directory = Path(agents_dir)
+    if not directory.is_dir():
+        raise SubagentSpecError(f"agents directory not found: {directory}")
+    specs: dict[str, SubagentSpec] = {}
+    for path in sorted(directory.glob("*.md")):
+        try:
+            spec = load_subagent_spec(path)
+        except SubagentSpecError as exc:
+            logger.warning("Skipping subagent file %s: %s", path, exc)
+            continue
+        specs[spec.name] = spec
+    return specs
