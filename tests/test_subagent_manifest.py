@@ -73,3 +73,50 @@ def test_spec_error_is_a_value_error() -> None:
     # validation) must also catch spec errors.
     with pytest.raises(ValueError):
         SubagentSpec(name="BAD", system_prompt="prompt")
+
+
+def test_to_markdown_round_trips_through_loader(tmp_path) -> None:
+    from kinetic_sdk.subagent.manifest import load_subagent_spec
+
+    spec = SubagentSpec(
+        name="code-reviewer",
+        system_prompt="Review one diff.",
+        description="Reviews a single diff.",
+        model="cheap-model",
+    )
+    path = tmp_path / "code-reviewer.md"
+    path.write_text(spec.to_markdown(), encoding="utf-8")
+
+    loaded = load_subagent_spec(path)
+    assert loaded == spec
+
+
+def test_to_markdown_omits_empty_fields(tmp_path) -> None:
+    from kinetic_sdk.subagent.manifest import load_subagent_spec
+
+    spec = SubagentSpec(name="researcher", system_prompt="Search and report.")
+    path = tmp_path / "researcher.md"
+    path.write_text(spec.to_markdown(), encoding="utf-8")
+    assert "model:" not in path.read_text(encoding="utf-8")
+    assert load_subagent_spec(path) == spec
+
+
+def test_load_subagent_specs_discovers_and_skips_broken(tmp_path) -> None:
+    from kinetic_sdk.subagent.manifest import load_subagent_specs
+
+    (tmp_path / "alpha.md").write_text(
+        SubagentSpec(name="alpha", system_prompt="A", description="first").to_markdown(),
+        encoding="utf-8",
+    )
+    (tmp_path / "beta.md").write_text("not a spec at all\n", encoding="utf-8")
+
+    specs = load_subagent_specs(tmp_path)
+    assert list(specs) == ["alpha"]
+    assert specs["alpha"].description == "first"
+
+
+def test_load_subagent_specs_missing_dir_raises(tmp_path) -> None:
+    from kinetic_sdk.subagent.manifest import load_subagent_specs
+
+    with pytest.raises(ValueError):
+        load_subagent_specs(tmp_path / "does-not-exist")
