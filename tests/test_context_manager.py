@@ -751,6 +751,34 @@ def test_tiktoken_counter_never_returns_zero_or_negative():
     assert counter("") >= 1
 
 
+def test_rust_token_counter_counts_real_tokens():
+    pytest.importorskip("kinetic_sdk._kinetic_rs")
+    from kinetic_sdk.context.tokens import RustTokenCounter
+
+    counter = RustTokenCounter()
+    vietnamese = "Xin chào, đây là một câu tiếng Việt đầy đủ dấu."
+    real = counter(vietnamese)
+    heuristic = estimate_tokens(vietnamese)
+    # cl100k splits Vietnamese into many more tokens than len//4 suggests.
+    assert real > heuristic
+
+
+def test_rust_token_counter_never_returns_zero_or_negative():
+    pytest.importorskip("kinetic_sdk._kinetic_rs")
+    from kinetic_sdk.context.tokens import RustTokenCounter
+
+    assert RustTokenCounter()("") >= 1
+
+
+def test_rust_token_counter_falls_back_without_extension(monkeypatch):
+    from kinetic_sdk.context import tokens as tokens_module
+    from kinetic_sdk.context.tokens import RustTokenCounter
+
+    monkeypatch.setattr(tokens_module, "_kinetic_rs", None)
+    counter = RustTokenCounter()
+    assert counter("a" * 400) == estimate_tokens("a" * 400)
+
+
 # --- oversized tool-result content truncation ---------------------------------
 
 

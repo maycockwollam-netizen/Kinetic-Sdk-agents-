@@ -16,6 +16,11 @@ from collections import OrderedDict
 from hashlib import sha1
 from typing import TYPE_CHECKING, Any, Callable
 
+try:
+    from kinetic_sdk import _kinetic_rs  # type: ignore[attr-defined]  # extension built by maturin
+except ImportError:  # Source checkout or Python-only environment without extension.
+    _kinetic_rs = None
+
 if TYPE_CHECKING:
     from kinetic_sdk.llm.client import LLMClient
 
@@ -69,6 +74,31 @@ class ProviderTokenCounter:
         if len(self._cache) > self.max_cache_entries:
             self._cache.popitem(last=False)
         return result
+
+
+class RustTokenCounter:
+    """BPE token counter backed by the optional Rust extension.
+
+    Uses the bundled ``cl100k_base`` encoding (GPT-4/3.5 family) compiled into
+    ``_kinetic_rs`` - the same data as ``tiktoken`` but with no Python package
+    dependency. Falls back to the 4-chars-per-token heuristic when the
+    extension is not installed.
+    """
+
+    def __init__(self, encoding: str = "cl100k_base") -> None:
+        if encoding != "cl100k_base":
+            raise ValueError("RustTokenCounter currently supports encoding='cl100k_base'")
+        self.encoding = encoding
+
+    def __call__(self, text: str) -> int:
+        from kinetic_sdk.context.manager import estimate_tokens
+
+        if _kinetic_rs is None:
+            return estimate_tokens(text)
+        try:
+            return max(1, int(_kinetic_rs.count_tokens(text, self.encoding)))
+        except Exception:  # noqa: BLE001 - never break compaction on encoding issues
+            return estimate_tokens(text)
 
 
 class TiktokenCounter:
