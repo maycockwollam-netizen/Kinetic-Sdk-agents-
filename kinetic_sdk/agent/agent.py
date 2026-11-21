@@ -113,6 +113,7 @@ class Agent:
               ``run(stream=True)``), ``agent.tool_call_started``,
               ``agent.tool_call_finished``, ``agent.run_finished``,
               ``agent.escalated``, ``agent.classified``, ``agent.error``,
+              ``agent.tool_error_guidance``,
               ``agent.verification_exhausted``,
               ``agent.budget_exceeded``, ``context.compacted``,
               ``context.summarization_failed``, ``security.permission_denied``,
@@ -240,6 +241,7 @@ class Agent:
         transient_retry_backoff_seconds: float = 0.25,
         injection_guard: InjectionGuard | bool | None = None,
         verification_required: bool = False,
+        consecutive_tool_error_guidance: int = 3,
     ) -> None:
         self.llm = llm
         #: Optional persistence backend. When set (and no explicit ``state``
@@ -368,6 +370,12 @@ class Agent:
             raise ValueError("max_transient_retries must be non-negative")
         if transient_retry_backoff_seconds < 0:
             raise ValueError("transient_retry_backoff_seconds must be non-negative")
+        if consecutive_tool_error_guidance < 0:
+            raise ValueError("consecutive_tool_error_guidance must be non-negative")
+        #: Inject a strategy-change message after this many consecutive tool
+        #: errors (0 disables the guidance).
+        self.consecutive_tool_error_guidance = consecutive_tool_error_guidance
+        self._consecutive_tool_errors = 0
         #: Retries for tools explicitly declaring a transient failure.
         self.max_transient_retries = max_transient_retries
         self.transient_retry_backoff_seconds = transient_retry_backoff_seconds
@@ -763,6 +771,7 @@ class Agent:
                 break
 
             any_error = self._execute_tool_calls(response.tool_calls)
+            self._maybe_inject_tool_error_guidance(any_error)
             self._persist_state()
 
             if self._stop_reason is not None:
@@ -794,6 +803,35 @@ class Agent:
                 {"reason": "max_iterations", "iterations": self.max_iterations},
             )
         return final_text
+
+    def _maybe_inject_tool_error_guidance(self, any_error: bool) -> None:
+        """Nudge the model to change strategy after repeated tool failures.
+
+        Keeps failing batches from burning turns on the same approach: after
+        ``consecutive_tool_error_guidance`` errors in a row a short user
+        message is injected and the counter resets, so guidance is re-emitted
+        only if failures keep happening.
+        """
+        if self.consecutive_tool_error_guidance <= 0:
+            self._consecutive_tool_errors = 0
+            return
+        if not any_error:
+            self._consecutive_tool_errors = 0
+            return
+        self._consecutive_tool_errors += 1
+        if self._consecutive_tool_errors < self.consecutive_tool_error_guidance:
+            return
+        self.state.add_user_message(
+            f"You have encountered {self._consecutive_tool_errors} consecutive tool errors. "
+            "Stop repeating the same failing approach. Inspect the latest tool error and "
+            "check preconditions (file contents, paths, permissions, availability), then "
+            "change strategy: try a different tool, different arguments, or a smaller step."
+        )
+        self._emit(
+            "agent.tool_error_guidance",
+            {"consecutive_errors": self._consecutive_tool_errors},
+        )
+        self._consecutive_tool_errors = 0
 
     def _maybe_escalate(
         self, iteration: int, *, triggered_by_error: bool, already_escalated: bool
