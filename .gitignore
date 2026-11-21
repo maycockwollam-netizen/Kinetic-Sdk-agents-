@@ -1,2 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+build/
+dist/
+
 # Rust build artifacts
 /target/
+
+# OpenHands agent memory
+.openhands/
