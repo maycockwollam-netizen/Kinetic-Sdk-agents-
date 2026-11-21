@@ -270,6 +270,7 @@ class LiteLLMClient(LLMClient):
         max_retries: int = 2,
         retry_base_delay: float = 0.5,
         retry_max_delay: float = 8.0,
+        prompt_cache: bool = True,
     ) -> None:
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -285,6 +286,7 @@ class LiteLLMClient(LLMClient):
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
         self.retry_max_delay = retry_max_delay
+        self.prompt_cache = prompt_cache
         # Import lazily so the rest of the SDK stays zero-dependency. We keep a
         # reference to the module to call ``completion`` on it (and so tests can
         # monkeypatch ``litellm.completion`` on the real module object).
@@ -695,7 +697,55 @@ class LiteLLMClient(LLMClient):
         if self.timeout is not None:
             request["timeout"] = self.timeout
         request.update(kwargs)
+        return self._apply_prompt_cache(request)
+
+    def _apply_prompt_cache(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Insert Anthropic prompt-cache breakpoints into a built request.
+
+        Only Anthropic models (``claude``/``anthropic``) support explicit
+        breakpoints; other providers are left untouched. A breakpoint goes on
+        the system message (if any), on the first non-system message and on
+        the last message, so the stable prefix (system + early history) and
+        the growing tail are both reused across turns. Disabled with
+        ``prompt_cache=False``.
+        """
+        model = self.model.lower()
+        if not (self.prompt_cache and ("anthropic" in model or "claude" in model)):
+            return request
+        messages = list(request.get("messages", []))
+        if not messages:
+            return request
+        system_idx = 0 if messages[0].get("role") == "system" else None
+        if system_idx is not None:
+            messages[0] = self._with_cache_control(messages[0])
+        first = system_idx + 1 if system_idx is not None else 0
+        if first < len(messages):
+            messages[first] = self._with_cache_control(messages[first])
+        last = len(messages) - 1
+        if last > first:
+            messages[last] = self._with_cache_control(messages[last])
+        request["messages"] = messages
         return request
+
+    @staticmethod
+    def _with_cache_control(message: dict[str, Any]) -> dict[str, Any]:
+        """Return a copy of *message* whose last content block is cacheable."""
+        content = message.get("content")
+        if isinstance(content, str):
+            return {
+                **message,
+                "content": [
+                    {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+                ],
+            }
+        if isinstance(content, list) and content:
+            blocks = list(content)
+            last = dict(blocks[-1])
+            if "cache_control" not in last:
+                last["cache_control"] = {"type": "ephemeral"}
+            blocks[-1] = last
+            return {**message, "content": blocks}
+        return message
 
     def _completion_with_retry(self, request: dict[str, Any]) -> Any:
         """Call ``litellm.completion`` with retry + backoff on transient errors."""
