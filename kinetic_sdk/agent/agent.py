@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal
 
 from kinetic_sdk.agent.budget import RunBudget, RunBudgetExceeded
 from kinetic_sdk.agent.classifier import DefaultClassifier, TaskClassifier
+from kinetic_sdk.agent.effort import Effort, EffortContext, EffortPolicy
 from kinetic_sdk.agent.modes import AgentMode
 from kinetic_sdk.agent.planning import AnswerVerifier, Plan, PlanStrategy
 from kinetic_sdk.agent.structured import (
@@ -242,6 +243,7 @@ class Agent:
         injection_guard: InjectionGuard | bool | None = None,
         verification_required: bool = False,
         consecutive_tool_error_guidance: int = 3,
+        effort_policy: EffortPolicy | None = None,
     ) -> None:
         self.llm = llm
         #: Optional persistence backend. When set (and no explicit ``state``
@@ -376,6 +378,8 @@ class Agent:
         #: errors (0 disables the guidance).
         self.consecutive_tool_error_guidance = consecutive_tool_error_guidance
         self._consecutive_tool_errors = 0
+        #: Optional per-turn reasoning-effort policy (see :mod:`effort`).
+        self.effort_policy = effort_policy
         #: Retries for tools explicitly declaring a transient failure.
         self.max_transient_retries = max_transient_retries
         self.transient_retry_backoff_seconds = transient_retry_backoff_seconds
@@ -682,6 +686,7 @@ class Agent:
         final_text = ""
         iteration = 0
         escalated = False
+        last_had_tool_calls = False
         retries_left = (
             DEFAULT_STRUCTURED_RETRIES if structured_retries is None else structured_retries
         )
@@ -715,7 +720,17 @@ class Agent:
                 logger.warning("Run budget exceeded: %s", budget_stop)
                 return budget_stop
             system_append = self._system_prompt_append(hook_results)
-            response = self._call_llm(stream=stream, system_append=system_append)
+            effort: Effort | None = None
+            if self.effort_policy is not None:
+                effort = self.effort_policy.effort_for(
+                    EffortContext(
+                        iteration=iteration,
+                        previous_had_tool_calls=last_had_tool_calls,
+                    )
+                )
+            response = self._call_llm(
+                stream=stream, system_append=system_append, effort=effort
+            )
             self._trigger_hooks(
                 HookPoint.AFTER_LLM_CALL,
                 HookContext(
@@ -771,6 +786,7 @@ class Agent:
                 break
 
             any_error = self._execute_tool_calls(response.tool_calls)
+            last_had_tool_calls = bool(response.tool_calls)
             self._maybe_inject_tool_error_guidance(any_error)
             self._persist_state()
 
@@ -895,7 +911,10 @@ class Agent:
         )
 
     def _call_llm(
-        self, stream: bool = False, system_append: str | None = None
+        self,
+        stream: bool = False,
+        system_append: str | None = None,
+        effort: Effort | None = None,
     ) -> LLMResponse:
         """Ask the LLM for the next turn using the current history + tools.
 
@@ -905,18 +924,27 @@ class Agent:
         returned, so the rest of the loop (tool calling, escalation) works
         unchanged. A client that does not implement streaming falls back to a
         plain ``chat`` call.
+
+        ``effort`` (from :mod:`kinetic_sdk.agent.effort`) is forwarded as the
+        ``reasoning_effort`` request option only when the model supports it;
+        see :meth:`_supports_effort`.
         """
         system, messages = self.state.for_llm()
         if system_append:
             system = f"{system}\n\n{system_append}" if system else system_append
         tools = self.tool_schemas() or None
+        extra_kwargs: dict[str, Any] = {}
+        if effort is not None and self._supports_effort():
+            extra_kwargs["reasoning_effort"] = effort.value
         if not stream:
-            response = self.llm.chat(messages=messages, tools=tools, system=system)
+            response = self.llm.chat(messages=messages, tools=tools, system=system, **extra_kwargs)
             self._record_usage(response)
             return response
         try:
             final: LLMResponse | None = None
-            for event in self.llm.chat_stream(messages=messages, tools=tools, system=system):
+            for event in self.llm.chat_stream(
+                messages=messages, tools=tools, system=system, **extra_kwargs
+            ):
                 if event.type == "text" and isinstance(event.delta, str):
                     self._emit("agent.text_delta", {"delta": event.delta})
                 elif event.type == "done" and isinstance(event.delta, LLMResponse):
@@ -926,7 +954,7 @@ class Agent:
                 "%s does not support streaming; falling back to chat()",
                 type(self.llm).__name__,
             )
-            response = self.llm.chat(messages=messages, tools=tools, system=system)
+            response = self.llm.chat(messages=messages, tools=tools, system=system, **extra_kwargs)
             self._record_usage(response)
             return response
         if final is None:
@@ -935,6 +963,15 @@ class Agent:
             final = LLMResponse(content="", stop_reason="end_turn")
         self._record_usage(final)
         return final
+
+    def _supports_effort(self) -> bool:
+        """Whether the bound client takes a per-request ``reasoning_effort``.
+
+        Conservative: only OpenAI-style model strings advertise the option;
+        other providers keep the default (no extra parameter is sent).
+        """
+        model = str(getattr(self.llm, "model", "") or "").lower()
+        return "openai" in model or "gpt" in model
 
     def _check_structured(
         self, schema: dict[str, Any], text: str, retries_left: int
