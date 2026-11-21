@@ -97,6 +97,9 @@ kinetic version
 kinetic --help
 ```
 
+`gow` is an alias for `kinetic`: run `gow` with no arguments to start the
+interactive TUI chat (opencode-style), or `gow run "..."` for a one-shot task.
+
 Configure a model or API key:
 
 ```bash

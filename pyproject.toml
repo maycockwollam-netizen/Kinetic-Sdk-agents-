@@ -33,6 +33,7 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
 
 [project.scripts]
 kinetic = "kinetic_sdk.cli.main:main"
+gow = "kinetic_sdk.cli.main:main"
 
 [tool.maturin]
 python-source = "."
