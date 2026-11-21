@@ -32,6 +32,9 @@ jobs:
           CIBW_ARCHS_MACOS: "arm64"
           # macOS/Windows runners ship Rust; only add the needed targets.
           CIBW_BEFORE_BUILD_MACOS: "rustup target add aarch64-apple-darwin"
+          # quay.io blocks anonymous pulls on runners; use Docker Hub mirrors.
+          CIBW_MANYLINUX_X86_64_IMAGE: "docker.io/pypa/manylinux2014_x86_64"
+          CIBW_MANYLINUX_X86_64_IMAGE_2_28: "docker.io/pypa/manylinux_2_28_x86_64"
           # manylinux containers do not ship Rust - install it and expose it.
           CIBW_BEFORE_ALL_LINUX: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
           CIBW_ENVIRONMENT_LINUX: 'PATH="$HOME/.cargo/bin:$PATH"'
