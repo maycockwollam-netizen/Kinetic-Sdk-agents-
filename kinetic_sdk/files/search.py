@@ -20,6 +20,11 @@ import time
 from pathlib import Path
 from typing import Any, ClassVar
 
+try:
+    from kinetic_sdk import _kinetic_rs  # type: ignore[attr-defined]  # extension built by maturin
+except ImportError:  # Source checkout or Python-only environment without extension.
+    _kinetic_rs = None
+
 from kinetic_sdk.files.snapshots import is_internal_snapshot_path
 from kinetic_sdk.tool.base import (
     Tool,
@@ -155,6 +160,9 @@ class GrepTool(_WorkspaceSearchTool):
             if shutil.which("rg"):
                 matches = self._grep_rg(pattern, root, glob, case_sensitive, limit)
                 engine = "rg"
+            elif _kinetic_rs is not None:
+                matches = self._grep_rust(pattern, root, glob, case_sensitive, limit)
+                engine = "rust"
             else:
                 matches = self._grep_python(pattern, root, glob, case_sensitive, limit)
                 engine = "python"
@@ -219,6 +227,16 @@ class GrepTool(_WorkspaceSearchTool):
             returncode = process.wait()
         if returncode not in (0, 1, -signal.SIGTERM):
             raise WorkspaceError("ripgrep failed")
+        return matches
+
+    def _grep_rust(self, pattern: str, root: Path, glob: str | None, case_sensitive: bool, limit: int) -> list[str]:
+        matches: list[str] = []
+        for filename, line_number, content in _kinetic_rs.grep_contents(
+            pattern, str(root), glob, case_sensitive, limit
+        ):
+            relative = self._safe_relative(Path(filename))
+            if relative is not None:
+                matches.append(f"{relative}:{line_number}:{self._truncate_line(content)}")
         return matches
 
     def _grep_python(self, pattern: str, root: Path, glob: str | None, case_sensitive: bool, limit: int) -> list[str]:
