@@ -7,7 +7,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.ask_user import AskUserTool
@@ -34,6 +34,7 @@ from kinetic_sdk.security.policy import (
 from kinetic_sdk.terminal import TerminalTool
 from kinetic_sdk.testing import MockLLMClient, text_response
 from kinetic_sdk.todo import InMemoryTodoStore, TodoReadTool, TodoWriteTool
+from kinetic_sdk.tool.base import Tool, ToolResult
 from kinetic_sdk.workspace import Workspace
 
 CONFIG_DIR = Path.home() / ".kinetic"
@@ -90,6 +91,56 @@ def _confirm_hook_factory(auto_yes: bool):  # type: ignore[no-untyped-def]
     return _hook
 
 
+def _default_plan_confirm(plan: str) -> bool:
+    """Show the proposed plan and ask the user to approve it."""
+    tui.print_system("PLAN PROPOSED — approve before the agent acts:")
+    print(plan)
+    try:
+        answer = input("\nApprove plan and proceed? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("y", "yes")
+
+
+class PlanGateTool(Tool):
+    """Plan-mode gate: the agent must propose a plan and get approval first.
+
+    When enabled, the model is instructed to call this tool with its plan
+    BEFORE making changes. Execution returns an error until the plan is
+    approved, so the agent is forced to revise instead of acting.
+    """
+
+    name = "plan_gate"
+    description = (
+        "You are in PLAN mode. Before making ANY change (file edits, git "
+        "operations, running commands) propose your complete step-by-step plan "
+        "by calling this tool with the 'plan' argument. Do NOT edit files or run "
+        "commands until the plan is approved. If it is rejected, revise your plan "
+        "and propose it again via plan_gate."
+    )
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "plan": {"type": "string", "description": "The complete plan to approve."},
+        },
+        "required": ["plan"],
+    }
+
+    def __init__(self, on_propose: Callable[[str], bool]) -> None:
+        if not callable(on_propose):
+            raise TypeError("on_propose must be callable")
+        self._on_propose = on_propose
+
+    def execute(self, plan: str, **_: Any) -> ToolResult:  # type: ignore[override]
+        if not isinstance(plan, str) or not plan.strip():
+            return ToolResult(error="plan must be a non-empty string")
+        if self._on_propose(plan):
+            return ToolResult(output="Plan approved. You may proceed.")
+        return ToolResult(
+            error="Plan rejected. Revise your plan and propose it again via plan_gate."
+        )
+
+
 def build_agent(
     model: str | None = None,
     api_key: str | None = None,
@@ -100,6 +151,7 @@ def build_agent(
     workspace_root: str | Path | None = None,
     stream_logger: bool = False,
     session_id: str | None = None,
+    plan_mode: bool = False,
 ) -> Agent:
     model = model or str(get_config("model", DEFAULT_MODEL))
     llm: LLMClient
@@ -137,6 +189,9 @@ def build_agent(
             tools[8] = MemoryTool(JsonFileMemory(str(mem_path)))
         except Exception:
             pass
+
+    if plan_mode:
+        tools.append(PlanGateTool(_default_plan_confirm))
 
     if api_key:
         try:
@@ -236,8 +291,8 @@ def _stream_into_agent(agent: Agent, task: str, verify: bool) -> str:
     return result
 
 
-def cmd_run(task: str, model: str | None, api_key: str | None, base_url: str | None, verify: bool, stream: bool, auto_yes: bool, safe: bool, show_diff: bool = False) -> int:
-    agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe)
+def cmd_run(task: str, model: str | None, api_key: str | None, base_url: str | None, verify: bool, stream: bool, auto_yes: bool, safe: bool, show_diff: bool = False, plan: bool = False) -> int:
+    agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe, plan_mode=plan)
     try:
         if stream:
             result = _stream_into_agent(agent, task, verify)
@@ -308,8 +363,8 @@ def cmd_session(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_chat(model: str | None, api_key: str | None, base_url: str | None, verify: bool, auto_yes: bool, safe: bool, stream: bool, session_id: str | None = None) -> int:
-    agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe, session_id=session_id)
+def cmd_chat(model: str | None, api_key: str | None, base_url: str | None, verify: bool, auto_yes: bool, safe: bool, stream: bool, session_id: str | None = None, plan_mode: bool = False) -> int:
+    agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe, session_id=session_id, plan_mode=plan_mode)
     if _tui_available():
         from kinetic_sdk.cli.tui_app import KineticTuiApp
 
@@ -333,8 +388,12 @@ def cmd_chat(model: str | None, api_key: str | None, base_url: str | None, verif
         if line == "/diff":
             cmd_diff(Path.cwd())
             continue
+        if line == "/plan":
+            status = "ON — the agent must propose a plan before acting" if plan_mode else "OFF"
+            tui.print_system(f"plan mode: {status}")
+            continue
         if line == "/reset":
-            agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe, session_id=session_id)
+            agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe, session_id=session_id, plan_mode=plan_mode)
             tui.print_system("Conversation reset.")
             continue
         if line == "/verify":
@@ -355,7 +414,7 @@ def cmd_chat(model: str | None, api_key: str | None, base_url: str | None, verif
             continue
         if line.startswith("/model "):
             model = line.split(maxsplit=1)[1].strip()
-            agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe, session_id=session_id)
+            agent = build_agent(model=model, api_key=api_key, base_url=base_url, auto_yes=auto_yes, safe=safe, session_id=session_id, plan_mode=plan_mode)
             tui.print_system(f"Switched to model: {model}")
             continue
         tui.print_user(line)
@@ -504,10 +563,12 @@ def main() -> int:
     p_run = sub.add_parser("run", help="Run a one-shot task")
     p_run.add_argument("task", help="Task description")
     p_run.add_argument("--diff", action="store_true", help="Show working-tree diff after running")
+    p_run.add_argument("--plan", action="store_true", help="Plan mode: agent must propose a plan before acting")
     _add_common(p_run)
 
     p_chat = sub.add_parser("chat", help="Interactive chat session")
     p_chat.add_argument("--session", metavar="ID", help="Named session to resume or create")
+    p_chat.add_argument("--plan", action="store_true", help="Plan mode: agent must propose a plan before acting")
     _add_common(p_chat)
 
     p_config = sub.add_parser("config", help="Manage configuration")
@@ -538,9 +599,9 @@ def main() -> int:
     args, unknown = parser.parse_known_args()
 
     if args.command == "run":
-        return cmd_run(args.task, args.model, args.api_key, args.base_url, args.verify, args.stream, args.yes, args.safe, args.diff)
+        return cmd_run(args.task, args.model, args.api_key, args.base_url, args.verify, args.stream, args.yes, args.safe, args.diff, args.plan)
     if args.command == "chat":
-        return cmd_chat(args.model, args.api_key, args.base_url, args.verify, args.yes, args.safe, args.stream, args.session)
+        return cmd_chat(args.model, args.api_key, args.base_url, args.verify, args.yes, args.safe, args.stream, args.session, args.plan)
     if args.command == "config":
         return cmd_config(args)
     if args.command == "init":
