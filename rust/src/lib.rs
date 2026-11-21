@@ -312,11 +312,56 @@ fn grep_contents(
     Ok(results)
 }
 
+fn dot(left: &[f64], right: &[f64]) -> f64 {
+    left.iter().zip(right.iter()).map(|(a, b)| a * b).sum()
+}
+
+/// Rank vectors by cosine similarity to a query, returning
+/// ``Vec<(original_index, score)>``.
+///
+/// The caller passes each candidate's original index so ties break exactly
+/// like the Python fallback (on equal scores a higher index wins, matching
+/// Python's ``sort(key=(score, index), reverse=True)``). Only positive
+/// scores survive, mirroring the Python post-filter, and the result is
+/// truncated to ``limit``.
+#[pyfunction]
+#[pyo3(signature = (query, indices, vectors, limit))]
+fn cosine_top_k(
+    query: Vec<f64>,
+    indices: Vec<usize>,
+    vectors: Vec<Vec<f64>>,
+    limit: usize,
+) -> PyResult<Vec<(usize, f64)>> {
+    if indices.len() != vectors.len() {
+        return Err(PyValueError::new_err("indices and vectors lengths differ"));
+    }
+    let query_norm = dot(&query, &query).sqrt();
+    let mut scored: Vec<(usize, f64)> = Vec::with_capacity(vectors.len());
+    for (index, vector) in indices.into_iter().zip(vectors.into_iter()) {
+        if vector.len() != query.len() {
+            continue; // Python's _cosine returns 0.0, filtered out below.
+        }
+        let denominator = query_norm * dot(&vector, &vector).sqrt();
+        let score = if denominator == 0.0 {
+            0.0
+        } else {
+            dot(&query, &vector) / denominator
+        };
+        if score > 0.0 {
+            scored.push((index, score));
+        }
+    }
+    scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0)));
+    scored.truncate(limit);
+    Ok(scored)
+}
+
 #[pymodule]
 fn _kinetic_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(parse_patch, module)?)?;
     module.add_function(wrap_pyfunction!(apply_file_patch, module)?)?;
     module.add_function(wrap_pyfunction!(count_tokens, module)?)?;
     module.add_function(wrap_pyfunction!(grep_contents, module)?)?;
+    module.add_function(wrap_pyfunction!(cosine_top_k, module)?)?;
     Ok(())
 }
