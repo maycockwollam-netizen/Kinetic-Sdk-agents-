@@ -382,6 +382,20 @@ def cmd_verify() -> int:
     return 0
 
 
+def cmd_explore(path: str = ".") -> int:
+    """Scan *path* and write a ``repo`` skill (SKILL.md) for it."""
+    from kinetic_sdk.codemap.skill import build_repo_skill
+
+    try:
+        skill = build_repo_skill(path)
+    except ValueError as exc:
+        tui.print_error(str(exc))
+        return 1
+    tui.print_ok(f"Wrote repo skill '{skill.name}' to {skill.root_path}")
+    tui.print_system(skill.description)
+    return 0
+
+
 def cmd_version() -> int:
     from importlib.metadata import PackageNotFoundError, version
     try:
@@ -425,6 +439,8 @@ def main() -> int:
 
     sub.add_parser("verify", help="Show verification evidence from last run")
     sub.add_parser("version", help="Show version")
+    p_explore = sub.add_parser("explore", help="Auto-generate a repo skill (SKILL.md) for a project")
+    p_explore.add_argument("path", nargs="?", default=".")
 
     args, unknown = parser.parse_known_args()
 
@@ -442,6 +458,8 @@ def main() -> int:
         return cmd_verify()
     if args.command == "version":
         return cmd_version()
+    if args.command == "explore":
+        return cmd_explore(args.path)
 
     if unknown and not unknown[0].startswith("-"):
         task = " ".join(unknown)
