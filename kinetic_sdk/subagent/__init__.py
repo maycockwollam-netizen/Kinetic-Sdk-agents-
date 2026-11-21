@@ -58,6 +58,7 @@ from kinetic_sdk.subagent.async_delegation import (
     spawn_async_subagent,
 )
 from kinetic_sdk.subagent.async_tool import AsyncDelegateTool
+from kinetic_sdk.subagent.batch_tool import BATCH_TOOL_NAME, DelegateBatchTool
 from kinetic_sdk.subagent.budget import (
     DEFAULT_MAX_CONSECUTIVE_REPEATS,
     DEFAULT_MAX_TOTAL_TOOL_CALLS,
@@ -102,11 +103,13 @@ from kinetic_sdk.subagent.tool import DELEGATE_TOOL_NAME, DelegateTool
 __all__ = [
     "DEFAULT_MAX_CONSECUTIVE_REPEATS",
     "DEFAULT_MAX_TOTAL_TOOL_CALLS",
+    "BATCH_TOOL_NAME",
     "DELEGATE_TOOL_NAME",
     "AsyncDelegateTool",
     "AsyncLLMFactory",
     "BudgetExceededError",
     "DEFAULT_LOCK_LEASE_SECONDS",
+    "DelegateBatchTool",
     "DelegateTool",
     "DelegationResult",
     "FileLock",
