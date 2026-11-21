@@ -31,10 +31,11 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Iterator, Literal
+from typing import Any, AsyncIterator, Iterator, Literal, Sequence
 
 from kinetic_sdk.secret.value import SecretValue
 from kinetic_sdk.security.redact import redact_secrets
@@ -44,27 +45,74 @@ logger = logging.getLogger(__name__)
 #: Role of a message in the conversation.
 Role = Literal["system", "user", "assistant", "tool"]
 
+#: Coarse provider-error categories used by :func:`classify_llm_error`.
+LLMErrorCategory = Literal[
+    "transient", "context_overflow", "auth", "quota", "content_policy", "invalid", "unknown"
+]
 
-def _is_retryable(exc: Exception) -> bool:
-    """Classify an LLM-call failure as worth retrying (transient) or not.
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"context window|context length|context limit|too long|maximum length|"
+    r"token limit|input length|reduce the length|too many tokens|max[_ ]tokens|"
+    r"prompt is too large|exceeds.*(?:limit|length)",
+    re.IGNORECASE,
+)
+_RATE_LIMIT_RE = re.compile(r"rate limit|too many requests|throttl|slow down|try again later", re.IGNORECASE)
+_QUOTA_RE = re.compile(r"quota|insufficient.*(?:credit|balance)|billing|payment required|402", re.IGNORECASE)
+_AUTH_RE = re.compile(r"authentication|unauthorized|invalid api ?key|api ?key.*(?:invalid|missing|expired)", re.IGNORECASE)
+_CONTENT_POLICY_RE = re.compile(
+    r"content policy|content.?filter|safety|moderation|blocked by", re.IGNORECASE
+)
 
-    Provider-neutral: litellm raises many exception types (its own plus the
-    underlying SDKs'), so we look at the HTTP ``status_code`` attribute when
-    present and fall back to the exception class name. Retryable: 408, 409,
-    429, any 5xx, timeouts and connection errors. Everything else - 400/401/
-    403/404, invalid requests, content filters - is raised immediately.
+
+def classify_llm_error(exc: Exception) -> LLMErrorCategory:
+    """Map any provider exception to a coarse category.
+
+    Providers report equivalent failures with very different HTTP codes and
+    free-form messages (opencode's ``provider-error`` taxonomy is the
+    reference), so the status code plus message/class-name heuristics decide
+    the right action: retry (transient), compact the context, switch key /
+    model (auth/quota), never retry (invalid/content policy), or unknown.
     """
     status = getattr(exc, "status_code", None)
+    text = f"{type(exc).__name__}: {exc}".lower()
     if isinstance(status, int):
         if status in (408, 409, 429) or status >= 500:
-            return True
-        if 400 <= status < 500:
-            return False
-    name = type(exc).__name__.lower()
-    return any(
-        marker in name
-        for marker in ("timeout", "connection", "ratelimit", "rate_limit", "unavailable")
-    )
+            return "transient"
+        if status == 401:
+            return "auth"
+        if status == 402:
+            return "quota"
+        if status == 403:
+            if _QUOTA_RE.search(text):
+                return "quota"
+            if _CONTENT_POLICY_RE.search(text):
+                return "content_policy"
+            return "auth"
+        if status in (400, 404, 413, 422):
+            if _CONTEXT_OVERFLOW_RE.search(text):
+                return "context_overflow"
+            if _RATE_LIMIT_RE.search(text):
+                return "transient"
+            return "invalid"
+    if _RATE_LIMIT_RE.search(text) or any(
+        marker in type(exc).__name__.lower()
+        for marker in ("timeout", "connection", "unavailable", "ratelimit", "rate_limit")
+    ):
+        return "transient"
+    if _CONTEXT_OVERFLOW_RE.search(text):
+        return "context_overflow"
+    if _QUOTA_RE.search(text):
+        return "quota"
+    if _AUTH_RE.search(text):
+        return "auth"
+    if _CONTENT_POLICY_RE.search(text):
+        return "content_policy"
+    return "invalid" if isinstance(status, int) else "unknown"
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Whether *exc* deserves a transient retry (see :func:`classify_llm_error`)."""
+    return classify_llm_error(exc) == "transient"
 
 #: A single message in the conversation history. The shape intentionally
 #: matches Anthropic's message format (``role`` + ``content`` where ``content``
@@ -271,6 +319,7 @@ class LiteLLMClient(LLMClient):
         retry_base_delay: float = 0.5,
         retry_max_delay: float = 8.0,
         prompt_cache: bool = True,
+        fallback_models: Sequence[str] | None = None,
     ) -> None:
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -278,6 +327,7 @@ class LiteLLMClient(LLMClient):
             raise ValueError("max_retries must be >= 0")
         if retry_base_delay <= 0 or retry_max_delay <= 0:
             raise ValueError("retry delays must be positive")
+        self.fallback_models = list(fallback_models) if fallback_models else []
         self.model = model
         self.api_key = self._wrap_secret(api_key)
         self.api_base = api_base
@@ -748,27 +798,51 @@ class LiteLLMClient(LLMClient):
         return message
 
     def _completion_with_retry(self, request: dict[str, Any]) -> Any:
-        """Call ``litellm.completion`` with retry + backoff on transient errors."""
+        """Call ``litellm.completion`` with backoff + model fallback.
+
+        Transient failures retry with exponential backoff (bounded by
+        ``max_retries``). Non-transient errors in a class a different model
+        can plausibly fix (auth, quota, unknown) advance through
+        ``fallback_models`` before giving up.
+        """
+        models = [self.model, *self.fallback_models]
         attempt = 0
+        model_index = 0
         while True:
+            current = models[model_index]
+            current_request = request if current == self.model else {**request, "model": current}
             try:
-                return self._litellm.completion(**request)
-            except Exception as exc:  # noqa: BLE001 - classified by _is_retryable
-                if attempt >= self.max_retries or not _is_retryable(exc):
-                    raise
-                attempt += 1
-                delay = min(
-                    self.retry_base_delay * (2 ** (attempt - 1)), self.retry_max_delay
-                )
-                delay += random.uniform(0, delay * 0.25)
-                logger.warning(
-                    "LLM request failed (attempt %d/%d), retrying in %.2fs: %s",
-                    attempt,
-                    self.max_retries + 1,
-                    delay,
-                    redact_secrets(f"{type(exc).__name__}: {exc}"),
-                )
-                time.sleep(delay)
+                return self._litellm.completion(**current_request)
+            except Exception as exc:  # noqa: BLE001 - classified by classify_llm_error
+                category = classify_llm_error(exc)
+                if category == "transient":
+                    if attempt >= self.max_retries:
+                        raise
+                    attempt += 1
+                    delay = min(
+                        self.retry_base_delay * (2 ** (attempt - 1)), self.retry_max_delay
+                    )
+                    delay += random.uniform(0, delay * 0.25)
+                    logger.warning(
+                        "LLM request failed (attempt %d/%d), retrying in %.2fs: %s",
+                        attempt,
+                        self.max_retries + 1,
+                        delay,
+                        redact_secrets(f"{type(exc).__name__}: {exc}"),
+                    )
+                    time.sleep(delay)
+                    continue
+                if category in ("auth", "quota", "unknown") and model_index < len(models) - 1:
+                    model_index += 1
+                    attempt = 0
+                    logger.warning(
+                        "LLM request failed with %s on %s; trying fallback %s",
+                        category,
+                        current,
+                        models[model_index],
+                    )
+                    continue
+                raise
 
 
 class AsyncLLMClient(ABC):
