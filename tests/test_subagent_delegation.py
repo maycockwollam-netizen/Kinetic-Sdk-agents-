@@ -32,6 +32,32 @@ GRANDCHILD_SPEC = SubagentSpec(
 )
 
 
+def test_spawn_filters_tools_by_spec_allowlist() -> None:
+    from kinetic_sdk.testing import MockTool
+
+    parent = Agent(
+        llm=MockLLMClient([]),
+        tools=[MockTool(name="alpha"), MockTool(name="beta")],
+        permission_policy=PermissivePolicy(),
+    )
+    spec = SubagentSpec(name="limited", system_prompt="p", tools=("alpha",))
+    child = spawn_subagent(parent, spec, SpawnBudget(100))
+    assert set(child._tools.keys()) == {"alpha"}  # noqa: SLF001
+
+
+def test_spawn_inherits_all_tools_when_allowlist_empty() -> None:
+    from kinetic_sdk.testing import MockTool
+
+    parent = Agent(
+        llm=MockLLMClient([]),
+        tools=[MockTool(name="alpha"), MockTool(name="beta")],
+        permission_policy=PermissivePolicy(),
+    )
+    spec = SubagentSpec(name="open", system_prompt="p")
+    child = spawn_subagent(parent, spec, SpawnBudget(100))
+    assert set(child._tools.keys()) == {"alpha", "beta"}  # noqa: SLF001
+
+
 def make_parent(
     llm: MockLLMClient | LoopLLM | None = None,
     budget: SpawnBudget | None = None,
