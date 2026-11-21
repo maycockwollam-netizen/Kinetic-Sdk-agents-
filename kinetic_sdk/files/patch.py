@@ -15,7 +15,7 @@ from kinetic_sdk.tool.base import Tool, ToolResult
 from kinetic_sdk.workspace.base import WorkspaceBase, WorkspaceError
 
 try:
-    from kinetic_sdk import _patch_rs
+    from kinetic_sdk import _patch_rs  # type: ignore[attr-defined]  # extension built by maturin
 except ImportError:  # Source checkout or Python-only environment without extension.
     _patch_rs = None
 
@@ -162,9 +162,16 @@ class ApplyPatchTool(Tool):
     def _parse_patch(cls, patch: str) -> list[_FilePatch]:
         if _patch_rs is not None:
             try:
+                parsed = _patch_rs.parse_patch(patch)
                 return [
-                    _FilePatch(path, tuple(_Hunk(*hunk[:4], tuple(hunk[4])) for hunk in hunks))
-                    for path, hunks in _patch_rs.parse_patch(patch)
+                    _FilePatch(
+                        path,
+                        tuple(
+                            _Hunk(hunk[0], hunk[1], hunk[2], hunk[3], tuple(hunk[4]))
+                            for hunk in hunks
+                        ),
+                    )
+                    for path, hunks in parsed
                 ]
             except ValueError as exc:
                 raise PatchApplyError(str(exc)) from exc
