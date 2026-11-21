@@ -23,7 +23,7 @@ async def test_splash_screen_shows_opencode_name() -> None:
     async with app.run_test() as pilot:
         await pilot.pause()
         await asyncio.sleep(0.05)
-        assert SPLASH_NAME == "opencode"
+        assert SPLASH_NAME == "gow"
         title = app.screen.query_one("#splash-title")
         assert SPLASH_NAME in str(title.render())
 
