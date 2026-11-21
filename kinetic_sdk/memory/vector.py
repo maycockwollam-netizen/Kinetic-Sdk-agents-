@@ -7,6 +7,11 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import Any
 
+try:
+    from kinetic_sdk import _kinetic_rs  # type: ignore[attr-defined]  # extension built by maturin
+except ImportError:  # Source checkout or Python-only environment without extension.
+    _kinetic_rs = None
+
 from kinetic_sdk.memory.provider import (
     MemoryEntry,
     MemoryError,
@@ -80,7 +85,29 @@ class VectorMemory(MemoryProvider):
             return []
         with self._lock:
             pairs = list(zip(self._entries, self._vectors))
-        scored = [(self._cosine(query_vector, vector), index, entry) for index, (entry, vector) in enumerate(pairs) if vector is not None and (tiers is None or entry.tier in tiers) and matches_scope(entry, scope) and (include_expired or not is_expired(entry))]
+        filtered = [
+            (index, entry, vector)
+            for index, (entry, vector) in enumerate(pairs)
+            if vector is not None
+            and (tiers is None or entry.tier in tiers)
+            and matches_scope(entry, scope)
+            and (include_expired or not is_expired(entry))
+        ]
+        if not filtered:
+            return []
+        if _kinetic_rs is not None:
+            try:
+                ranked = _kinetic_rs.cosine_top_k(
+                    query_vector,
+                    [index for index, _entry, _vector in filtered],
+                    [vector for _index, _entry, vector in filtered],
+                    limit,
+                )
+                by_index = {index: entry for index, entry, _vector in filtered}
+                return [by_index[index] for index, _score in ranked]
+            except Exception:  # noqa: BLE001 - ranking must never break search
+                pass  # fall back to the pure-Python ranking below
+        scored = [(self._cosine(query_vector, vector), index, entry) for index, entry, vector in filtered]
         scored.sort(key=lambda value: (value[0], value[1]), reverse=True)
         return [entry for score, _index, entry in scored if score > 0][:limit]
 
