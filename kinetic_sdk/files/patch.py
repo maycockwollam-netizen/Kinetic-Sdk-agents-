@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from kinetic_sdk.subagent.filelock import FileLockRegistry
-from kinetic_sdk.tool.base import Tool, ToolResult
+from kinetic_sdk.tool.base import Tool, ToolResult, ToolRiskLevel
 from kinetic_sdk.workspace.base import WorkspaceBase, WorkspaceError
 
 try:
@@ -46,6 +46,9 @@ class _FilePatch:
 
 class ApplyPatchTool(Tool):
     """Apply a unified-diff patch to existing workspace files atomically."""
+
+    #: Modifies workspace files, so it is a writing tool.
+    risk_level = ToolRiskLevel.WRITE
 
     name: str = "apply_patch"
     description: str = (
@@ -93,7 +96,9 @@ class ApplyPatchTool(Tool):
         with self._lock_registry.acquire(path, self._owner_id, timeout=self.lock_timeout):
             operation()
 
-    def execute(self, patch: str, **_: Any) -> ToolResult:  # type: ignore[override]
+    def execute(  # type: ignore[override]
+        self, patch: str, *, idempotency_key: str | None = None, **_: Any
+    ) -> ToolResult:
         """Dry-run *patch*, then apply it or leave the workspace unchanged."""
         try:
             file_patches = self._parse_patch(patch)

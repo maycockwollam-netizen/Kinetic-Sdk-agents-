@@ -42,9 +42,11 @@ import inspect
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 import warnings
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Iterable, Literal
 
@@ -275,6 +277,11 @@ class AsyncAgent:
         #: Validate model-supplied arguments against each tool's declared
         #: JSON schema before executing (see ``tool/validation.py``).
         self.validate_tool_inputs = validate_tool_inputs
+        #: Bounds how many tool executions a parallel batch may start at once,
+        #: mirroring the sync agent's ``BoundedSemaphore``: beyond this many
+        #: concurrent calls the overflow gets an immediate "capacity
+        #: exhausted" error instead of unbounded fan-out.
+        self._tool_slots = threading.BoundedSemaphore(8)
         #: Cooperative cancellation flag, set via :meth:`cancel` from any
         #: task. Checked between iterations and between tool calls.
         self._cancel_event = asyncio.Event()
@@ -1108,17 +1115,31 @@ class AsyncAgent:
         executed: dict[int, ToolResult] = {}
         executed_args: dict[int, dict[str, Any]] = {}
         if pending:
-            async def _run(i: int, call: ToolCall, tool: Tool, arguments: dict[str, Any]) -> None:
+            # Bounded fan-out mirroring the sync agent: at most the first
+            # ``_tool_slots`` calls run concurrently; the overflow gets an
+            # immediate "capacity exhausted" error result, so a huge batch
+            # can never launch unbounded work.
+            to_run: list[tuple[int, ToolCall, Tool, dict[str, Any]]] = []
+            for i, call, tool, arguments in pending:
                 executed_args[i] = arguments
+                if self._tool_slots.acquire(blocking=False):
+                    to_run.append((i, call, tool, arguments))
+                else:
+                    executed[i] = ToolResult(error="tool execution capacity exhausted")
+
+            async def _run(i: int, call: ToolCall, tool: Tool, arguments: dict[str, Any]) -> None:
                 try:
                     executed[i] = await self._run_tool(tool, arguments)
                 except Exception as exc:  # noqa: BLE001 - surface as tool error
                     logger.exception("Tool %s raised", call.name)
                     executed[i] = ToolResult(error=f"{type(exc).__name__}: {exc}")
+                finally:
+                    self._tool_slots.release()
 
-            await asyncio.gather(
-                *(_run(i, call, tool, arguments) for (i, call, tool, arguments) in pending)
-            )
+            if to_run:
+                await asyncio.gather(
+                    *(_run(i, call, tool, arguments) for (i, call, tool, arguments) in to_run)
+                )
 
         for i, call in enumerate(calls):
             if i in early_or_skip:
@@ -1291,8 +1312,9 @@ class AsyncAgent:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Tool %s raised", tool.name)
             result = ToolResult(error=f"{type(exc).__name__}: {exc}")
-        result.duration_seconds = time.perf_counter() - started
-        return result
+        # Stamp the measurement on a COPY (shared/cached ToolResult instances
+        # must not be mutated — see the sync agent's ``_invoke_tool``).
+        return replace(result, duration_seconds=time.perf_counter() - started)
 
     async def _retry_transient_tool(
         self, call: ToolCall, tool: Tool, arguments: dict[str, Any], result: ToolResult

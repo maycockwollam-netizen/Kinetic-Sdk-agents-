@@ -85,6 +85,11 @@ class TerminalTool(Tool):
     MAX_TIMEOUT: ClassVar[float] = 600.0
     DEFAULT_MAX_OUTPUT_CHARS: ClassVar[int] = 30_000
 
+    #: Stateless per call: each execution spawns its own subprocess and the
+    #: remaining state is immutable configuration, so one instance can be
+    #: shared across concurrent runs.
+    thread_safe = True
+
     def __init__(
         self,
         workspace: WorkspaceBase | None = None,

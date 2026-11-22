@@ -92,6 +92,10 @@ class _WorkspaceSearchTool(Tool):
     capabilities = frozenset({ToolCapability.FILESYSTEM})
     execution_policy = ToolExecutionPolicy(timeout_seconds=30.0, circuit_breaker_threshold=3)
 
+    #: Read-only and stateless per call (fresh subprocess / bounded Python
+    #: fallback), safe to share across concurrent runs.
+    thread_safe = True
+
     def __init__(self, workspace: WorkspaceBase) -> None:
         self.workspace = workspace
 

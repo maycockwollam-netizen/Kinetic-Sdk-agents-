@@ -6,7 +6,7 @@ from typing import Any
 
 from kinetic_sdk.todo.models import TODO_STATUSES, TodoItem, TodoList
 from kinetic_sdk.todo.store import TodoStore
-from kinetic_sdk.tool.base import Tool, ToolResult
+from kinetic_sdk.tool.base import Tool, ToolResult, ToolRiskLevel
 
 _STATUS_MARKERS = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
 
@@ -21,6 +21,9 @@ def _render(todo_list: TodoList) -> str:
 
 class TodoWriteTool(Tool):
     """Replace the complete todo scratchpad used for a multi-step task."""
+
+    #: Replaces shared todo state on every call, so it is a writing tool.
+    risk_level = ToolRiskLevel.WRITE
 
     name = "todo_write"
     description = (
@@ -65,7 +68,9 @@ class TodoWriteTool(Tool):
     def __init__(self, store: TodoStore) -> None:
         self._store = store
 
-    def execute(self, todos: list[dict[str, Any]], **_: Any) -> ToolResult:  # type: ignore[override]
+    def execute(  # type: ignore[override]
+        self, todos: list[dict[str, Any]], *, idempotency_key: str | None = None, **_: Any
+    ) -> ToolResult:
         """Replace the entire todo list with the provided items in one call."""
         if not isinstance(todos, list):
             return ToolResult(error="todos must be a list")

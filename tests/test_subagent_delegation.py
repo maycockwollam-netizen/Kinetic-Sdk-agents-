@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from kinetic_sdk.agent.agent import Agent
@@ -322,3 +324,53 @@ class TestRootAndStreamingGuards:
             child.run("stream", stream=True)
 
         assert delegate.budget.used == 2
+
+
+def test_isolate_tools_rejects_a_tool_that_cannot_be_shared() -> None:
+    from kinetic_sdk.tool import Tool, ToolResult
+
+    class MutableTool(Tool):
+        name = "mutable"
+        description = "Mutable state; neither thread_safe nor cloneable."
+        parameters: dict[str, Any] = {"type": "object"}
+
+        def execute(self, **params: Any) -> ToolResult:
+            return ToolResult(output="ok")
+
+    parent = Agent(
+        llm=MockLLMClient([]),
+        tools=[MutableTool()],
+        permission_policy=PermissivePolicy(),
+    )
+    spec = SubagentSpec(name="child", system_prompt="p")
+    with pytest.raises(SubagentError, match="cannot be shared"):
+        spawn_subagent(parent, spec, SpawnBudget(100), isolate_tools=True)
+
+
+def test_isolate_tools_clones_cloneable_and_shares_thread_safe() -> None:
+    from kinetic_sdk.testing import MockTool
+    from kinetic_sdk.tool import Tool, ToolResult
+
+    class CloneableTool(Tool):
+        name = "cloneable"
+        description = "Implements clone_for_subagent."
+        parameters: dict[str, Any] = {"type": "object"}
+
+        def execute(self, **params: Any) -> ToolResult:
+            return ToolResult(output="ok")
+
+        def clone_for_subagent(self) -> "CloneableTool":
+            return CloneableTool()
+
+    shared = MockTool(name="shared_mock")
+    parent = Agent(
+        llm=MockLLMClient([]),
+        tools=[CloneableTool(), shared],
+        permission_policy=PermissivePolicy(),
+    )
+    child = spawn_subagent(
+        parent, SubagentSpec(name="child", system_prompt="p"), SpawnBudget(100), isolate_tools=True
+    )
+
+    assert child._tools["cloneable"] is not parent._tools["cloneable"]  # noqa: SLF001
+    assert child._tools["shared_mock"] is shared  # noqa: SLF001
