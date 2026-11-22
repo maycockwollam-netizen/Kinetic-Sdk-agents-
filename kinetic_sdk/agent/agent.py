@@ -33,6 +33,7 @@ import uuid
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Iterable, Literal
 
@@ -1631,8 +1632,10 @@ class Agent:
         except Exception as exc:  # noqa: BLE001 - surface as tool error
             logger.exception("Tool %s raised", tool.name)
             result = ToolResult(error=f"{type(exc).__name__}: {exc}")
-        result.duration_seconds = time.perf_counter() - started
-        return result
+        # Stamp the measurement on a COPY: a tool may return a shared/cached
+        # ToolResult instance, and mutating it would race concurrent calls and
+        # corrupt the preceding callers' duration.
+        return replace(result, duration_seconds=time.perf_counter() - started)
 
     def _tool_timeout(self, tool: Tool) -> float | None:
         policy = tool.execution_policy

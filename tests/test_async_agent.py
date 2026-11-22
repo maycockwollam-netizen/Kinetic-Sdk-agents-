@@ -9,6 +9,7 @@ driven by the scripted ``AsyncMockLLMClient``/``AsyncMockTool`` fakes.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
@@ -1070,3 +1071,32 @@ async def test_async_checkpoint_resumes_multi_call_batch_after_confirmation(tmp_
     assert await resumed.run() == "done"
     assert resumed_confirm.calls == [{"target": "yes"}]
     assert resumed_last.calls == [{}]
+
+
+async def test_parallel_capacity_exhaustion_errors_overflow_calls():
+    # Async parallel dispatch mirrors the sync agent's bounded fan-out: with
+    # the slot pool exhausted, overflow calls get an immediate error instead
+    # of unbounded concurrent fan-out.
+    llm = AsyncMockLLMClient([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                tool_response("c1", "echo", {"message": "a"}).tool_calls[0],
+                tool_response("c2", "echo", {"message": "b"}).tool_calls[0],
+            ],
+            stop_reason="tool_use",
+        ),
+        text_response("ok"),
+    ])
+    echo = AsyncMockTool("echo", result="x")
+    agent = make_agent(llm, tools=[echo], parallel_tool_execution=True)
+    agent._tool_slots = threading.BoundedSemaphore(0)  # noqa: SLF001
+    await agent.run("hi")
+
+    assert echo.calls == []
+    blocks = [
+        agent.state.messages[2]["content"][0],
+        agent.state.messages[3]["content"][0],
+    ]
+    assert all(b["is_error"] for b in blocks)
+    assert all("capacity exhausted" in b["content"] for b in blocks)

@@ -49,7 +49,7 @@ from typing import Any, Callable, ClassVar
 
 from kinetic_sdk.secret.registry import SecretRegistry
 from kinetic_sdk.security.redact import REDACTED, redact_secrets
-from kinetic_sdk.tool.base import Tool, ToolResult
+from kinetic_sdk.tool.base import Tool, ToolResult, ToolRiskLevel
 
 #: Signature of the command runner used by :class:`GitTool`. Receives the full
 #: argv (starting with ``"git"``), the working directory and a timeout in
@@ -191,6 +191,14 @@ class GitTool(Tool):
     #: Default secret key holding the remote credential.
     DEFAULT_TOKEN_KEY: ClassVar[str] = "GIT_TOKEN"
 
+    #: Git can write the work tree / remote (add, commit, push, ...), so the
+    #: agent hands write-calls a stable idempotency key on retries.
+    risk_level = ToolRiskLevel.WRITE
+
+    #: Stateless per call: every action spawns a fresh ``git`` subprocess and
+    #: the remaining state is immutable configuration.
+    thread_safe = True
+
     def __init__(
         self,
         workdir: str | None = None,
@@ -207,7 +215,9 @@ class GitTool(Tool):
 
     # -- Tool interface -----------------------------------------------------
 
-    def execute(self, action: str, **params: Any) -> ToolResult:  # type: ignore[override]
+    def execute(  # type: ignore[override]
+        self, action: str, *, idempotency_key: str | None = None, **params: Any
+    ) -> ToolResult:
         """Dispatch one git sub-action after validating its parameters."""
         handler = getattr(self, f"_action_{action}", None)
         if action not in self.ACTIONS or handler is None:

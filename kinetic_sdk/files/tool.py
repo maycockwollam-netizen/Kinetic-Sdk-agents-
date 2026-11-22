@@ -30,7 +30,7 @@ from kinetic_sdk.files.snapshots import (
 )
 from kinetic_sdk.subagent.exceptions import FileLockTimeoutError
 from kinetic_sdk.subagent.filelock import FileLockRegistry
-from kinetic_sdk.tool.base import Tool, ToolResult
+from kinetic_sdk.tool.base import Tool, ToolResult, ToolRiskLevel
 from kinetic_sdk.workspace.base import WorkspaceBase, WorkspaceError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -268,6 +268,10 @@ class FileTool(Tool):
         "required": ["action", "path"],
     }
 
+    #: Writes the workspace (create/str_replace/insert), so the agent hands
+    #: write-calls a stable idempotency key on retries.
+    risk_level = ToolRiskLevel.WRITE
+
     DEFAULT_MAX_VIEW_LINES: ClassVar[int] = 2_000
     MAX_VIEW_LINE_CHARS: ClassVar[int] = 500
 
@@ -292,6 +296,9 @@ class FileTool(Tool):
         self._snapshot_store = snapshot_store
         # path -> previous content, for single-level undo_edit.
         self._undo: dict[str, str | None] = {}
+        # idempotency_key -> result of the write that first applied it. A
+        # retried write (same key) is a no-op returning the recorded result.
+        self._idem: dict[str, ToolResult] = {}
 
     def bind(self, agent: "Agent", *, owner_id: str | None = None) -> None:
         """Bind lock ownership to *agent*'s stable delegation audit id.
@@ -316,10 +323,14 @@ class FileTool(Tool):
             snapshot_store=self._snapshot_store,
         )
 
+    def clone_for_subagent(self) -> "FileTool":
+        """Fresh instance for a sub-agent: same workspace/locks, clean state."""
+        return self._clone_for()
+
     # --- dispatch -----------------------------------------------------
 
     def execute(  # type: ignore[override]
-        self, action: str, path: str, **params: Any
+        self, action: str, path: str, *, idempotency_key: str | None = None, **params: Any
     ) -> ToolResult:
         # Named-parameter signature by design: the agent loop always invokes
         # tools via execute(**model_arguments) after schema validation, so
@@ -336,10 +347,15 @@ class FileTool(Tool):
             return ToolResult(
                 error=f"unknown action {action!r} (expected view/create/str_replace/insert/undo_edit)"
             )
+        if is_internal_snapshot_path(path):
+            return ToolResult(error="path is reserved for internal snapshot storage")
+        write_actions = {"create", "str_replace", "insert"}
+        if idempotency_key is not None and action in write_actions:
+            cached = self._idem.get(idempotency_key)
+            if cached is not None:
+                return cached
         try:
-            if is_internal_snapshot_path(path):
-                return ToolResult(error="path is reserved for internal snapshot storage")
-            return handler(path, **params)
+            result = handler(path, **params)
         except FileLockTimeoutError as exc:
             logger.warning("Write lock unavailable for %r: %s", path, exc)
             return ToolResult(error=f"file is locked for writing: {exc}")
@@ -347,6 +363,9 @@ class FileTool(Tool):
             return ToolResult(error=f"path rejected: {exc}")
         except (OSError, WorkspaceError, SnapshotStoreError) as exc:
             return ToolResult(error=f"filesystem error: {exc}")
+        if idempotency_key is not None and action in write_actions and not result.is_error:
+            self._idem[idempotency_key] = result
+        return result
 
     # --- actions --------------------------------------------------------
 
