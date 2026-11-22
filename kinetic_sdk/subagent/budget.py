@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 from kinetic_sdk.subagent.exceptions import (
     BudgetExceededError,
+    CostExceededError,
     RepetitionLimitError,
     TokenExceededError,
 )
@@ -50,10 +51,17 @@ class SpawnBudget:
             output) across the entire tree.  When exceeded, a :class:`TokenExceededError`
             is raised.  This is separate from ``max_total_tool_calls`` so
             providers can enforce both cost and token limits independently.
+
+        max_total_cost_usd: Optional hard cap on provider-reported
+            ``cost_usd`` across the entire tree. When exceeded, a
+            :class:`CostExceededError` is raised. Costs only accrue for
+            clients that report ``cost_usd`` in their usage (``LiteLLMClient``
+            does best-effort via ``litellm``).
     """
 
     def __init__(self, max_total_tool_calls: int = DEFAULT_MAX_TOTAL_TOOL_CALLS,
-                 max_total_tokens: int = DEFAULT_MAX_TOTAL_TOKENS) -> None:
+                 max_total_tokens: int = DEFAULT_MAX_TOTAL_TOKENS,
+                 max_total_cost_usd: float | None = None) -> None:
         if not isinstance(max_total_tool_calls, int) or max_total_tool_calls < 1:
             raise ValueError(
                 f"max_total_tool_calls must be a positive int, got {max_total_tool_calls!r}"
@@ -62,10 +70,21 @@ class SpawnBudget:
             raise ValueError(
                 f"max_total_tokens must be a non-negative int or None, got {max_total_tokens!r}"
             )
+        if max_total_cost_usd is not None and (
+            isinstance(max_total_cost_usd, bool)
+            or not isinstance(max_total_cost_usd, (int, float))
+            or max_total_cost_usd < 0
+        ):
+            raise ValueError(
+                "max_total_cost_usd must be a non-negative number or None, "
+                f"got {max_total_cost_usd!r}"
+            )
         self._max_tool_calls = max_total_tool_calls
         self._max_tokens = max_total_tokens
+        self._max_cost = None if max_total_cost_usd is None else float(max_total_cost_usd)
         self._used_tool_calls = 0
         self._used_tokens = 0
+        self._used_cost = 0.0
         self._per_agent: dict[str, int] = {}
         self._lock = threading.Lock()
 
@@ -102,6 +121,23 @@ class SpawnBudget:
                 )
             self._used_tokens += token_count
 
+    def record_cost(self, agent_id: str, cost_usd: float) -> None:
+        """Charge provider-reported cost to the shared budget.
+
+        Raises:
+            CostExceededError: When the cost budget is already exhausted.
+        """
+        if isinstance(cost_usd, bool) or not isinstance(cost_usd, (int, float)):
+            raise ValueError(f"cost_usd must be a number, got {cost_usd!r}")
+        with self._lock:
+            if self._max_cost is not None and self._used_cost + cost_usd > self._max_cost:
+                raise CostExceededError(
+                    f"Cost budget exceeded: ${self._used_cost:.4f}/${self._max_cost:.4f} "
+                    f"across the sub-agent tree when agent {agent_id!r} "
+                    f"used ${cost_usd:.4f}"
+                )
+            self._used_cost += float(cost_usd)
+
     @property
     def max_total_tool_calls(self) -> int:
         """The configured cap on tool calls."""
@@ -123,6 +159,23 @@ class SpawnBudget:
         """Tokens still available before the token budget trips, or None."""
         with self._lock:
             return (self._max_tokens - self._used_tokens) if self._max_tokens is not None else None
+
+    @property
+    def max_total_cost_usd(self) -> float | None:
+        """The configured cost cap in USD (``None`` = unlimited)."""
+        return self._max_cost
+
+    @property
+    def used_cost_usd(self) -> float:
+        """Provider-reported cost charged so far."""
+        with self._lock:
+            return self._used_cost
+
+    @property
+    def remaining_cost_usd(self) -> float | None:
+        """Cost still available before the cost budget trips, or None."""
+        with self._lock:
+            return (self._max_cost - self._used_cost) if self._max_cost is not None else None
 
     @property
     def exhausted(self) -> bool:

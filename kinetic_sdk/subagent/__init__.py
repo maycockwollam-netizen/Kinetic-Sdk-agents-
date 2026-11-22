@@ -74,6 +74,7 @@ from kinetic_sdk.subagent.delegation import (
 )
 from kinetic_sdk.subagent.exceptions import (
     BudgetExceededError,
+    CostExceededError,
     FileLockError,
     FileLockOwnershipError,
     FileLockTimeoutError,
@@ -109,6 +110,7 @@ __all__ = [
     "AsyncDelegateTool",
     "AsyncLLMFactory",
     "BudgetExceededError",
+    "CostExceededError",
     "DEFAULT_LOCK_LEASE_SECONDS",
     "DelegateBatchTool",
     "DelegateTool",

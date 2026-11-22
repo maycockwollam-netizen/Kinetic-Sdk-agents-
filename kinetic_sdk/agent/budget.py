@@ -43,6 +43,11 @@ class RunBudget:
             still runs; the next one stops the run. ``None`` = unlimited.
         max_total_tokens: Hard cap on input+output tokens accumulated by the
             run's LLM responses. ``None`` = unlimited.
+        max_total_cost_usd: Optional hard cap on the run's provider-reported
+            ``cost_usd`` total. ``None`` = unlimited. Costs only accrue for
+            providers/clients that report a numeric ``cost_usd`` in usage
+            (``LiteLLMClient`` does best-effort via ``litellm``); a
+            usage-silent client simply never triggers this limit.
 
     The counter is guarded by a lock: root runs are sequential in this
     version, but the budget must already survive concurrent use for when
@@ -53,6 +58,7 @@ class RunBudget:
         self,
         max_llm_calls: int | None = None,
         max_total_tokens: int | None = None,
+        max_total_cost_usd: float | None = None,
     ) -> None:
         if max_llm_calls is not None and (
             not isinstance(max_llm_calls, int) or max_llm_calls < 1
@@ -68,10 +74,21 @@ class RunBudget:
                 "max_total_tokens must be a positive int or None, "
                 f"got {max_total_tokens!r}"
             )
+        if max_total_cost_usd is not None and (
+            isinstance(max_total_cost_usd, bool)
+            or not isinstance(max_total_cost_usd, (int, float))
+            or max_total_cost_usd < 0
+        ):
+            raise ValueError(
+                "max_total_cost_usd must be a non-negative number or None, "
+                f"got {max_total_cost_usd!r}"
+            )
         self._max_calls = max_llm_calls
         self._max_tokens = max_total_tokens
+        self._max_cost = None if max_total_cost_usd is None else float(max_total_cost_usd)
         self._used_calls = 0
         self._used_tokens = 0
+        self._used_cost = 0.0
         self._lock = threading.Lock()
 
     def check(self) -> None:
@@ -93,6 +110,11 @@ class RunBudget:
                     f"{self._used_tokens}/{self._max_tokens} tokens used "
                     "(input + output)"
                 )
+            if self._max_cost is not None and self._used_cost >= self._max_cost:
+                raise RunBudgetExceeded(
+                    "cost budget exhausted: "
+                    f"${self._used_cost:.4f}/${self._max_cost:.4f} used"
+                )
 
     def record(self, usage: Mapping[str, Any] | None) -> None:
         """Charge one completed LLM call, plus its reported token usage.
@@ -104,12 +126,15 @@ class RunBudget:
         """
         inp = usage.get("input_tokens") if usage else None
         out = usage.get("output_tokens") if usage else None
+        cost = usage.get("cost_usd") if usage else None
         with self._lock:
             self._used_calls += 1
             if isinstance(inp, int):
                 self._used_tokens += inp
             if isinstance(out, int):
                 self._used_tokens += out
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                self._used_cost += float(cost)
 
     @property
     def max_llm_calls(self) -> int | None:
@@ -120,6 +145,11 @@ class RunBudget:
     def max_total_tokens(self) -> int | None:
         """The configured token cap (``None`` = unlimited)."""
         return self._max_tokens
+
+    @property
+    def max_total_cost_usd(self) -> float | None:
+        """The configured cost cap in USD (``None`` = unlimited)."""
+        return self._max_cost
 
     @property
     def used_calls(self) -> int:
@@ -134,12 +164,20 @@ class RunBudget:
             return self._used_tokens
 
     @property
+    def used_cost_usd(self) -> float:
+        """Provider-reported cost accumulated so far (best-effort)."""
+        with self._lock:
+            return self._used_cost
+
+    @property
     def exhausted(self) -> bool:
         """True once any configured limit has been reached."""
         with self._lock:
             if self._max_calls is not None and self._used_calls >= self._max_calls:
                 return True
             if self._max_tokens is not None and self._used_tokens >= self._max_tokens:
+                return True
+            if self._max_cost is not None and self._used_cost >= self._max_cost:
                 return True
             return False
 
@@ -149,6 +187,8 @@ class RunBudget:
             return {
                 "max_llm_calls": self._max_calls,
                 "max_total_tokens": self._max_tokens,
+                "max_total_cost_usd": self._max_cost,
                 "used_calls": self._used_calls,
                 "used_tokens": self._used_tokens,
+                "used_cost_usd": round(self._used_cost, 6),
             }

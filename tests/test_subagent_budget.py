@@ -10,6 +10,7 @@ from kinetic_sdk.subagent import (
     DEFAULT_MAX_CONSECUTIVE_REPEATS,
     DEFAULT_MAX_TOTAL_TOOL_CALLS,
     BudgetExceededError,
+    CostExceededError,
     RepetitionCircuitBreaker,
     RepetitionLimitError,
     SpawnBudget,
@@ -166,3 +167,27 @@ class TestRepetitionCircuitBreaker:
         breaker.reset()
         assert breaker.consecutive_count == 0
         breaker.record("echo", {})  # would have tripped without the reset
+
+
+class TestSpawnBudgetCost:
+    def test_cost_limit_trips(self) -> None:
+        budget = SpawnBudget(max_total_cost_usd=0.01)
+        budget.record_cost("a", 0.004)
+        budget.record_cost("a", 0.004)
+        assert budget.used_cost_usd == pytest.approx(0.008)
+        assert budget.remaining_cost_usd == pytest.approx(0.002)
+        with pytest.raises(CostExceededError, match="Cost budget exceeded"):
+            budget.record_cost("a", 0.004)
+
+    def test_invalid_cost_cap_rejected(self) -> None:
+        with pytest.raises(ValueError, match="max_total_cost_usd"):
+            SpawnBudget(max_total_cost_usd=-1)
+        with pytest.raises(ValueError, match="max_total_cost_usd"):
+            SpawnBudget(max_total_cost_usd=True)
+
+    def test_cost_unlimited_by_default(self) -> None:
+        budget = SpawnBudget()
+        budget.record_cost("a", 5.0)
+        assert budget.used_cost_usd == 5.0
+        assert budget.max_total_cost_usd is None
+        assert budget.remaining_cost_usd is None

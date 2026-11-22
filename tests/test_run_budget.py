@@ -14,7 +14,7 @@ from kinetic_sdk.agent import Agent, RunBudget, RunBudgetExceeded
 from kinetic_sdk.llm.client import LLMResponse
 from kinetic_sdk.observability import InMemoryObservabilityLogger
 from kinetic_sdk.security import PermissivePolicy
-from kinetic_sdk.testing import MockLLMClient, MockTool, tool_response
+from kinetic_sdk.testing import MockLLMClient, MockTool, text_response, tool_response
 
 
 def _usage(input_tokens: int, output_tokens: int) -> dict[str, int]:
@@ -86,8 +86,10 @@ class TestRunBudgetUnit:
         assert budget.details() == {
             "max_llm_calls": 10,
             "max_total_tokens": 100,
+            "max_total_cost_usd": None,
             "used_calls": 1,
             "used_tokens": 15,
+            "used_cost_usd": 0.0,
         }
 
 
@@ -182,3 +184,85 @@ class TestAgentIntegration:
         assert snapshot.calls == 2
         assert snapshot.input_tokens == 20
         assert snapshot.output_tokens == 10
+
+
+class TestRunBudgetCost:
+    def test_cost_limit_trips_and_details_report_it(self) -> None:
+        budget = RunBudget(max_total_cost_usd=0.01)
+        budget.record({"input_tokens": 1, "output_tokens": 1, "cost_usd": 0.004})
+        budget.record({"input_tokens": 1, "output_tokens": 1, "cost_usd": 0.004})
+        assert budget.used_cost_usd == pytest.approx(0.008)
+        assert budget.max_total_cost_usd == 0.01
+        # Under the cap: no trip yet.
+        budget.check()
+        budget.record({"input_tokens": 1, "output_tokens": 1, "cost_usd": 0.004})
+        assert budget.exhausted is True
+        with pytest.raises(RunBudgetExceeded, match="cost budget exhausted"):
+            budget.check()
+
+    def test_cost_only_counts_numeric_values(self) -> None:
+        budget = RunBudget(max_total_cost_usd=1.0)
+        budget.record({"input_tokens": 10, "output_tokens": 10})  # no cost key
+        budget.record({"cost_usd": "0.5"})  # non-numeric ignored
+        budget.record({"cost_usd": True})  # bool ignored
+        assert budget.used_cost_usd == 0.0
+
+    def test_invalid_cost_cap_rejected(self) -> None:
+        with pytest.raises(ValueError, match="max_total_cost_usd"):
+            RunBudget(max_total_cost_usd=-1)
+        with pytest.raises(ValueError, match="max_total_cost_usd"):
+            RunBudget(max_total_cost_usd=True)
+
+    def test_cost_cap_coerced_to_float(self) -> None:
+        budget = RunBudget(max_total_cost_usd=1)
+        assert budget.max_total_cost_usd == 1.0
+        assert budget.details()["max_total_cost_usd"] == 1.0
+        assert budget.details()["used_cost_usd"] == 0.0
+
+
+class TestRunBudgetCostIntegration:
+    def test_agent_stops_gracefully_when_cost_budget_trips(self) -> None:
+        from kinetic_sdk.llm.client import LLMResponse, ToolCall
+
+        def tool_turn(messages, tools, system):  # type: ignore[no-untyped-def]
+            return LLMResponse(
+                tool_calls=[ToolCall(id="c1", name="echo", arguments={})],
+                usage={"input_tokens": 1, "output_tokens": 1, "cost_usd": 0.02},
+                stop_reason="tool_use",
+            )
+
+        agent = Agent(
+            MockLLMClient([tool_turn, text_response("done")]),
+            tools=[MockTool(name="echo", result="ok")],
+            permission_policy=PermissivePolicy(),
+            run_budget=RunBudget(max_total_cost_usd=0.015),
+        )
+        result = agent.run("go")
+
+        assert result.startswith("Run stopped: budget exceeded")
+        assert "cost budget exhausted" in result
+
+
+@pytest.mark.asyncio
+async def test_async_agent_stops_gracefully_when_cost_budget_trips() -> None:
+    from kinetic_sdk.agent import AsyncAgent
+    from kinetic_sdk.llm.client import LLMResponse, ToolCall
+    from kinetic_sdk.testing import AsyncMockLLMClient
+
+    async def tool_turn(messages, tools, system):  # type: ignore[no-untyped-def]
+        return LLMResponse(
+            tool_calls=[ToolCall(id="c1", name="echo", arguments={})],
+            usage={"input_tokens": 1, "output_tokens": 1, "cost_usd": 0.02},
+            stop_reason="tool_use",
+        )
+
+    agent = AsyncAgent(
+        AsyncMockLLMClient([tool_turn, text_response("done")]),
+        tools=[MockTool(name="echo", result="ok")],
+        permission_policy=PermissivePolicy(),
+        run_budget=RunBudget(max_total_cost_usd=0.015),
+    )
+    result = await agent.run("go")
+
+    assert result.startswith("Run stopped: budget exceeded")
+    assert "cost budget exhausted" in result

@@ -108,6 +108,14 @@ class _GuardedAsyncLLMClient(AsyncLLMClient):
         for call in response.tool_calls:
             self._budget.record_tool_call(self._agent_id, call.name)
             self._breaker.record(call.name, call.arguments)
+        if response.usage:
+            inp = response.usage.get("input_tokens", 0)
+            out = response.usage.get("output_tokens", 0)
+            if inp + out > 0:
+                self._budget.record_token_usage(self._agent_id, inp + out)
+            cost = response.usage.get("cost_usd")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost > 0:
+                self._budget.record_cost(self._agent_id, float(cost))
         return response
 
     async def chat_stream(
@@ -125,6 +133,14 @@ class _GuardedAsyncLLMClient(AsyncLLMClient):
                 for call in event.delta.tool_calls:
                     self._budget.record_tool_call(self._agent_id, call.name)
                     self._breaker.record(call.name, call.arguments)
+                if event.delta.usage:
+                    inp = event.delta.usage.get("input_tokens", 0)
+                    out = event.delta.usage.get("output_tokens", 0)
+                    if inp + out > 0:
+                        self._budget.record_token_usage(self._agent_id, inp + out)
+                    cost = event.delta.usage.get("cost_usd")
+                    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost > 0:
+                        self._budget.record_cost(self._agent_id, float(cost))
             yield event
 
 
