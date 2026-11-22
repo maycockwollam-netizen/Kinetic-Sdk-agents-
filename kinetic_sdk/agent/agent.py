@@ -89,6 +89,17 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+#: Prompt suffix appended (request-local, NOT into history) to the LLM call
+#: right after a turn whose tool batch failed. It nudges the model to
+#: diagnose before retrying instead of repeating the same failing call.
+_REFLECTION_INSTRUCTION = (
+    "REFLECTION — your previous tool call(s) failed. Before acting again:\n"
+    "1. State the likely cause (missing precondition, bad arguments, capacity).\n"
+    "2. State what you will change.\n"
+    "Do not repeat the exact failing call with the same arguments."
+)
+
+
 class AnswerNotVerifiedError(RuntimeError):
     """Raised when every allowed verification attempt rejects a final answer.
 
@@ -238,6 +249,7 @@ class Agent:
         memory: MemoryProvider | None = None,
         memory_recall_limit: int = 3,
         memory_consolidator: MemoryConsolidator | None = None,
+        reflection_on_error: bool = True,
         run_budget: RunBudget | None = None,
         stuck_detector: StuckDetector | None = None,
         planner: PlanStrategy | None = None,
@@ -372,6 +384,12 @@ class Agent:
         #: entries, a run folds them into one persistent summary after it
         #: stores the Q/A pair (emits ``agent.memory_consolidated``).
         self.memory_consolidator = memory_consolidator
+        #: When True (default), the LLM call immediately following a turn
+        #: whose tool batch failed gets a request-local reflection nudge in
+        #: its system prompt (never written into history) asking the model to
+        #: diagnose before retrying.
+        self.reflection_on_error = reflection_on_error
+        self._pending_reflection = False
         #: Optional root-run cost guardrail (see ``agent/budget.py``). Checked
         #: before every LLM call; on exhaustion the run stops gracefully with
         #: an explanatory final text and an ``agent.budget_exceeded`` event —
@@ -528,6 +546,7 @@ class Agent:
                 ),
             )
             self._classify_and_route(user_message)
+            self._pending_reflection = False
             self.plan = self._create_plan(user_message)
             if self.plan is not None:
                 # A plan is appended to the system prompt outside state.messages;
@@ -735,7 +754,16 @@ class Agent:
             if budget_stop is not None:
                 logger.warning("Run budget exceeded: %s", budget_stop)
                 return budget_stop
+            reflect_this_turn = self.reflection_on_error and self._pending_reflection
+            self._pending_reflection = False
             system_append = self._system_prompt_append(hook_results)
+            if reflect_this_turn:
+                system_append = (
+                    f"{system_append}\n\n{_REFLECTION_INSTRUCTION}"
+                    if system_append
+                    else _REFLECTION_INSTRUCTION
+                )
+                self._emit("agent.reflection_prompted", {})
             effort: Effort | None = None
             if self.effort_policy is not None:
                 effort = self.effort_policy.effort_for(
@@ -803,6 +831,7 @@ class Agent:
 
             any_error = self._execute_tool_calls(response.tool_calls)
             last_had_tool_calls = bool(response.tool_calls)
+            self._pending_reflection = any_error
             self._maybe_inject_tool_error_guidance(any_error)
             self._persist_state()
 

@@ -102,6 +102,15 @@ from kinetic_sdk.tool.validation import validate_tool_input
 
 logger = logging.getLogger(__name__)
 
+#: Same request-local reflection suffix as the sync agent — appended to the
+#: system prompt, never written into history.
+_REFLECTION_INSTRUCTION = (
+    "REFLECTION — your previous tool call(s) failed. Before acting again:\n"
+    "1. State the likely cause (missing precondition, bad arguments, capacity).\n"
+    "2. State what you will change.\n"
+    "Do not repeat the exact failing call with the same arguments."
+)
+
 if TYPE_CHECKING:
     from kinetic_sdk.replay.checkpoint import CheckpointManager
 
@@ -185,6 +194,7 @@ class AsyncAgent:
         memory: MemoryProvider | None = None,
         memory_recall_limit: int = 3,
         memory_consolidator: MemoryConsolidator | None = None,
+        reflection_on_error: bool = True,
         run_budget: RunBudget | None = None,
         checkpoint_manager: CheckpointManager | None = None,
         stuck_detector: StuckDetector | None = None,
@@ -320,6 +330,11 @@ class AsyncAgent:
         #: persistent summary after storing its Q/A pair (emits
         #: ``agent.memory_consolidated``).
         self.memory_consolidator = memory_consolidator
+        #: When True (default), the LLM call immediately following a turn
+        #: whose tool batch failed gets a request-local reflection nudge in
+        #: its system prompt (never written into history).
+        self.reflection_on_error = reflection_on_error
+        self._pending_reflection = False
         #: Optional root-run cost guardrail — same contract as the sync
         #: Agent: checked before every LLM call; exhaustion stops the run
         #: gracefully with ``agent.budget_exceeded`` and an explanatory
@@ -424,6 +439,7 @@ class AsyncAgent:
                 ),
             )
             await self._classify_and_route(user_message)
+            self._pending_reflection = False
             self.plan = await self._create_plan(user_message)
             if self.plan is not None:
                 self.state.metadata["plan"] = self.plan.to_prompt()
@@ -626,8 +642,18 @@ class AsyncAgent:
                         "agent.budget_exceeded", self.run_budget.details()
                     )
                     return f"Run stopped: budget exceeded ({exc})."
+            reflect_this_turn = self.reflection_on_error and self._pending_reflection
+            self._pending_reflection = False
+            system_append = self._system_prompt_append(hook_results)
+            if reflect_this_turn:
+                system_append = (
+                    f"{system_append}\n\n{_REFLECTION_INSTRUCTION}"
+                    if system_append
+                    else _REFLECTION_INSTRUCTION
+                )
+                await self._emit("agent.reflection_prompted", {})
             response = await self._call_llm(
-                stream=stream, system_append=self._system_prompt_append(hook_results)
+                stream=stream, system_append=system_append
             )
             await self._trigger_hooks(
                 HookPoint.AFTER_LLM_CALL,
@@ -685,6 +711,7 @@ class AsyncAgent:
                 break
 
             any_error = await self._execute_tool_calls(response.tool_calls)
+            self._pending_reflection = any_error
             await self._persist_state()
 
             if self._stop_reason is not None:
