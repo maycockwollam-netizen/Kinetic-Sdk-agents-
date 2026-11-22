@@ -80,6 +80,7 @@ from kinetic_sdk.subagent.exceptions import (
     RepetitionLimitError,
     SubagentError,
     SubagentSpecError,
+    TokenExceededError,
 )
 from kinetic_sdk.subagent.filelock import (
     DEFAULT_LOCK_LEASE_SECONDS,
@@ -127,6 +128,7 @@ __all__ = [
     "SubagentResultMerger",
     "SubagentSpec",
     "SubagentSpecError",
+    "TokenExceededError",
     "load_subagent_spec",
     "SUBAGENT_MAX_NAME_LENGTH",
     "SUBAGENT_NAME_PATTERN",

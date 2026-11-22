@@ -25,10 +25,12 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import queue
 import threading
 import time
 import uuid
+import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
@@ -1301,7 +1303,6 @@ class Agent:
         if self.parallel_tool_execution:
             for i, call, tool, arguments in pending:
                 if not getattr(tool, "thread_safe", False):
-                    import os
                     if os.environ.get("KINETIC_ENFORCE_THREAD_SAFE", "warn") == "error":
                         raise RuntimeError(
                             f"Tool {tool.name!r} has thread_safe=False but parallel_tool_execution=True. "
@@ -1310,7 +1311,6 @@ class Agent:
                             "Set KINETIC_ENFORCE_THREAD_SAFE=warn to downgrade to a warning."
                         )
                     else:
-                        import warnings
                         warnings.warn(
                             f"Tool {tool.name!r} has thread_safe=False but parallel_tool_execution=True. "
                             "This may cause race conditions if the tool has mutable state. "

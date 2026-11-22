@@ -41,8 +41,10 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import time
 import uuid
+import warnings
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Iterable, Literal
 
@@ -1076,7 +1078,6 @@ class AsyncAgent:
         if self.parallel_tool_execution:
             for i, call, tool, arguments in pending:
                 if not getattr(tool, "thread_safe", False):
-                    import os
                     if os.environ.get("KINETIC_ENFORCE_THREAD_SAFE", "warn") == "error":
                         raise RuntimeError(
                             f"Tool {tool.name!r} has thread_safe=False but parallel_tool_execution=True. "
@@ -1085,7 +1086,6 @@ class AsyncAgent:
                             "Set KINETIC_ENFORCE_THREAD_SAFE=error to make this a hard error."
                         )
                     else:
-                        import warnings
                         warnings.warn(
                             f"Tool {tool.name!r} has thread_safe=False but parallel_tool_execution=True. "
                             "This may cause race conditions if the tool has mutable state. "

@@ -127,9 +127,6 @@ def tool_response(
 
 class MockTool(Tool):
     """A configurable stand-in :class:`Tool`.
-    """
-    thread_safe = True  # :class:`MockTool` has no mutable state, safe to share
-    """A configurable stand-in :class:`Tool`.
 
     Args:
         name: Tool name reported to the model (unique per agent).
@@ -143,6 +140,11 @@ class MockTool(Tool):
 
     Every invocation is recorded on :attr:`calls`.
     """
+
+    # Recorded ``calls`` is append-only (``list.append`` is GIL-atomic), so a
+    # single instance shared across concurrent sub-agent runs stays safe; each
+    # test already creates its own fixture instance.
+    thread_safe = True
 
     def __init__(
         self,
