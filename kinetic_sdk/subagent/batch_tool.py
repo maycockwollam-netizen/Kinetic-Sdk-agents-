@@ -158,6 +158,10 @@ class DelegateBatchTool(Tool):
 
         sections: list[str] = []
         for index, (entry, result) in enumerate(zip(tasks, results)):
+            if result is None:
+                # The pool swallowed a worker exception; keep the batch going
+                # but omit the failed worker's section.
+                continue
             label = entry.get("subagent_name") or f"task {index + 1}"
             sections.append(f"## {label}\n{redact_secrets(result.final_message)}")
         output = "\n\n".join(sections)

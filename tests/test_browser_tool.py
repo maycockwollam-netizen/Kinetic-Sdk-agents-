@@ -8,7 +8,6 @@ import pytest
 from kinetic_sdk.browser import BrowserTool
 from kinetic_sdk.workspace.base import CommandResult, WorkspaceBase
 
-
 # --- fake Playwright objects (no real Chromium needed) ----------------------
 
 class FakePage:

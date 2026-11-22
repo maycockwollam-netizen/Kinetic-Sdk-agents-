@@ -9,7 +9,7 @@ serial task.
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, Iterator, Protocol, Sequence
 
 from kinetic_sdk.agent.agent import Agent
@@ -22,7 +22,7 @@ from kinetic_sdk.subagent.manifest import SubagentSpec
 class SubagentResultMerger(Protocol):
     """Combine completed sub-agent results into one parent-facing message."""
 
-    def merge(self, results: list[DelegationResult]) -> str:
+    def merge(self, results: Sequence[DelegationResult | None]) -> str:
         """Return the merged final message."""
 
 
@@ -96,8 +96,10 @@ class SubagentPool:
         that raised an exception (the exception itself is swallowed so the
         pool can keep collecting other results).
 
-        ``timeout``, when set, applies per-future and will cancel in-flight
-        agent runs that have not yet produced a result.
+        ``timeout``, when set, bounds how long the whole batch is awaited
+        (passed to :func:`as_completed`). On expiry a :class:`TimeoutError`
+        is raised; already-running workers are not interrupted — the
+        executor waits for them on shutdown.
         """
         base_llm_override = (
             _SerializedLLMClient(parent.llm)
@@ -108,7 +110,7 @@ class SubagentPool:
         results: list[DelegationResult | None] = [None] * len(specs)
 
         with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
-            future_to_idx: dict[int, int] = {}
+            future_to_idx: dict[Future[DelegationResult], int] = {}
             for i, spec in enumerate(specs):
                 fut = executor.submit(
                     run_subagent,
@@ -131,11 +133,16 @@ class SubagentPool:
         return results
 
 
-def _default_merge(results: list[DelegationResult | None]) -> str:
-    """Join results without an extra model call or interpretation."""
-    return "\n\n--- Sub-agent result ---\n\n".join(
-        result.final_message for result in results if result is not None
-    )
+class _DefaultMerge:
+    """Default :class:`SubagentResultMerger`: join results verbatim."""
+
+    def merge(self, results: Sequence[DelegationResult | None]) -> str:
+        return "\n\n--- Sub-agent result ---\n\n".join(
+            result.final_message for result in results if result is not None
+        )
+
+
+_default_merge = _DefaultMerge()
 
 
 def spawn_subagent_pool(
@@ -173,7 +180,7 @@ def spawn_subagent_pool(
     )
 
     merger = merger or _default_merge
-    merged = merger(results) if results else ""
+    merged = merger.merge(results) if results else ""
 
     if parent.answer_verifier is not None:
         accepted, feedback = parent._verify_final_answer(merged)  # noqa: SLF001

@@ -38,8 +38,8 @@ or, keeping the value wrapped until the last moment (preferred)::
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import threading
+from dataclasses import dataclass, field
 from typing import Any
 
 from kinetic_sdk.mcp.adapter import MCPToolAdapter

@@ -15,6 +15,7 @@ from typing import Any, Mapping
 from kinetic_sdk.subagent.exceptions import (
     BudgetExceededError,
     RepetitionLimitError,
+    TokenExceededError,
 )
 
 #: Default total tool-call budget for one spawned tree. Sized so a healthy
@@ -142,6 +143,12 @@ class SpawnBudget:
             return self._used_tool_calls
 
     @property
+    def used_tokens(self) -> int:
+        """Tokens charged so far (0 until any usage is recorded)."""
+        with self._lock:
+            return self._used_tokens
+
+    @property
     def remaining(self) -> int:
         """Calls still available before the budget trips."""
         with self._lock:
@@ -153,21 +160,10 @@ class SpawnBudget:
         with self._lock:
             return (self._max_tokens - self._used_tokens) if self._max_tokens is not None else None
 
-    @property
-    def exhausted_tokens(self) -> bool:
-        """True once no further token usage may be charged (if a token limit is set)."""
-        with self._lock:
-            return self._max_tokens is not None and self._used_tokens >= self._max_tokens
-
     def calls_by_agent(self) -> dict[str, int]:
         """Per-agent breakdown of charged tool calls (audit/debug aid)."""
         with self._lock:
             return dict(self._per_agent)
-
-
-class TokenExceededError(RuntimeError):
-    """Raised when token usage exceeds the configured token budget."""
-    pass
 
 
 class RepetitionCircuitBreaker:
