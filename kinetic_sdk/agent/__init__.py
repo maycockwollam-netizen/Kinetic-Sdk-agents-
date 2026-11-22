@@ -25,6 +25,7 @@ from kinetic_sdk.agent.planning import (
 )
 from kinetic_sdk.agent.settings import AgentSettings
 from kinetic_sdk.agent.stuck_detector import StuckDetector
+from kinetic_sdk.agent.verifier import LLMAnswerVerifier
 
 __all__ = [
     "Agent",
@@ -39,6 +40,7 @@ __all__ = [
     "Classification",
     "DefaultClassifier",
     "LiteLLMClassifier",
+    "LLMAnswerVerifier",
     "RunBudget",
     "RunBudgetExceeded",
     "Plan",
