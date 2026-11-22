@@ -22,6 +22,12 @@ not enough. ``VectorMemory`` has an injectable backend; its LiteLLM wrapper
 is lazy-imported and remains optional.
 """
 
+from kinetic_sdk.memory.consolidation import (
+    LLMMemoryConsolidator,
+    MemoryConsolidator,
+    NoopMemoryConsolidator,
+    consolidate_episodic,
+)
 from kinetic_sdk.memory.inmemory import InMemoryMemory
 from kinetic_sdk.memory.json_file import JsonFileMemory
 from kinetic_sdk.memory.provider import (
@@ -41,6 +47,10 @@ from kinetic_sdk.memory.vector import (
 )
 
 __all__ = [
+    "LLMMemoryConsolidator",
+    "MemoryConsolidator",
+    "NoopMemoryConsolidator",
+    "consolidate_episodic",
     "InMemoryMemory",
     "JsonFileMemory",
     "MemoryEntry",
