@@ -85,6 +85,7 @@ from kinetic_sdk.llm.client import (
     ToolCall,
 )
 from kinetic_sdk.llm.usage import UsageAccumulator
+from kinetic_sdk.memory.consolidation import MemoryConsolidator, consolidate_episodic
 from kinetic_sdk.memory.provider import MemoryProvider, MemorySource, MemoryTier
 from kinetic_sdk.observability.logger import ObservabilityLogger
 from kinetic_sdk.replay.checkpoint import PendingConfirmationError
@@ -183,6 +184,7 @@ class AsyncAgent:
         parallel_tool_execution: bool = False,
         memory: MemoryProvider | None = None,
         memory_recall_limit: int = 3,
+        memory_consolidator: MemoryConsolidator | None = None,
         run_budget: RunBudget | None = None,
         checkpoint_manager: CheckpointManager | None = None,
         stuck_detector: StuckDetector | None = None,
@@ -313,6 +315,11 @@ class AsyncAgent:
         #: Optional long-term memory (recall before runs, store after).
         self.memory = memory
         self.memory_recall_limit = memory_recall_limit
+        #: Optional episodic->persistent summariser (see ``memory/``). When a
+        #: consolidator is given, a run folds episodic entries into one
+        #: persistent summary after storing its Q/A pair (emits
+        #: ``agent.memory_consolidated``).
+        self.memory_consolidator = memory_consolidator
         #: Optional root-run cost guardrail — same contract as the sync
         #: Agent: checked before every LLM call; exhaustion stops the run
         #: gracefully with ``agent.budget_exceeded`` and an explanatory
@@ -460,6 +467,7 @@ class AsyncAgent:
         await self._emit("agent.run_finished", {"final_text": final_text, "mode": self.mode.value})
         if user_message is not None and self.memory is not None:
             await self._store_memory(user_message, final_text)
+            await self._maybe_consolidate_memories()
         if self.memory is not None:
             await self._clear_working_memory()
         return final_text
@@ -903,7 +911,7 @@ class AsyncAgent:
             return
         if not recalled:
             return
-        lines = "\n".join("- " + e.text for e in recalled)
+        lines = "\n".join(f"- [{e.tier.value}] {e.text}" for e in recalled)
         self.state.add_user_message(f"[Recalled memories]\n{lines}")
         await self._emit(
             "agent.memory_recalled", {"query": query, "count": len(recalled)}
@@ -937,6 +945,36 @@ class AsyncAgent:
         except Exception as exc:  # noqa: BLE001 - cleanup is fail-soft
             logger.warning("Working memory cleanup failed: %s", exc)
             await self._emit("agent.memory_cleanup_failed", {"error": redact_secrets(f"{type(exc).__name__}: {exc}")})
+
+    async def _maybe_consolidate_memories(self) -> None:
+        """Fold accumulated episodic entries into one persistent summary.
+
+        The consolidator is a plain ``LLMClient`` (sync), so it runs in a
+        worker thread. Fail-soft: neither a broken consolidator nor a broken
+        provider alters the run outcome.
+        """
+        if self.memory is None or self.memory_consolidator is None:
+            return
+        memory = self.memory
+        consolidator = self.memory_consolidator
+
+        def _consolidate() -> tuple[str | None, int]:
+            return consolidate_episodic(memory, consolidator)
+
+        try:
+            summary_id, consolidated = await asyncio.to_thread(_consolidate)
+        except Exception as exc:  # noqa: BLE001 - fail-soft
+            logger.warning("Memory consolidation failed: %s", exc)
+            await self._emit(
+                "agent.memory_consolidate_failed",
+                {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+            )
+            return
+        if summary_id is not None:
+            await self._emit(
+                "agent.memory_consolidated",
+                {"id": summary_id, "consolidated": consolidated},
+            )
 
     async def _record_usage(self, response: LLMResponse) -> None:
         """Fold one LLM turn's usage into the agent total + emit a delta."""

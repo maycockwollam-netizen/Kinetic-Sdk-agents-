@@ -62,6 +62,7 @@ from kinetic_sdk.hooks.base import HookContext, HookPoint, HookResult
 from kinetic_sdk.hooks.registry import HookRegistry
 from kinetic_sdk.llm.client import LLMClient, LLMResponse, ToolCall
 from kinetic_sdk.llm.usage import UsageAccumulator
+from kinetic_sdk.memory.consolidation import MemoryConsolidator, consolidate_episodic
 from kinetic_sdk.memory.provider import MemoryProvider, MemorySource, MemoryTier
 from kinetic_sdk.observability.logger import ObservabilityLogger
 from kinetic_sdk.replay.checkpoint import PendingConfirmationError
@@ -236,6 +237,7 @@ class Agent:
         parallel_tool_execution: bool = False,
         memory: MemoryProvider | None = None,
         memory_recall_limit: int = 3,
+        memory_consolidator: MemoryConsolidator | None = None,
         run_budget: RunBudget | None = None,
         stuck_detector: StuckDetector | None = None,
         planner: PlanStrategy | None = None,
@@ -365,6 +367,11 @@ class Agent:
         #: stores the Q/A pair AFTER it (emits ``agent.memory_stored``).
         self.memory = memory
         self.memory_recall_limit = memory_recall_limit
+        #: Optional episodic->persistent summariser (see ``memory/``). When a
+        #: consolidator is given and the provider amasses enough episodic
+        #: entries, a run folds them into one persistent summary after it
+        #: stores the Q/A pair (emits ``agent.memory_consolidated``).
+        self.memory_consolidator = memory_consolidator
         #: Optional root-run cost guardrail (see ``agent/budget.py``). Checked
         #: before every LLM call; on exhaustion the run stops gracefully with
         #: an explanatory final text and an ``agent.budget_exceeded`` event —
@@ -568,6 +575,7 @@ class Agent:
         self._emit("agent.run_finished", {"final_text": final_text, "mode": self.mode.value})
         if user_message is not None and self.memory is not None:
             self._store_memory(user_message, final_text)
+            self._maybe_consolidate_memories()
         if self.memory is not None:
             self._clear_working_memory()
         return final_text
@@ -1113,7 +1121,7 @@ class Agent:
             return
         if not recalled:
             return
-        lines = "\n".join("- " + e.text for e in recalled)
+        lines = "\n".join(f"- [{e.tier.value}] {e.text}" for e in recalled)
         self.state.add_user_message(f"[Recalled memories]\n{lines}")
         self._emit("agent.memory_recalled", {"query": query, "count": len(recalled)})
 
@@ -1133,6 +1141,31 @@ class Agent:
             self._emit(
                 "agent.memory_store_failed",
                 {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+            )
+
+    def _maybe_consolidate_memories(self) -> None:
+        """Fold accumulated episodic entries into one persistent summary.
+
+        Fail-soft like recall/store: a broken consolidator or provider never
+        alters the run outcome.
+        """
+        if self.memory is None or self.memory_consolidator is None:
+            return
+        try:
+            summary_id, consolidated = consolidate_episodic(
+                self.memory, self.memory_consolidator
+            )
+        except Exception as exc:  # noqa: BLE001 - fail-soft
+            logger.warning("Memory consolidation failed: %s", exc)
+            self._emit(
+                "agent.memory_consolidate_failed",
+                {"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
+            )
+            return
+        if summary_id is not None:
+            self._emit(
+                "agent.memory_consolidated",
+                {"id": summary_id, "consolidated": consolidated},
             )
 
     def _clear_working_memory(self) -> None:

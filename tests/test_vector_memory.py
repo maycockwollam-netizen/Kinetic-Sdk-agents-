@@ -58,3 +58,76 @@ def test_vector_memory_rust_respects_tier_filter() -> None:
 
     assert [entry.id for entry in memory.search("query", tiers={MemoryTier.PERSISTENT})] == [persistent.id]
     assert [entry.id for entry in memory.search("query", tiers={MemoryTier.WORKING})] == [working.id]
+
+
+# --- persistence --------------------------------------------------------
+
+def test_vector_memory_persists_entries_and_vectors(tmp_path) -> None:
+    path = tmp_path / "mem.json"
+    memory = VectorMemory(FakeEmbeddings(), path=path)
+    cat = memory.add("cats")
+    memory.add("dogs")
+
+    reloaded = VectorMemory(FakeEmbeddings(), path=path)
+    assert [entry.id for entry in reloaded.all()] == [entry.id for entry in memory.all()]
+    assert [entry.text for entry in reloaded.all()] == ["cats", "dogs"]
+    # Search against RELOADED vectors: the cosine ranking must survive a restart.
+    assert reloaded.search("cat query") == [cat]
+    assert path.exists()
+    import json
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == VectorMemory.SCHEMA_VERSION
+
+
+def test_vector_memory_clear_and_delete_persist(tmp_path) -> None:
+    path = tmp_path / "mem.json"
+    memory = VectorMemory(FakeEmbeddings(), path=path)
+    cat = memory.add("cats")
+    memory.add("dogs")
+
+    memory.delete(cat.id)
+    reloaded = VectorMemory(FakeEmbeddings(), path=path)
+    assert [e.text for e in reloaded.all()] == ["dogs"]
+
+    memory.clear()
+    reloaded = VectorMemory(FakeEmbeddings(), path=path)
+    assert reloaded.all() == []
+
+
+def test_vector_memory_none_vector_persists_and_stays_unsearchable(tmp_path) -> None:
+    class Broken(EmbeddingClient):
+        def embed(self, texts: list[str]) -> list[list[float]]: raise RuntimeError("offline")
+
+    path = tmp_path / "mem.json"
+    memory = VectorMemory(Broken(), path=path)
+    stored = memory.add("secret")
+
+    reloaded = VectorMemory(Broken(), path=path)
+    assert reloaded.all() == [stored]
+    assert reloaded.search("secret") == []  # no vector -> excluded, fail-soft
+
+
+def test_vector_memory_corrupt_or_wrong_schema_raises(tmp_path) -> None:
+    from kinetic_sdk.memory import MemoryError
+
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("{not json", encoding="utf-8")
+    with pytest.raises(MemoryError, match="Cannot load"):
+        VectorMemory(FakeEmbeddings(), path=bad_json)
+
+    wrong_schema = tmp_path / "schema.json"
+    wrong_schema.write_text('{"schema_version": 99, "entries": [], "vectors": []}', encoding="utf-8")
+    with pytest.raises(MemoryError, match="schema version"):
+        VectorMemory(FakeEmbeddings(), path=wrong_schema)
+
+    mismatched = tmp_path / "mismatch.json"
+    mismatched.write_text('{"schema_version": 1, "entries": [{}], "vectors": []}', encoding="utf-8")
+    with pytest.raises(MemoryError, match="length mismatch"):
+        VectorMemory(FakeEmbeddings(), path=mismatched)
+
+
+def test_vector_memory_without_path_stays_in_memory() -> None:
+    memory = VectorMemory(FakeEmbeddings())
+    assert memory.path is None
+    memory.add("cats")
+    assert memory.search("cat query")  # still ranks
