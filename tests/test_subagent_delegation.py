@@ -374,3 +374,32 @@ def test_isolate_tools_clones_cloneable_and_shares_thread_safe() -> None:
 
     assert child._tools["cloneable"] is not parent._tools["cloneable"]  # noqa: SLF001
     assert child._tools["shared_mock"] is shared  # noqa: SLF001
+
+
+def test_subagent_charges_cost_from_usage() -> None:
+    from kinetic_sdk.llm.client import LLMResponse
+
+    def charged_llm(model: str) -> MockLLMClient:
+        return MockLLMClient(
+            [
+                LLMResponse(
+                    content="child done",
+                    usage={"input_tokens": 10, "output_tokens": 5, "cost_usd": 0.012},
+                    stop_reason="end_turn",
+                )
+            ]
+        )
+
+    parent, _, _, _ = make_parent()
+    budget = SpawnBudget(max_total_cost_usd=0.05)
+    result = run_subagent(
+        parent,
+        SubagentSpec(name="child", system_prompt="p", model="x"),
+        "do the task",
+        budget,
+        llm_factory=charged_llm,
+    )
+
+    assert result.final_message == "child done"
+    assert budget.used_cost_usd == pytest.approx(0.012)
+    assert budget.used_tokens == 15

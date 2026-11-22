@@ -60,3 +60,12 @@ class TokenExceededError(SubagentError):
     would exceed ``max_total_tokens``. This is a *hard stop* analogous to
     :class:`BudgetExceededError` but for token-based billing.
     """
+
+
+class CostExceededError(SubagentError):
+    """The shared :class:`~kinetic_sdk.subagent.budget.SpawnBudget` cost limit is spent.
+
+    Raised the moment any agent in the spawned tree requests provider-reported
+    usage that would exceed ``max_total_cost_usd``. A *hard stop* for
+    dollar-based billing, analogous to :class:`TokenExceededError`.
+    """
