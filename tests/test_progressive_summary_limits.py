@@ -75,6 +75,18 @@ def test_progressive_json_wrappers_parse_and_invalid_json_falls_back_with_event(
     assert progressive.summarize(message, None).goal == ["giữ nguyên"]
     assert progressive.summarize(message, None).decisions == ["ok"]
 
+    # A state with elidable assistant/tool content in the middle (human
+    # guidance turns are now kept as anchors, so the summarizer span must
+    # actually contain non-user messages for a placeholder to be produced).
+    mixed = ConversationState(messages=[
+        {"role": "user", "content": "mục tiêu ban đầu"},
+        {"role": "user", "content": "guidance one"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "a1", "name": "x", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a1", "content": "ok"}]},
+        {"role": "user", "content": "guidance two"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "a2", "name": "x", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a2", "content": "ok"}]},
+    ])
     events: list[str] = []
     bus = EventBus()
     bus.subscribe("context.summarization_failed", lambda event: events.append(event.type))
@@ -82,8 +94,10 @@ def test_progressive_json_wrappers_parse_and_invalid_json_falls_back_with_event(
         keep_last_tool_results=1, event_bus=bus,
         summarizer=ProgressiveSummarizer(MockLLMClient([text_response('{"goal": [')]))
     )
-    compacted = manager.compact(_state())
-    assert "rút gọn" in str(compacted.messages[1]["content"])
+    compacted = manager.compact(mixed)
+    contents = [str(m.get("content")) for m in compacted.messages]
+    assert any("rút gọn" in content for content in contents)
+    assert "guidance one" in contents and "guidance two" in contents  # anchors kept
     assert events == ["context.summarization_failed"]
 
 
