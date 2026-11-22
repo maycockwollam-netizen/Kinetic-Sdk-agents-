@@ -185,6 +185,7 @@ class AsyncAgent:
         planner: PlanStrategy | None = None,
         answer_verifier: AnswerVerifier | None = None,
         max_verification_retries: int = 1,
+        verifier_fail_closed: bool = True,
         max_transient_retries: int = 2,
         transient_retry_backoff_seconds: float = 0.25,
         injection_guard: InjectionGuard | bool | None = None,
@@ -322,6 +323,10 @@ class AsyncAgent:
         self.planner = planner
         self.answer_verifier = answer_verifier
         self.max_verification_retries = max_verification_retries
+        #: When True (default), a verifier that raises is treated as a
+        #: rejection so it cannot silently approve unverified answers. Set to
+        #: False to fail open (accept on verifier error).
+        self.verifier_fail_closed = verifier_fail_closed
         self.plan: Plan | None = None
         self.injection_guard: InjectionGuard | None = (
             None if injection_guard is False else injection_guard if isinstance(injection_guard, InjectionGuard) else InjectionGuard()
@@ -837,7 +842,7 @@ class AsyncAgent:
         return plan
 
     async def _verify_final_answer(self, answer: str) -> tuple[bool, str]:
-        """Run the synchronous verifier in a worker thread, fail-open on errors."""
+        """Run the synchronous verifier in a worker thread, respecting verifier_fail_closed."""
         assert self.answer_verifier is not None
         task = self._first_user_message() or "Continue the current task"
         try:
@@ -847,7 +852,9 @@ class AsyncAgent:
                 "agent.verification_failed",
                 {"reason": "exception", "error": redact_secrets(f"{type(exc).__name__}: {exc}")},
             )
-            return True, ""
+            if not self.verifier_fail_closed:
+                return True, ""
+            return False, "Verifier raised an error; final answer was not verified."
         if not hasattr(verdict, "accepted") or not isinstance(verdict.accepted, bool):
             await self._emit("agent.verification_failed", {"reason": "invalid_verdict"})
             return False, "Verifier returned an invalid verdict."

@@ -140,6 +140,27 @@ export OPENAI_API_KEY="YOUR_API_KEY"
 kinetic run "Review the current changes" --safe
 ```
 
+## Browser Tool
+
+`BrowserTool` controls headless pages via Playwright (optional `[browser]`
+extra). Install the Python package and the Chromium binary:
+
+```bash
+pip install -e ".[browser]"
+python -m playwright install chromium
+```
+
+Actions: `navigate`, `click`, `type`, `screenshot`, `wait_for_selector`,
+`get_console_logs`, `get_network_requests`, plus multi-tab management
+(`new_tab`, `switch_tab`, `close_tab`, `list_tabs`) and `get_downloads`.
+
+Sandboxing: pass a `DockerWorkspace` (in `exec` mode) to the constructor and
+the tool attempts to launch the browser *inside that container* and connect
+over CDP, so navigation runs in the sandbox. If the container lacks Chromium
+or is unreachable, it falls back to a local headless browser — the effective
+mode is exposed as `tool.launch_mode` (`"local"` or `"docker-cdp"`). A
+crashed/closed page or browser is auto-recovered on the next action.
+
 ## Testing
 
 ```bash

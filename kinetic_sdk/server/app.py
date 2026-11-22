@@ -13,12 +13,17 @@ API (JSON in/out):
     -> ``{"run_id": str, "status": "completed"|"error", "final": str,
     "structured_output": any|null, "usage": {...}, "error": str?}``
 * ``GET  /runs/<run_id>`` -> the recorded run result (404 when unknown)
-* ``POST /v1/chat/completions`` -> small non-streaming OpenAI-compatible
-  gateway; its ``model`` field is used as the Kinetic session id, not as LLM
-  model selection.
-* ``GET /runs/stream`` -> WebSocket endpoint. Send one JSON text frame with
-  ``message`` (and optional ``session_id``) to receive run events as text
-  frames followed by a ``run.completed`` frame.
+* ``POST /v1/chat/completions`` -> small OpenAI-compatible gateway; its
+  ``model`` field is used as the Kinetic session id, not as LLM model
+  selection. ``stream: true`` returns an SSE ``text/event-stream`` of
+  ``chat.completion.chunk`` objects ending in ``[DONE]``; otherwise a single
+  ``chat.completion`` JSON object.
+* ``GET /runs/stream`` -> WebSocket endpoint. The connection stays open and
+  accepts any number of JSON text frames, each with ``message`` (and optional
+  ``session_id``); every request streams its run events as text frames
+  followed by a ``run.completed`` frame. Ping/pong and close frames are
+  handled transparently, fragmented text messages are reassembled, and data
+  payloads are capped at ``MAX_WS_PAYLOAD_BYTES``.
 * ``POST /workspace/{run,read,write,delete,list,list-directory}`` -> managed
   workspace operations when ``workspace_factory`` is configured. Every body
   includes ``workspace_id``; the factory, not the HTTP client, selects the
@@ -49,6 +54,7 @@ import hashlib
 import inspect
 import json
 import logging
+from pathlib import Path
 import socket
 import struct
 import threading
@@ -65,6 +71,10 @@ logger = logging.getLogger(__name__)
 
 #: Hard cap on request bodies (bytes).
 MAX_BODY_BYTES = 1024 * 1024
+
+#: Hard cap on a single WebSocket message payload (bytes). Control frames
+#: (ping/pong/close) are exempt; oversized data frames close the connection.
+MAX_WS_PAYLOAD_BYTES = 8 * 1024 * 1024
 
 
 class RunRecord(dict):
@@ -109,6 +119,7 @@ class AgentServer:
         max_requests_per_minute: int | None = None,
         max_runs: int = 1_000,
         max_concurrent_requests: int = 64,
+        session_store_dir: str | os.PathLike | None = None,
     ) -> None:
         if not callable(agent_factory):
             raise TypeError("agent_factory must be callable")
@@ -130,6 +141,16 @@ class AgentServer:
         self._sessions: dict[str, Agent] = {}
         self._session_activity: dict[str, float] = {}
         self._lock = threading.Lock()
+        #: Optional on-disk store for run history. When set, run records are
+        #: appended to ``<dir>/runs.jsonl`` and reloaded on startup, so a
+        #: restart keeps the run index durable. Live Agent sessions are not
+        #: serialized — wire the agent factory's ``state_store`` for full
+        #: conversation persistence.
+        self._store_dir: Path | None = None
+        if session_store_dir is not None:
+            self._store_dir = Path(session_store_dir)
+            self._store_dir.mkdir(parents=True, exist_ok=True)
+            self._load_stored_runs()
         self._drain_condition = threading.Condition(self._lock)
         self._in_flight_requests = 0
         self._request_slots = threading.BoundedSemaphore(max_concurrent_requests)
@@ -281,7 +302,51 @@ class AgentServer:
             )
         with self._lock:
             self._runs[run_id] = record
+        self._persist_run(record)
         return record
+
+    # -- persistence ------------------------------------------------------
+
+    def _runs_path(self) -> Path:
+        """Path to the append-only run log when a store directory is set."""
+        assert self._store_dir is not None
+        return self._store_dir / "runs.jsonl"
+
+    def _load_stored_runs(self) -> None:
+        """Rebuild the run index from the on-disk append-only log."""
+        if self._store_dir is None:
+            return
+        path = self._runs_path()
+        if not path.exists():
+            return
+        with self._lock:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        run_id = rec.get("run_id")
+                        if not isinstance(run_id, str):
+                            continue
+                        self._runs[run_id] = RunRecord(rec)
+                        self._run_order.append(run_id)
+            except OSError:
+                logger.exception("Failed to load stored runs from %s", path)
+
+    def _persist_run(self, record: RunRecord) -> None:
+        """Append one run record to the on-disk log (best-effort)."""
+        if self._store_dir is None:
+            return
+        try:
+            with open(self._runs_path(), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(dict(record), ensure_ascii=False, default=str) + "\n")
+        except OSError:
+            logger.exception("Failed to persist run %s", record.get("run_id"))
 
     # --- HTTP plumbing --------------------------------------------------
 
@@ -513,9 +578,6 @@ class AgentServer:
                 than selecting an LLM model; model routing belongs to an
                 application's agent factory / registry configuration.
                 """
-                if body.get("stream") is True:
-                    self._send_json(400, {"error": "streaming not yet supported on this endpoint"})
-                    return
                 model = body.get("model")
                 messages = body.get("messages")
                 if not isinstance(model, str) or not model:
@@ -532,6 +594,9 @@ class AgentServer:
                 )
                 if not isinstance(message, str) or not message.strip():
                     self._send_json(400, {"error": "'messages' must contain a non-empty user message"})
+                    return
+                if body.get("stream") is True:
+                    self._openai_completion_stream(body, model, message)
                     return
                 record = server._run_agent(message, stream=False, output_schema=None, session_id=model)
                 if record["status"] != "completed":
@@ -550,8 +615,75 @@ class AgentServer:
                     },
                 })
 
+            def _openai_completion_stream(
+                self, body: dict[str, Any], model: str, message: str
+            ) -> None:
+                """Stream an OpenAI-compatible SSE response for one run.
+
+                Emits ``chat.completion.chunk`` objects as the agent publishes
+                ``agent.text_delta`` events, then a final ``stop`` chunk and
+                the ``[DONE]`` sentinel.
+                """
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self._response_status = 200
+
+                run_id = uuid.uuid4().hex
+                chunk_id = "chatcmpl-" + run_id
+                agent = server._make_agent(model)
+
+                def emit(delta: dict[str, Any], finish_reason: str | None) -> None:
+                    chunk = json.dumps({
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+                    })
+                    self.wfile.write(f"data: {chunk}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+
+                from kinetic_sdk.event.bus import Event
+
+                def publish(event: Event) -> None:
+                    if event.type == "agent.text_delta":
+                        delta = event.payload.get("delta", "")
+                        if isinstance(delta, str) and delta:
+                            emit({"content": delta}, None)
+
+                agent.event_bus.subscribe("*", publish)
+                try:
+                    with server._lock:
+                        agent.run(message, stream=True)
+                        server._session_activity[model] = time.monotonic()
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("OpenAI streaming run failed")
+                    emit({}, "stop")
+                    self.wfile.write(
+                        f'data: {{"error": "{type(exc).__name__}: {exc}"}}\n\n'.encode("utf-8")
+                    )
+                finally:
+                    agent.event_bus.unsubscribe("*", publish)
+
+                emit({}, "stop")
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                # End the SSE response: close the connection so the client can
+                # observe EOF after the [DONE] sentinel.
+                self.close_connection = True
+
             def _websocket_run(self) -> None:
-                """Upgrade then receive one JSON text frame and stream its run events."""
+                """Upgrade then serve run requests over a persistent connection.
+
+                The connection stays open and accepts any number of JSON text
+                frames (each ``{"message": str, "session_id": str?}``), so a
+                client can stream several runs without re-handshaking. Control
+                frames (ping/pong/close) are handled transparently by
+                :meth:`_ws_receive`; the connection ends on a close frame,
+                EOF, or a protocol violation.
+                """
                 key = self.headers.get("Sec-WebSocket-Key")
                 if self.headers.get("Upgrade", "").lower() != "websocket" or not key:
                     self._send_json(400, {"error": "websocket upgrade required"})
@@ -565,65 +697,122 @@ class AgentServer:
                 self.send_header("Connection", "Upgrade")
                 self.send_header("Sec-WebSocket-Accept", accept)
                 self.end_headers()
-                payload = self._ws_receive()
-                if payload is None:
-                    return
-                try:
-                    request = json.loads(payload)
-                    message = request["message"]
-                    session_id = request.get("session_id")
-                    if not isinstance(message, str) or not message.strip() or (session_id is not None and not isinstance(session_id, str)):
-                        raise ValueError
-                except (json.JSONDecodeError, KeyError, ValueError):
-                    self._ws_send(json.dumps({"error": "expected JSON with non-empty 'message'"}))
-                    return
-                agent = server._make_agent(session_id)
                 from kinetic_sdk.event.bus import Event
 
-                def publish(event: Event) -> None:
-                    self._ws_send(json.dumps({"type": event.type, "payload": event.payload}, default=str))
+                while True:
+                    payload = self._ws_receive()
+                    if payload is None:
+                        return
+                    try:
+                        request = json.loads(payload)
+                        message = request["message"]
+                        session_id = request.get("session_id")
+                        if not isinstance(message, str) or not message.strip() or (session_id is not None and not isinstance(session_id, str)):
+                            raise ValueError
+                    except (json.JSONDecodeError, KeyError, ValueError):
+                        self._ws_send(json.dumps({"error": "expected JSON with non-empty 'message'"}))
+                        continue
+                    agent = server._make_agent(session_id)
 
-                agent.event_bus.subscribe("*", publish)
-                try:
-                    final = agent.run(message)
-                    self._ws_send(json.dumps({"type": "run.completed", "final": final}))
-                finally:
-                    agent.event_bus.unsubscribe("*", publish)
+                    def publish(event: Event) -> None:
+                        self._ws_send(json.dumps({"type": event.type, "payload": event.payload}, default=str))
+
+                    agent.event_bus.subscribe("*", publish)
+                    try:
+                        final = agent.run(message)
+                        self._ws_send(json.dumps({"type": "run.completed", "final": final}))
+                    except Exception as exc:  # noqa: BLE001 - never drop a connection on a run error
+                        logger.exception("WebSocket run failed")
+                        self._ws_send(json.dumps({"type": "run.error", "error": f"{type(exc).__name__}: {exc}"}))
+                    finally:
+                        agent.event_bus.unsubscribe("*", publish)
 
             def _ws_receive(self) -> str | None:
-                header = self.rfile.read(2)
-                if len(header) != 2:
-                    return None
-                opcode, length_byte = header[0] & 0x0F, header[1]
-                if opcode == 0x8:
-                    return None
-                if opcode != 0x1:
-                    return None
-                length = length_byte & 0x7F
-                if length == 126:
-                    length = struct.unpack("!H", self.rfile.read(2))[0]
-                elif length == 127:
-                    length = struct.unpack("!Q", self.rfile.read(8))[0]
-                masked = bool(length_byte & 0x80)
-                mask = self.rfile.read(4) if masked else b""
-                data = self.rfile.read(length)
-                if len(data) != length:
-                    return None
-                if masked:
-                    data = bytes(byte ^ mask[i % 4] for i, byte in enumerate(data))
-                return data.decode("utf-8")
+                """Read one complete text message, handling control frames inline.
 
-            def _ws_send(self, text: str) -> None:
-                data = text.encode("utf-8")
+                Returns the decoded text payload, or ``None`` when the peer
+                closed the connection (close frame, EOF, or a protocol
+                violation). Ping frames are answered with a pong; pong frames
+                are ignored; fragmented text messages are reassembled from
+                continuation frames. Data payloads are capped at
+                ``MAX_WS_PAYLOAD_BYTES``.
+                """
+                fragments: list[bytes] = []
+                while True:
+                    header = self.rfile.read(2)
+                    if len(header) != 2:
+                        return None
+                    fin = bool(header[0] & 0x80)
+                    opcode = header[0] & 0x0F
+                    length_byte = header[1]
+                    masked = bool(length_byte & 0x80)
+                    length = length_byte & 0x7F
+                    if length == 126:
+                        raw = self.rfile.read(2)
+                        if len(raw) != 2:
+                            return None
+                        length = struct.unpack("!H", raw)[0]
+                    elif length == 127:
+                        raw = self.rfile.read(8)
+                        if len(raw) != 8:
+                            return None
+                        length = struct.unpack("!Q", raw)[0]
+                    if length > MAX_WS_PAYLOAD_BYTES:
+                        self._ws_send_close(1009, "payload too large")
+                        return None
+                    mask = self.rfile.read(4) if masked else b""
+                    if masked and len(mask) != 4:
+                        return None
+                    data = self.rfile.read(length)
+                    if len(data) != length:
+                        return None
+                    if masked:
+                        data = bytes(byte ^ mask[i % 4] for i, byte in enumerate(data))
+
+                    if opcode == 0x9:  # ping -> pong
+                        self._ws_send_frame(0xA, data)
+                        continue
+                    if opcode == 0xA:  # pong -> ignore
+                        continue
+                    if opcode == 0x8:  # close -> echo close, end connection
+                        self._ws_send_close(1000, "")
+                        return None
+                    if opcode == 0x0:  # continuation frame
+                        if not fragments:
+                            return None  # continuation without a start frame
+                        fragments.append(data)
+                        if sum(len(f) for f in fragments) > MAX_WS_PAYLOAD_BYTES:
+                            self._ws_send_close(1009, "payload too large")
+                            return None
+                        if fin:
+                            return b"".join(fragments).decode("utf-8")
+                        continue
+                    if opcode in (0x1, 0x2):  # text/binary start frame
+                        if fragments:
+                            return None  # new message in the middle of a fragment
+                        if fin:
+                            return data.decode("utf-8")
+                        fragments = [data]
+                        continue
+                    return None  # reserved/unknown opcode
+
+            def _ws_send_frame(self, opcode: int, data: bytes) -> None:
+                first = 0x80 | opcode
                 if len(data) < 126:
-                    header = bytes([0x81, len(data)])
+                    header = bytes([first, len(data)])
                 elif len(data) <= 0xFFFF:
-                    header = bytes([0x81, 126]) + struct.pack("!H", len(data))
+                    header = bytes([first, 126]) + struct.pack("!H", len(data))
                 else:
-                    header = bytes([0x81, 127]) + struct.pack("!Q", len(data))
+                    header = bytes([first, 127]) + struct.pack("!Q", len(data))
                 try:
                     self.connection.sendall(header + data)
                 except (BrokenPipeError, ConnectionResetError, socket.error):
                     pass
+
+            def _ws_send(self, text: str) -> None:
+                self._ws_send_frame(0x1, text.encode("utf-8"))
+
+            def _ws_send_close(self, code: int, reason: str) -> None:
+                self._ws_send_frame(0x8, struct.pack("!H", code) + reason.encode("utf-8"))
 
         return Handler

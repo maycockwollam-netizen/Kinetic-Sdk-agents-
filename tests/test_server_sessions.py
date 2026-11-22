@@ -98,6 +98,51 @@ def _read_frame(sock: socket.socket) -> str:
     return sock.recv(length).decode()
 
 
+def _read_raw_frame(sock: socket.socket) -> tuple[int, bytes]:
+    head = sock.recv(2)
+    assert len(head) == 2
+    opcode = head[0] & 0x0F
+    length = head[1] & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", sock.recv(2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", sock.recv(8))[0]
+    return opcode, sock.recv(length)
+
+
+def _ws_frame(opcode: int, payload: bytes, *, fin: bool = True) -> bytes:
+    """Build a masked client frame (opcode, payload, FIN)."""
+    mask = os.urandom(4)
+    first = (0x80 if fin else 0) | opcode
+    if len(payload) < 126:
+        header = bytes([first, 0x80 | len(payload)])
+    elif len(payload) <= 0xFFFF:
+        header = bytes([first, 0x80 | 126]) + struct.pack("!H", len(payload))
+    else:
+        header = bytes([first, 0x80 | 127]) + struct.pack("!Q", len(payload))
+    masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+    return header + mask + masked
+
+
+def _upgrade(sock: socket.socket) -> None:
+    key = base64.b64encode(os.urandom(16)).decode()
+    sock.sendall((
+        "GET /runs/stream HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n\r\n"
+    ).encode())
+    assert b"101 Switching Protocols" in sock.recv(1024)
+
+
+def _run_until_completed(sock: socket.socket) -> list[dict]:
+    events = []
+    while True:
+        event = json.loads(_read_frame(sock))
+        events.append(event)
+        if event.get("type") == "run.completed":
+            return events
+
+
 def test_websocket_streams_agent_events(server):
     sock = socket.create_connection(("127.0.0.1", server.port), timeout=2)
     try:
@@ -119,3 +164,101 @@ def test_websocket_streams_agent_events(server):
         assert json.loads(events[-1]) == {"type": "run.completed", "final": "seen: socket"}
     finally:
         sock.close()
+
+
+def test_websocket_accepts_multiple_messages_on_one_connection(server):
+    sock = socket.create_connection(("127.0.0.1", server.port), timeout=2)
+    try:
+        _upgrade(sock)
+        sock.sendall(_masked_frame(json.dumps({"message": "one"})))
+        first = _run_until_completed(sock)
+        assert first[-1] == {"type": "run.completed", "final": "seen: one"}
+        sock.sendall(_masked_frame(json.dumps({"message": "two"})))
+        second = _run_until_completed(sock)
+        assert second[-1] == {"type": "run.completed", "final": "seen: two"}
+    finally:
+        sock.close()
+
+
+def test_websocket_replies_to_ping_with_pong(server):
+    sock = socket.create_connection(("127.0.0.1", server.port), timeout=2)
+    try:
+        _upgrade(sock)
+        sock.sendall(_ws_frame(0x9, b"hi"))  # ping
+        opcode, payload = _read_raw_frame(sock)
+        assert opcode == 0xA
+        assert payload == b"hi"
+        # connection must still be usable after the ping/pong exchange
+        sock.sendall(_masked_frame(json.dumps({"message": "socket"})))
+        events = _run_until_completed(sock)
+        assert events[-1] == {"type": "run.completed", "final": "seen: socket"}
+    finally:
+        sock.close()
+
+
+def test_websocket_reassembles_fragmented_text(server):
+    sock = socket.create_connection(("127.0.0.1", server.port), timeout=2)
+    try:
+        _upgrade(sock)
+        payload = json.dumps({"message": "socket"}).encode()
+        sock.sendall(_ws_frame(0x1, payload[:5], fin=False))      # text start
+        sock.sendall(_ws_frame(0x0, payload[5:10], fin=False))    # continuation
+        sock.sendall(_ws_frame(0x0, payload[10:], fin=True))      # final continuation
+        events = _run_until_completed(sock)
+        assert events[-1] == {"type": "run.completed", "final": "seen: socket"}
+    finally:
+        sock.close()
+
+
+def test_websocket_close_handshake(server):
+    sock = socket.create_connection(("127.0.0.1", server.port), timeout=2)
+    try:
+        _upgrade(sock)
+        sock.sendall(_ws_frame(0x8, struct.pack("!H", 1000)))
+        opcode, payload = _read_raw_frame(sock)
+        assert opcode == 0x8
+        assert struct.unpack("!H", payload[:2])[0] == 1000
+    finally:
+        sock.close()
+
+
+def test_openai_completion_streams_sse(server):
+    root = f"http://127.0.0.1:{server.port}"
+    request = urllib.request.Request(
+        root + "/v1/chat/completions",
+        data=json.dumps({
+            "model": "stream-session",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request) as response:
+        assert response.headers.get_content_type() == "text/event-stream"
+        body = response.read().decode()
+    lines = [line for line in body.splitlines() if line.startswith("data: ")]
+    assert lines[-1] == "data: [DONE]"
+    parsed = [json.loads(line[6:]) for line in lines[:-1]]
+    assert all(item["object"] == "chat.completion.chunk" for item in parsed)
+    assert parsed[-1]["choices"][0]["finish_reason"] == "stop"
+    content = "".join(item["choices"][0]["delta"].get("content", "") for item in parsed)
+    assert content == "seen: hi"
+
+
+def test_session_store_persists_runs_across_restart(tmp_path):
+    store = tmp_path / "store"
+    first = AgentServer(_factory, port=0, session_store_dir=store)
+    try:
+        record = first._run_agent("hello", stream=False, output_schema=None)
+        run_id = record["run_id"]
+    finally:
+        first._httpd.server_close()
+    # Simulate a restart: a fresh server over the same directory reloads runs.
+    second = AgentServer(_factory, port=0, session_store_dir=store)
+    try:
+        assert run_id in second._runs
+        assert second._runs[run_id]["status"] == "completed"
+        assert second._runs[run_id]["final"] == "seen: hello"
+    finally:
+        second._httpd.server_close()

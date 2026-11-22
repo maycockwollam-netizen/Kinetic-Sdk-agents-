@@ -89,6 +89,15 @@ class DockerWorkspace(WorkspaceBase):
     def root_path(self) -> str:
         return self._workdir
 
+    @property
+    def container_name(self) -> str | None:
+        """Container name when running in persistent ``exec`` mode, else ``None``.
+
+        Useful for callers that need to address the container directly (e.g.
+        discovering its IP to reach a service it exposes).
+        """
+        return self._wrapper[-1] if self._mode == "exec" else None
+
     def run_command(
         self, command: str, *, timeout: float | None = None, cwd: str | None = None
     ) -> CommandResult:

@@ -238,6 +238,7 @@ class Agent:
         planner: PlanStrategy | None = None,
         answer_verifier: AnswerVerifier | None = None,
         max_verification_retries: int = 1,
+        verifier_fail_closed: bool = True,
         max_transient_retries: int = 2,
         transient_retry_backoff_seconds: float = 0.25,
         injection_guard: InjectionGuard | bool | None = None,
@@ -394,6 +395,10 @@ class Agent:
         self.planner = planner
         self.answer_verifier = answer_verifier
         self.max_verification_retries = max_verification_retries
+        #: When True (default), a verifier that raises is treated as a
+        #: rejection so it cannot silently approve unverified answers. Set to
+        #: False to fail open (accept on verifier error).
+        self.verifier_fail_closed = verifier_fail_closed
         self.plan: Plan | None = None
         #: Tool output is untrusted by default.  ``False`` is the explicit
         #: opt-out for controlled, purely internal tools.
@@ -1054,10 +1059,12 @@ class Agent:
     def _verify_final_answer(self, answer: str) -> tuple[bool, str]:
         """Run the optional verifier, failing closed for an invalid verdict.
 
-        Verifier exceptions are surfaced as events but do not turn a healthy
-        completed run into a failure; extensions must not become an outage
-        multiplier.  A malformed verifier result is treated as a rejection,
-        because silently accepting it would undermine the verify contract.
+        A malformed verifier result is treated as a rejection. When the
+        verifier itself raises, the behaviour is controlled by
+        ``verifier_fail_closed``: by default (True) the answer is **not**
+        accepted (the agent retries or raises ``AnswerNotVerified``), so a
+        broken verifier cannot silently approve unverified answers. Set it to
+        False to preserve the legacy fail-open behaviour (accept on error).
         """
         assert self.answer_verifier is not None
         task = self._first_user_message() or "Continue the current task"
@@ -1068,7 +1075,9 @@ class Agent:
                 "agent.verification_failed",
                 {"reason": "exception", "error": redact_secrets(f"{type(exc).__name__}: {exc}")},
             )
-            return True, ""
+            if not self.verifier_fail_closed:
+                return True, ""
+            return False, "Verifier raised an error; final answer was not verified."
         if not hasattr(verdict, "accepted") or not isinstance(verdict.accepted, bool):
             self._emit("agent.verification_failed", {"reason": "invalid_verdict"})
             return False, "Verifier returned an invalid verdict."
