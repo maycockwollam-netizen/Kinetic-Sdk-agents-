@@ -213,9 +213,73 @@ def test_compact_without_any_tool_results_keeps_head_and_last_turn():
     for i in range(6):
         state.messages.append(_user(f"msg {i}"))
     compacted = manager.compact(state)
+    # All six are human guidance turns: the anchor feature keeps them
+    # verbatim, so nothing needs eliding.
+    assert [dict(m) for m in compacted.messages] == [dict(m) for m in state.messages]
+
+
+def test_compact_user_anchor_can_be_disabled_for_legacy_elision():
+    manager = SimpleTruncateContextManager(keep_user_messages=False)
+    state = ConversationState()
+    for i in range(6):
+        state.messages.append(_user(f"msg {i}"))
+    compacted = manager.compact(state)
     assert compacted.messages[0] == state.messages[0]
     assert compacted.messages[-1] == state.messages[-1]
     assert "rút gọn" in compacted.messages[1]["content"]
+
+
+def test_compact_keeps_mid_conversation_user_guidance_verbatim():
+    manager = SimpleTruncateContextManager(keep_last_tool_results=1)
+    state = ConversationState()
+    state.messages.append(_user("goal"))
+    state.messages.append(
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "t", "input": {}}]}
+    )
+    state.messages.append(_tool_result("c1", "first result"))
+    state.messages.append(_user("IMPORTANT follow-up instruction"))
+    state.messages.append(_assistant("analysing..."))
+    state.messages.append(
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "c2", "name": "t", "input": {}}]}
+    )
+    state.messages.append(_tool_result("c2", "second result"))
+
+    compacted = manager.compact(state)
+
+    contents = [m.get("content") for m in compacted.messages]
+    # The first user message, the mid-conversation instruction, and the
+    # protected tail (tool_use c2 + its result) survive.
+    assert contents[0] == "goal"
+    assert "IMPORTANT follow-up instruction" in contents
+    assert compacted.messages[-2]["content"][0]["id"] == "c2"
+    # The elided assistant/tool span is replaced by one placeholder.
+    placeholders = [c for c in contents if isinstance(c, str) and "rút gọn" in c]
+    assert len(placeholders) == 1
+
+
+def test_compact_summarizing_keeps_user_guidance_verbatim():
+    state = ConversationState()
+    state.messages.append(_user("goal"))
+    state.messages.append(
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "t", "input": {}}]}
+    )
+    state.messages.append(_tool_result("c1", "result one"))
+    state.messages.append(_user("switch to approach B"))
+    state.messages.append(_assistant("thinking about B"))
+    # Build a tail with its own tool group.
+    state.messages.append(
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "c2", "name": "t", "input": {}}]}
+    )
+    state.messages.append(_tool_result("c2", "final result"))
+
+    manager = SummarizingContextManager(
+        keep_last_tool_results=1, summarizer=FakeSummarizer("Tóm tắt gọn gàng.")
+    )
+    compacted = manager.compact(state)
+
+    contents = [m.get("content") for m in compacted.messages]
+    assert "switch to approach B" in contents  # human guidance kept verbatim
+    assert any(isinstance(c, str) and "Tóm tắt gọn gàng" in c for c in contents)
 
 
 def test_compact_when_everything_is_protected_returns_copy():

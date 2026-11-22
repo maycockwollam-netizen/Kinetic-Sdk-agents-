@@ -168,6 +168,17 @@ def _message_has_tool_content(msg: Message) -> bool:
     return bool(_message_tool_use_ids(msg) or _message_tool_result_ids(msg))
 
 
+def _is_user_guidance_message(msg: Message) -> bool:
+    """True for a human instruction turn (not a tool_result carrier).
+
+    Tool results are stored as ``user`` messages whose content is a list of
+    ``tool_result`` blocks; genuine guidance (plain text or an image turn)
+    carries no tool block and must survive compaction, otherwise the model
+    loses the user's updated instructions mid-conversation.
+    """
+    return msg.get("role") == "user" and not _message_has_tool_content(msg)
+
+
 @dataclass
 class StructuredSummary:
     """Additive findings retained across progressive compaction rounds."""
@@ -487,11 +498,18 @@ class SimpleTruncateContextManager(ContextManager):
             selects newest results by token cost, capped by
             ``keep_last_tool_results``; ``None`` preserves historical count
             based behaviour.
+        keep_user_messages: When True (default), every human guidance turn in
+            the elided middle span survives compaction verbatim (the model
+            never loses updated instructions). Only assistant/tool/system
+            messages are replaced by the placeholder; the placeholder count
+            reflects those elided messages.
 
     Compaction keeps, in order: the first message (normally the original
-    user request) and the tail of the conversation starting just before the
-    Nth-from-last tool result. Everything in between is replaced by a single
-    placeholder message so the model still sees that something was elided.
+    user request), every intermediate human guidance turn (when
+    ``keep_user_messages``), and the tail of the conversation starting just
+    before the Nth-from-last tool result. The assistant/tool/system span in
+    between is replaced by a single placeholder message so the model still
+    sees that something was elided.
     """
 
     PLACEHOLDER_TEMPLATE = "[{n} tin nhắn trước đó đã được rút gọn]"
@@ -506,6 +524,7 @@ class SimpleTruncateContextManager(ContextManager):
         budget: ContextBudget | None = None,
         tool_output_compressor: ToolOutputCompressor | None = None,
         tail_token_budget: float | None = None,
+        keep_user_messages: bool = True,
     ) -> None:
         if keep_last_tool_results < 0:
             raise ValueError("keep_last_tool_results must be >= 0")
@@ -529,6 +548,7 @@ class SimpleTruncateContextManager(ContextManager):
         self.budget = budget
         self.tool_output_compressor = tool_output_compressor
         self.tail_token_budget = tail_token_budget
+        self.keep_user_messages = keep_user_messages
         self._budget_context_limit: int | None = None
 
     def _count_tokens(self, text: str) -> int:
@@ -582,15 +602,24 @@ class SimpleTruncateContextManager(ContextManager):
             if tail_start > 0 and not _message_has_tool_content(messages[0])
             else 0
         )
-        removed = tail_start - head_end
-        if removed <= 0:
-            # No message-level cut is possible, but oversized tool results in
-            # the kept span may still need trimming (a giant protected tail
-            # is exactly the case elision cannot fix).
+        middle = messages[head_end:tail_start]
+        if not middle:
             return self._copy(state, self._truncate_oversized_tool_results(list(messages)))
 
         kept = [dict(m) for m in messages[:head_end]]
-        kept.append(self._elided_message(messages[head_end:tail_start], removed))
+        if self.keep_user_messages:
+            kept.extend(dict(m) for m in middle if _is_user_guidance_message(m))
+        elided = [
+            m
+            for m in middle
+            if not (self.keep_user_messages and _is_user_guidance_message(m))
+        ]
+        if not elided:
+            # Nothing was dropped (everything worth keeping is already in
+            # ``kept``); oversized tool results may still need trimming.
+            return self._copy(state, self._truncate_oversized_tool_results(list(messages)))
+
+        kept.append(self._elided_message(elided, len(elided)))
         kept.extend(dict(m) for m in messages[tail_start:])
         return self._copy(state, self._truncate_oversized_tool_results(kept))
 
@@ -817,6 +846,7 @@ class SummarizingContextManager(SimpleTruncateContextManager):
         budget: ContextBudget | None = None,
         tool_output_compressor: ToolOutputCompressor | None = None,
         tail_token_budget: float | None = None,
+        keep_user_messages: bool = True,
     ) -> None:
         super().__init__(
             keep_last_tool_results=keep_last_tool_results,
@@ -827,6 +857,7 @@ class SummarizingContextManager(SimpleTruncateContextManager):
             budget=budget,
             tool_output_compressor=tool_output_compressor,
             tail_token_budget=tail_token_budget,
+            keep_user_messages=keep_user_messages,
         )
         if summarizer is not None and summarizer_client is not None:
             raise ValueError("pass either `summarizer` or `summarizer_client`, not both")
