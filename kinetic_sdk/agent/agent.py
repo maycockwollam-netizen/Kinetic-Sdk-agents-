@@ -1294,6 +1294,32 @@ class Agent:
                 assert tool is not None
                 pending.append((i, call, tool, arguments))
 
+        # Enforce thread_safe contract when parallel execution is enabled.
+        # Tools with thread_safe=False and mutable state must either:
+        # - implement clone_for_subagent() so each sub-agent gets its own instance
+        # - or be declared thread_safe=True after careful review
+        if self.parallel_tool_execution:
+            for i, call, tool, arguments in pending:
+                if not getattr(tool, "thread_safe", False):
+                    import os
+                    if os.environ.get("KINETIC_ENFORCE_THREAD_SAFE", "warn") == "error":
+                        raise RuntimeError(
+                            f"Tool {tool.name!r} has thread_safe=False but parallel_tool_execution=True. "
+                            "Either set thread_safe=True (if the tool has no mutable state), "
+                            "implement clone_for_subagent(), or run with parallel_tool_execution=False. "
+                            "Set KINETIC_ENFORCE_THREAD_SAFE=warn to downgrade to a warning."
+                        )
+                    else:
+                        import warnings
+                        warnings.warn(
+                            f"Tool {tool.name!r} has thread_safe=False but parallel_tool_execution=True. "
+                            "This may cause race conditions if the tool has mutable state. "
+                            "Set thread_safe=True, implement clone_for_subagent(), or use parallel_tool_execution=False. "
+                            "Set KINETIC_ENFORCE_THREAD_SAFE=error to make this a hard error.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+
         return self._dispatch_and_record(calls, pending, early_or_skip, skipped)
 
     def _dispatch_and_record(

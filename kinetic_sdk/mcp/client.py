@@ -30,6 +30,7 @@ version and are ignored.
 from __future__ import annotations
 
 import time
+import threading
 from typing import Any, Callable
 
 from kinetic_sdk.mcp.protocol import (
@@ -96,6 +97,10 @@ class MCPClient:
         self._on_notification = on_notification
         self._ids = RequestIdGenerator()
         self._initialized = False
+        #: Serializes request/response exchanges. A transport is not safe for
+        #: concurrent use (a response could be consumed by the wrong caller),
+        #: so every request round-trip holds this lock.
+        self._request_lock = threading.Lock()
         #: Populated by a successful handshake: the server's protocolVersion.
         self.protocol_version: str | None = None
         #: Populated by a successful handshake: serverInfo + capabilities.
@@ -201,37 +206,38 @@ class MCPClient:
             )
 
     def _request(self, method: str, params: dict[str, Any], timeout: float) -> Any:
-        request_id = self._ids.next()
-        self._transport.send(JsonRpcRequest(id=request_id, method=method, params=params))
-        deadline = time.monotonic() + timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise MCPTimeoutError(
-                    f"MCP server did not answer {method!r} (id={request_id}) "
-                    f"within {timeout}s"
-                )
-            msg = self._transport.receive(timeout=remaining)
-            if isinstance(msg, JsonRpcNotification):
-                if self._on_notification is not None:
-                    self._on_notification(msg)
-                continue
-            if isinstance(msg, JsonRpcRequest):
-                # Server-initiated requests (sampling, roots, ...) are not
-                # supported in this version; ignore and keep waiting.
-                continue
-            assert isinstance(msg, JsonRpcResponse)
-            if msg.id != request_id:
-                raise MCPClientError(
-                    f"Response id mismatch for {method!r}: got id={msg.id!r}, "
-                    f"expected id={request_id!r} — the server is not pairing "
-                    "responses to requests correctly."
-                )
-            if msg.is_error:
-                assert msg.error is not None
-                raise MCPServerError(
-                    code=msg.error["code"],
-                    message=msg.error["message"],
-                    data=msg.error.get("data"),
-                )
-            return msg.result
+        with self._request_lock:
+            request_id = self._ids.next()
+            self._transport.send(JsonRpcRequest(id=request_id, method=method, params=params))
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MCPTimeoutError(
+                        f"MCP server did not answer {method!r} (id={request_id}) "
+                        f"within {timeout}s"
+                    )
+                msg = self._transport.receive(timeout=remaining)
+                if isinstance(msg, JsonRpcNotification):
+                    if self._on_notification is not None:
+                        self._on_notification(msg)
+                    continue
+                if isinstance(msg, JsonRpcRequest):
+                    # Server-initiated requests (sampling, roots, ...) are not
+                    # supported in this version; ignore and keep waiting.
+                    continue
+                assert isinstance(msg, JsonRpcResponse)
+                if msg.id != request_id:
+                    raise MCPClientError(
+                        f"Response id mismatch for {method!r}: got id={msg.id!r}, "
+                        f"expected id={request_id!r} — the server is not pairing "
+                        "responses to requests correctly."
+                    )
+                if msg.is_error:
+                    assert msg.error is not None
+                    raise MCPServerError(
+                        code=msg.error["code"],
+                        message=msg.error["message"],
+                        data=msg.error.get("data"),
+                    )
+                return msg.result

@@ -51,3 +51,12 @@ class FileLockTimeoutError(FileLockError, TimeoutError):
 
 class FileLockOwnershipError(FileLockError):
     """An agent attempted to release or renew a lock it does not own."""
+
+
+class TokenExceededError(SubagentError):
+    """The shared :class:`~kinetic_sdk.subagent.budget.SpawnBudget` token limit is spent.
+
+    Raised the moment any agent in the spawned tree requests token usage that
+    would exceed ``max_total_tokens``. This is a *hard stop* analogous to
+    :class:`BudgetExceededError` but for token-based billing.
+    """

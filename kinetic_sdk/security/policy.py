@@ -111,9 +111,21 @@ def _matches_pattern(pattern: str, text: str) -> bool:
 def _path_matches_prefix(path: str, prefix: str) -> bool:
     """Return whether *path* is *prefix* itself or is inside it by segment.
 
-    This treats paths as platform-independent logical POSIX paths.  Absolute
-    and relative paths never match each other, preventing an ambiguous rule
-    from granting access to a differently rooted path.
+    This treats paths as platform-independent **logical** POSIX paths: it
+    normalises ``.``/``..`` textually and compares segments. It deliberately
+    does **not** touch the filesystem, so it neither resolves symlinks nor
+    verifies that the path exists.
+
+    That makes it correct for policy rules (which must stay pure and fast)
+    but *not* a filesystem sandbox: a path that looks contained here can
+    still reach outside through a symlink. Real containment is enforced at
+    the execution boundary by
+    :meth:`kinetic_sdk.workspace.manager.Workspace.resolve`, which
+    canonicalises with :func:`os.path.realpath` and compares with
+    :func:`os.path.commonpath`.
+
+    Absolute and relative paths never match each other, preventing an
+    ambiguous rule from granting access to a differently rooted path.
     """
     norm_path = posixpath.normpath(path)
     norm_prefix = posixpath.normpath(prefix)
@@ -153,6 +165,15 @@ class RuleBasedPolicy(PermissionPolicy):
     complements (rather than replaces) :class:`AllowListPolicy`: use it when
     a policy must distinguish e.g. a read-only terminal command from a
     destructive one, or requests to trusted domains from arbitrary hosts.
+
+    .. warning::
+       ``path_prefix`` rules are **logical** path-segment matches, not a
+       filesystem sandbox. They do not resolve symlinks or confirm that a
+       path exists, so a rule allowing ``/workspace`` does not by itself
+       prevent a symlink inside the workspace from pointing elsewhere. Treat
+       this policy as one layer of defence, and rely on the execution
+       boundary (:meth:`kinetic_sdk.workspace.manager.Workspace.resolve`,
+       which uses ``realpath`` + ``commonpath``) for real containment.
     """
 
     def __init__(

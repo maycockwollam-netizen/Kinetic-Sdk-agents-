@@ -129,6 +129,13 @@ class Tool(ABC):
     #: timeout/retry settings and has no circuit breaker, as before.
     execution_policy: ToolExecutionPolicy | None = None
 
+    #: Declares whether this tool is safe to share across concurrent
+    #: sub-agent runs. Default ``False``: tools with mutable internal state
+    #: (sessions, caches, connections, ...) must either set this to ``True``
+    #: after careful review, or implement :meth:`clone_for_subagent` so each
+    #: sub-agent gets its own instance.
+    thread_safe: bool = False
+
     @abstractmethod
     def execute(self, *, idempotency_key: str | None = None, **params: Any) -> ToolResult:
         """Run the tool with validated parameters and return a result.
@@ -166,6 +173,27 @@ class Tool(ABC):
         the background — Python cannot safely kill a running thread.
         """
         return await asyncio.to_thread(self.execute, **params)
+
+    def clone_for_subagent(self) -> "Tool":
+        """Return a fresh instance for a spawned sub-agent.
+
+        The default implementation raises ``NotImplementedError`` because
+        tools with mutable state cannot be safely cloned without knowing
+        their internals.  Tools that declare ``thread_safe = True`` are
+        shared as-is; tools that need per-sub-agent isolation must override
+        this method to return a properly initialized clone (e.g. a new
+        session, a new cache, a new connection pool).
+
+        Raises:
+            NotImplementedError: When the tool does not declare ``thread_safe``
+                and does not implement cloning. This prevents accidental
+                sharing of mutable state across concurrent sub-agents.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement clone_for_subagent() "
+            "and is not declared thread_safe. Either set thread_safe=True "
+            "(if the tool has no mutable state) or implement cloning."
+        )
 
     def to_schema(self) -> dict[str, Any]:
         """Return the tool definition in a provider-neutral shape.

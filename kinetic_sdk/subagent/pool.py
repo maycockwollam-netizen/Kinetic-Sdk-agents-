@@ -9,13 +9,13 @@ serial task.
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Iterator, Protocol, Sequence
 
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.llm.client import LLMClient, LLMResponse, Message, StreamEvent
 from kinetic_sdk.subagent.budget import SpawnBudget
-from kinetic_sdk.subagent.delegation import DelegationResult, LLMFactory, run_subagent
+from kinetic_sdk.subagent.delegation import DelegationResult, run_subagent
 from kinetic_sdk.subagent.manifest import SubagentSpec
 
 
@@ -86,24 +86,31 @@ class SubagentPool:
         specs: Sequence[SubagentSpec],
         budget: SpawnBudget,
         *,
-        llm_factory: LLMFactory | None = None,
-    ) -> list[DelegationResult]:
+        llm_factory: Any | None = None,
+        timeout: float | None = None,
+    ) -> list[DelegationResult | None]:
         """Run every spec with its description as the delegated task prompt.
 
-        ``SubagentSpec`` deliberately contains metadata only; its
-        ``description`` is therefore the natural pool task input. Empty
-        descriptions are valid and are passed through unchanged. When a
-        factory is supplied it is called once for every worker, with the
-        spec's model or the inherited parent model.
+        Returns one entry per spec, preserving ``specs`` order.  Entries are
+        ``DelegationResult`` for successful workers and ``None`` for workers
+        that raised an exception (the exception itself is swallowed so the
+        pool can keep collecting other results).
+
+        ``timeout``, when set, applies per-future and will cancel in-flight
+        agent runs that have not yet produced a result.
         """
         base_llm_override = (
             _SerializedLLMClient(parent.llm)
             if llm_factory is None and self.max_concurrency > 1
             else None
         )
+
+        results: list[DelegationResult | None] = [None] * len(specs)
+
         with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
-            futures = [
-                executor.submit(
+            future_to_idx: dict[int, int] = {}
+            for i, spec in enumerate(specs):
+                fut = executor.submit(
                     run_subagent,
                     parent,
                     spec,
@@ -112,14 +119,23 @@ class SubagentPool:
                     llm_factory=llm_factory,
                     _base_llm_override=base_llm_override,
                 )
-                for spec in specs
-            ]
-            return [future.result() for future in futures]
+                future_to_idx[fut] = i
+
+            for future in as_completed(future_to_idx.keys(), timeout=timeout):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception:  # noqa: BLE001 - swallow so pool keeps going
+                    results[idx] = None
+
+        return results
 
 
-def _default_merge(results: list[DelegationResult]) -> str:
+def _default_merge(results: list[DelegationResult | None]) -> str:
     """Join results without an extra model call or interpretation."""
-    return "\n\n--- Sub-agent result ---\n\n".join(result.final_message for result in results)
+    return "\n\n--- Sub-agent result ---\n\n".join(
+        result.final_message for result in results if result is not None
+    )
 
 
 def spawn_subagent_pool(
@@ -129,7 +145,8 @@ def spawn_subagent_pool(
     budget: SpawnBudget | None = None,
     merger: SubagentResultMerger | None = None,
     max_concurrency: int = 3,
-    llm_factory: LLMFactory | None = None,
+    llm_factory: Any | None = None,
+    timeout: float | None = None,
 ) -> str:
     """Run independent agents concurrently, merge, then optionally verify.
 
@@ -145,15 +162,22 @@ def spawn_subagent_pool(
     verifier is reused for the merged text.  A rejected merge raises the same
     :class:`AnswerNotVerifiedError` path as a rejected final answer.
     """
-    results = SubagentPool(max_concurrency).run_all(
+    budget = budget or SpawnBudget()
+    pool = SubagentPool(max_concurrency=max_concurrency)
+    results = pool.run_all(
         parent,
         specs,
-        budget if budget is not None else SpawnBudget(),
+        budget,
         llm_factory=llm_factory,
+        timeout=timeout,
     )
-    merged = merger.merge(results) if merger is not None else _default_merge(results)
+
+    merger = merger or _default_merge
+    merged = merger(results) if results else ""
+
     if parent.answer_verifier is not None:
         accepted, feedback = parent._verify_final_answer(merged)  # noqa: SLF001
         if not accepted:
             parent._raise_answer_not_verified(merged, feedback)  # noqa: SLF001
+
     return merged

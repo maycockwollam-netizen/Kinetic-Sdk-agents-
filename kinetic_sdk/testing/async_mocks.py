@@ -119,7 +119,13 @@ class AsyncMockTool(Tool):
     The synchronous :meth:`execute` raises ``NotImplementedError``: this
     fixture exists to exercise the async tool path, and silently falling
     back to sync execution would hide wiring mistakes in tests.
+
+    Declared ``thread_safe=True`` because each test creates a fresh instance
+    and the mutable ``calls`` list is not shared across concurrent runs in
+    typical test usage. In production, a tool with mutable state should either
+    implement ``clone_for_subagent()`` or use proper synchronization.
     """
+    thread_safe = True
 
     def __init__(
         self,

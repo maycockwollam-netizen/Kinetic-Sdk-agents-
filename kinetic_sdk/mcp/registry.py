@@ -39,6 +39,7 @@ or, keeping the value wrapped until the last moment (preferred)::
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import threading
 from typing import Any
 
 from kinetic_sdk.mcp.adapter import MCPToolAdapter
@@ -125,29 +126,40 @@ class MCPServerRegistry:
         self._secrets = secrets if secrets is not None else SecretRegistry()
         self._configs: dict[str, MCPServerConfig] = {}
         self._clients: dict[str, MCPClient] = {}
+        #: Serializes connect/reconnect/close so two threads can't race on
+        #: the same cached client or spawn duplicate subprocesses.
+        self._lock = threading.RLock()
 
     @property
     def secrets(self) -> SecretRegistry:
         return self._secrets
 
     def register(self, name: str, config: MCPServerConfig) -> None:
-        """Store *config* under *name*. Does NOT connect yet."""
-        if not name:
-            raise ValueError("Server name must be non-empty")
-        if name in self._configs:
-            raise ValueError(
-                f"MCP server {name!r} is already registered — close() and "
-                "re-register to replace it"
-            )
-        self._configs[name] = config
+        """Store *config* under *name* (thread-safe). Does NOT connect yet."""
+        with self._lock:
+            if not name:
+                raise ValueError("Server name must be non-empty")
+            if name in self._configs:
+                raise ValueError(
+                    f"MCP server {name!r} is already registered — close() and "
+                    "re-register to replace it"
+                )
+            self._configs[name] = config
 
     def registered_names(self) -> list[str]:
-        return sorted(self._configs)
+        with self._lock:
+            return sorted(self._configs)
 
     def is_connected(self, name: str) -> bool:
-        return name in self._clients
+        with self._lock:
+            return name in self._clients
 
     def connect(self, name: str) -> MCPClient:
+        """Thread-safe wrapper around :meth:`_connect_locked`."""
+        with self._lock:
+            return self._connect_locked(name)
+
+    def _connect_locked(self, name: str) -> MCPClient:
         """Connect to *name* (spawning the transport) and run the handshake.
 
         The connected client is cached; a second call returns the same
@@ -185,8 +197,11 @@ class MCPServerRegistry:
         runs the full handshake again. Raises for unknown servers like
         :meth:`connect` does.
         """
-        self.close(name)
-        return self.connect(name)
+        with self._lock:
+            client = self._clients.pop(name, None)
+            if client is not None:
+                client.close()
+            return self._connect_locked(name)
 
     def get_tools_as_kinetic_tools(self, name: str) -> list[Tool]:
         """Connect (if needed) and wrap every server tool in an adapter.
@@ -201,14 +216,18 @@ class MCPServerRegistry:
         ]
 
     def close(self, name: str) -> None:
-        """Close one server's client (idempotent; keeps the config)."""
-        client = self._clients.pop(name, None)
-        if client is not None:
-            client.close()
+        """Close one server's client (thread-safe; idempotent)."""
+        with self._lock:
+            client = self._clients.pop(name, None)
+            if client is not None:
+                client.close()
 
     def close_all(self) -> None:
-        for name in list(self._clients):
-            self.close(name)
+        with self._lock:
+            for name in list(self._clients):
+                client = self._clients.pop(name, None)
+                if client is not None:
+                    client.close()
 
     def __enter__(self) -> "MCPServerRegistry":
         return self

@@ -48,7 +48,9 @@ class AuditLogger:
             input=redact_value(tool_input),
             decision={
                 "allowed": decision.allowed,
-                "reason": decision.reason,
+                # ``reason`` is policy-authored free text that may echo back
+                # part of the tool input, so it goes through redaction too.
+                "reason": redact_value(decision.reason),
                 "requires_confirmation": decision.requires_confirmation,
             },
         )
@@ -84,7 +86,7 @@ class AuditLogger:
             tool_name,
             timestamp,
             input=redact_value(tool_input),
-            reason=reason,
+            reason=redact_value(reason),
         )
 
     def log_event(
@@ -102,14 +104,17 @@ class AuditLogger:
         (kept for shape compatibility); all field values are redacted.
         """
         safe_fields = {key: redact_value(value) for key, value in fields.items()}
-        return self._entry(event, subject, timestamp, **safe_fields)
+        return self._entry(event, redact_value(subject), timestamp, **safe_fields)
 
     def _entry(self, event: str, tool_name: str, timestamp: datetime, **fields: Any) -> dict[str, Any]:
         entry: dict[str, Any] = {
             "id": uuid.uuid4().hex,
             "timestamp": timestamp.isoformat(),
             "event": event,
-            "tool_name": tool_name,
+            # ``tool_name`` doubles as the free-form ``subject`` for
+            # ``log_event`` entries, so it is redacted here as a last line of
+            # defence for any caller that forgets to scrub it.
+            "tool_name": redact_value(tool_name),
         }
         entry.update(fields)
         self._record(entry)

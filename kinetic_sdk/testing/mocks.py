@@ -127,6 +127,9 @@ def tool_response(
 
 class MockTool(Tool):
     """A configurable stand-in :class:`Tool`.
+    """
+    thread_safe = True  # :class:`MockTool` has no mutable state, safe to share
+    """A configurable stand-in :class:`Tool`.
 
     Args:
         name: Tool name reported to the model (unique per agent).

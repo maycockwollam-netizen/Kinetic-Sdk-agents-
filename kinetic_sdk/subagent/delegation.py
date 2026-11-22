@@ -151,6 +151,12 @@ class _GuardedLLMClient(LLMClient):
         for call in response.tool_calls:
             self._budget.record_tool_call(self._agent_id, call.name)
             self._breaker.record(call.name, call.arguments)
+        # Charge token usage if available.
+        if response.usage:
+            inp = response.usage.get("input_tokens", 0)
+            out = response.usage.get("output_tokens", 0)
+            if inp + out > 0:
+                self._budget.record_token_usage(self._agent_id, inp + out)
         return response
 
     def chat_stream(
@@ -166,6 +172,12 @@ class _GuardedLLMClient(LLMClient):
                 for call in event.delta.tool_calls:
                     self._budget.record_tool_call(self._agent_id, call.name)
                     self._breaker.record(call.name, call.arguments)
+                # Charge token usage from the final response.
+                if event.delta.usage:
+                    inp = event.delta.usage.get("input_tokens", 0)
+                    out = event.delta.usage.get("output_tokens", 0)
+                    if inp + out > 0:
+                        self._budget.record_token_usage(self._agent_id, inp + out)
             yield event
 
 
@@ -216,6 +228,7 @@ def spawn_subagent(
     max_consecutive_repeats: int = DEFAULT_MAX_CONSECUTIVE_REPEATS,
     llm_factory: LLMFactory | None = None,
     _base_llm_override: LLMClient | None = None,
+    isolate_tools: bool = False,
 ) -> Agent:
     """Build the sub-agent for *spec* (does NOT run it — see ``run_subagent``).
 
@@ -237,6 +250,11 @@ def spawn_subagent(
             worker even when every worker inherits the same model. Without
             it, a mismatched ``spec.model`` raises :class:`SubagentError`
             rather than silently running on the parent's model.
+        isolate_tools: When True, enforce the thread-safety contract for
+            inherited tools: only tools declared ``thread_safe=True`` are
+            shared, and tools without a ``clone_for_subagent`` implementation
+            raise :class:`SubagentError` instead of being shared. When False
+            (default), tools are shared as before (historical behaviour).
 
     Every spawn is audit-logged (``subagent_spawn``) on the parent's
     (shared) audit logger — including spawns whose run later gets blocked
@@ -281,6 +299,12 @@ def spawn_subagent(
     # are cloned and re-bound to the SUB-agent: delegates share the tree
     # budget, while file editors share the same lock registry but get the
     # child's distinct owner id.
+    #
+    # Other tools are shared by default (historical behaviour). With
+    # ``isolate_tools=True`` the thread-safety contract is enforced:
+    # - thread_safe=True -> shared as-is
+    # - implements clone_for_subagent() -> cloned per sub-agent
+    # - otherwise -> raise, preventing accidental mutable-state sharing
     tools: list[Any] = []
     delegate_clones: list[DelegateTool] = []
     file_tool_clones: list[Any] = []
@@ -295,8 +319,19 @@ def spawn_subagent(
             file_clone = tool._clone_for()  # noqa: SLF001
             file_tool_clones.append(file_clone)
             tools.append(file_clone)
-        else:
+        elif not isolate_tools or getattr(tool, "thread_safe", False):
+            # Default: share. In strict mode, only declared thread-safe tools
+            # are shared.
             tools.append(tool)
+        else:
+            try:
+                tools.append(tool.clone_for_subagent())
+            except NotImplementedError as exc:
+                raise SubagentError(
+                    f"Tool {tool.name!r} cannot be shared across sub-agents: "
+                    "it has no thread_safe=True declaration and does not "
+                    f"implement clone_for_subagent(). {exc}"
+                ) from exc
 
     if spec.tools:
         # Single authentication layer: this sub-agent may only touch the
@@ -361,6 +396,7 @@ def run_subagent(
     max_consecutive_repeats: int = DEFAULT_MAX_CONSECUTIVE_REPEATS,
     llm_factory: LLMFactory | None = None,
     _base_llm_override: LLMClient | None = None,
+    isolate_tools: bool = False,
 ) -> DelegationResult:
     """Spawn the sub-agent and run it to completion on *task_prompt*.
 
@@ -378,6 +414,7 @@ def run_subagent(
         max_consecutive_repeats=max_consecutive_repeats,
         llm_factory=llm_factory,
         _base_llm_override=_base_llm_override,
+        isolate_tools=isolate_tools,
     )
     agent_id = agent_id_for(sub_agent)
     try:

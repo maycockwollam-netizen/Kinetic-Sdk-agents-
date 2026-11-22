@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 from abc import ABC, abstractmethod
+from collections import deque
 from typing import BinaryIO, Callable
 from urllib.parse import urljoin, urlsplit
 
@@ -124,11 +125,12 @@ class StdioTransport(Transport):
             defaults to :func:`_default_process_factory`.
 
     A background daemon thread pumps stdout lines into a queue so
-    :meth:`receive` can enforce timeouts on blocking pipes. If the child
-    dies mid-conversation (EOF on stdout), the pending and all subsequent
-    :meth:`receive` calls raise :class:`MCPTransportError` carrying the
-    exit code and a stderr tail — the layer above can never mistake a dead
-    server for a successful no-op.
+    :meth:`receive` can enforce timeouts on blocking pipes. Another background
+    thread drains stderr on a best-effort basis (buffer capped at 64 KiB) to
+    avoid subprocess block. If the child dies mid-conversation (EOF on stdout),
+    the pending and all subsequent :meth:`receive` calls raise
+    :class:`MCPTransportError` carrying the exit code and a stderr tail —
+    the layer above can never mistake a dead server for a successful no-op.
     """
 
     def __init__(
@@ -149,12 +151,24 @@ class StdioTransport(Transport):
         self._reader = self._proc.stdout
         self._writer = self._proc.stdin
         self._queue: queue.Queue[bytes | _StreamEnd] = queue.Queue()
+        # stderr is drained continuously by a daemon thread into this bounded
+        # buffer (keeps the most recent 64 KiB). Without it, a chatty MCP
+        # server fills the OS pipe (typically 64 KiB) and *blocks* mid-request
+        # while still alive — a deadlock that looks like a timeout.
+        self._stderr_buf: deque[bytes] = deque()
+        self._stderr_lock = threading.Lock()
         self._closed = False
         self._lock = threading.Lock()
         self._pump = threading.Thread(
             target=self._pump_lines, args=(self._reader, self._queue), daemon=True
         )
+        self._pump_stderr = threading.Thread(
+            target=self._pump_stderr_lines,
+            args=(self._proc.stderr, self._stderr_buf, self._stderr_lock),
+            daemon=True,
+        )
         self._pump.start()
+        self._pump_stderr.start()
 
     @classmethod
     def attach(
@@ -173,6 +187,8 @@ class StdioTransport(Transport):
         self._reader = reader if reader is not None else sys.stdin.buffer
         self._writer = writer if writer is not None else sys.stdout.buffer
         self._queue = queue.Queue()
+        self._stderr_buf = deque()
+        self._stderr_lock = threading.Lock()
         self._closed = False
         self._lock = threading.Lock()
         self._pump = threading.Thread(
@@ -180,6 +196,31 @@ class StdioTransport(Transport):
         )
         self._pump.start()
         return self
+
+    @staticmethod
+    def _pump_stderr_lines(
+        stderr: BinaryIO | None, buf: deque[bytes], lock: threading.Lock
+    ) -> None:
+        """Daemon thread that drains stderr into a bounded buffer.
+
+        The buffer keeps at most the latest 64 KiB of stderr so a chatty MCP
+        server can never fill the OS pipe and block mid-request, while the
+        most recent output is still available for diagnostics.
+        """
+        total = 0
+        while True:
+            try:
+                chunk = stderr.read(64 * 1024) if stderr is not None else b""
+            except Exception:  # noqa: BLE001 - best effort
+                break
+            if not chunk:
+                break
+            with lock:
+                buf.append(chunk)
+                total += len(chunk)
+                while total > 64 * 1024:
+                    dropped = buf.popleft()
+                    total -= len(dropped)
 
     @staticmethod
     def _pump_lines(stream: BinaryIO, out: "queue.Queue[bytes | _StreamEnd]") -> None:
@@ -237,13 +278,11 @@ class StdioTransport(Transport):
 
     def _death_detail(self, end: _StreamEnd) -> str:
         parts = [f"MCP subprocess stream ended ({end.detail}); {self._process_state()}"]
-        if self._proc is not None and self._proc.stderr is not None:
-            try:
-                tail = self._proc.stderr.read()  # safe: process already exited
-            except Exception:  # noqa: BLE001 - best effort diagnostics
-                tail = b""
-            if tail:
-                parts.append(f"stderr: {tail.decode('utf-8', 'replace')[-500:]}")
+        # Read the latest stderr from the bounded buffer (most recent 64 KiB).
+        with self._stderr_lock:
+            if self._stderr_buf:
+                stderr_tail = b"".join(self._stderr_buf)
+                parts.append(f"stderr: {stderr_tail.decode('utf-8', 'replace')[-500:]}")
         return "; ".join(parts)
 
     def close(self) -> None:
