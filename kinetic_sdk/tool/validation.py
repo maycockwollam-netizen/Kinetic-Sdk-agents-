@@ -53,7 +53,7 @@ def validate_tool_input(schema: dict[str, Any], params: Any) -> list[str]:
                     f"unexpected parameter {key!r} (declared: {sorted(properties)})"
                 )
             continue
-        errors.extend(_validate_value(value, properties[key], path=key))
+        errors.extend(_validate_value(value, properties[key], path=key, root=schema))
     return errors
 
 
@@ -65,13 +65,39 @@ def validate_value(schema: Any, value: Any, path: str = "") -> list[str]:
     ``Agent.run(output_schema=...)`` is in play). Returns problems; empty
     means valid.
     """
-    return _validate_value(value, schema, path or "$")
+    root = schema if isinstance(schema, dict) else {}
+    return _validate_value(value, schema, path or "$", root=root)
 
 
-def _validate_value(value: Any, schema: Any, path: str) -> list[str]:
+def _validate_value(value: Any, schema: Any, path: str, root: dict[str, Any]) -> list[str]:
     if not isinstance(schema, dict) or not schema:
         return []
     errors: list[str] = []
+
+    # ``$ref`` (local JSON pointer into the root's $defs/definitions) is
+    # resolved before any keyword so a definition can be reused anywhere.
+    if "$ref" in schema:
+        target = _resolve_ref(schema["$ref"], root)
+        if target is None:
+            # An unresolvable reference cannot be validated — fail open
+            # rather than inventing constraints.
+            return []
+        return _validate_value(value, target, path, root=root)
+
+    # Combinators: anyOf (at least one branch) and oneOf (exactly one).
+    if "anyOf" in schema or "oneOf" in schema:
+        branches = schema.get("anyOf", schema.get("oneOf"))
+        if not isinstance(branches, list) or not branches:
+            return [f"{path}: combinator needs a non-empty list of schemas"]
+        valid_indices = [
+            index
+            for index, branch in enumerate(branches)
+            if not _validate_value(value, branch, path, root=root)
+        ]
+        if "anyOf" in schema and not valid_indices:
+            return [f"{path}: does not match any of the anyOf alternatives"]
+        if "oneOf" in schema and len(valid_indices) != 1:
+            return [f"{path}: matches {len(valid_indices)} oneOf alternatives (want exactly 1)"]
 
     if "enum" in schema:
         if value not in schema["enum"]:
@@ -91,7 +117,7 @@ def _validate_value(value: Any, schema: Any, path: str) -> list[str]:
         nested_additional = schema.get("additionalProperties", True)
         for key, item in value.items():
             if key in nested:
-                errors.extend(_validate_value(item, nested[key], f"{path}.{key}"))
+                errors.extend(_validate_value(item, nested[key], f"{path}.{key}", root=root))
             elif nested_additional is False:
                 errors.append(f"{path}.{key}: unexpected property")
 
@@ -99,9 +125,21 @@ def _validate_value(value: Any, schema: Any, path: str) -> list[str]:
         item_schema = schema.get("items")
         if isinstance(item_schema, dict) and item_schema:
             for i, item in enumerate(value):
-                errors.extend(_validate_value(item, item_schema, f"{path}[{i}]"))
+                errors.extend(_validate_value(item, item_schema, f"{path}[{i}]", root=root))
 
     return errors
+
+
+def _resolve_ref(ref: Any, root: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve a local ``$ref`` ``#/$defs/Name`` (or ``#/definitions/Name``)."""
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        return None
+    node: Any = root
+    for part in ref[1:].lstrip("/").split("/"):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node if isinstance(node, dict) else None
 
 
 def _type_matches(value: Any, expected: Any) -> bool:

@@ -173,3 +173,47 @@ def test_echo_tool_still_works_with_validation():
     )
     agent = Agent(llm=llm, tools=[EchoTool()], permission_policy=PermissivePolicy())
     assert agent.run("go") == "fin"
+
+
+def test_any_of_accepts_at_least_one_branch() -> None:
+    from kinetic_sdk.tool.validation import validate_value
+
+    schema = {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+    assert validate_value(schema, "x") == []
+    assert validate_value(schema, 3) == []
+    assert validate_value(schema, 1.5) != []  # neither string nor integer
+
+
+def test_one_of_requires_exactly_one_branch() -> None:
+    from kinetic_sdk.tool.validation import validate_value
+
+    schema = {"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "number"}]}
+    assert validate_value(schema, "a") == []  # string only
+    assert validate_value(schema, 1.5) == []  # number only
+    assert validate_value(schema, 3) != []  # int AND number -> 2 matches
+
+
+def test_local_ref_resolves_definitions() -> None:
+    from kinetic_sdk.tool.validation import validate_value
+
+    schema = {
+        "type": "object",
+        "properties": {"addr": {"$ref": "#/$defs/address"}},
+        "$defs": {
+            "address": {
+                "type": "object",
+                "properties": {"zip": {"type": "string"}},
+                "required": ["zip"],
+            }
+        },
+        "required": ["addr"],
+    }
+    assert validate_value(schema, {"addr": {"zip": "10000"}}) == []
+    assert validate_value(schema, {"addr": {"zip": 5}}) != []
+
+
+def test_unknown_local_ref_fails_open() -> None:
+    from kinetic_sdk.tool.validation import validate_value
+
+    schema = {"type": "object", "properties": {"x": {"$ref": "#/$defs/missing"}}}
+    assert validate_value(schema, {"x": {"anything": 1}}) == []

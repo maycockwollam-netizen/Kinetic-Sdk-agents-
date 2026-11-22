@@ -53,6 +53,12 @@ CORRECTION_TEMPLATE = (
 )
 
 
+#: Name of the pseudo-tool used to submit a structured final answer while
+#: ``Agent.run(output_schema=...)`` is active. The model's call arguments ARE
+#: the answer — far more reliable than asking it to emit JSON as text.
+OUTPUT_SCHEMA_TOOL = "respond"
+
+
 def schema_instruction(schema: dict[str, Any]) -> str:
     """Build the natural-language instruction carrying *schema*."""
     try:
@@ -60,6 +66,39 @@ def schema_instruction(schema: dict[str, Any]) -> str:
     except (TypeError, ValueError):
         schema_json = str(schema)
     return INSTRUCTION_TEMPLATE.format(schema_json=schema_json)
+
+
+def can_use_output_tool(schema: Any) -> bool:
+    """Whether *schema* can be submitted via the ``respond`` pseudo-tool.
+
+    Tool arguments are always an object, so only object-rooted schemas (or
+    schemas without an explicit type) work; scalar/array roots keep the
+    text-based path.
+    """
+    return isinstance(schema, dict) and schema.get("type", "object") == "object"
+
+
+def output_tool_instruction() -> str:
+    """Task suffix telling the model to submit the answer via ``respond``."""
+    return (
+        f"Submit your final answer by CALLING the {OUTPUT_SCHEMA_TOOL!r} tool "
+        "with arguments matching the schema — those arguments ARE your answer. "
+        "You may use other tools normally first; the final call should be "
+        f"{OUTPUT_SCHEMA_TOOL!r} with the completed JSON. Reply with plain text "
+        "instead if you cannot produce a valid value."
+    )
+
+
+def output_schema_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """The tool definition exposed to the model for *schema*."""
+    return {
+        "name": OUTPUT_SCHEMA_TOOL,
+        "description": (
+            "Submit the final structured answer. The arguments must satisfy "
+            "the required output schema; they ARE the answer."
+        ),
+        "input_schema": schema,
+    }
 
 
 def parse_structured(text: str) -> tuple[bool, Any]:
