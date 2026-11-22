@@ -19,6 +19,7 @@ with the existing wrapper functions, then run it exactly the way
 from __future__ import annotations
 
 import os
+import posixpath
 import signal
 import subprocess
 import time
@@ -26,6 +27,7 @@ from shlex import quote
 
 from kinetic_sdk.terminal.docker import docker_exec_wrapper, docker_run_wrapper
 from kinetic_sdk.workspace.base import CommandResult, WorkspaceBase, WorkspaceError
+from kinetic_sdk.workspace.manager import PathTraversalError
 
 
 class DockerWorkspace(WorkspaceBase):
@@ -66,18 +68,20 @@ class DockerWorkspace(WorkspaceBase):
     ) -> None:
         if mode not in ("exec", "run"):
             raise ValueError(f"mode must be 'exec' or 'run', got {mode!r}")
+        if not workdir or not workdir.startswith("/"):
+            raise ValueError("workdir must be an absolute POSIX path")
         self._mode = mode
-        self._workdir = workdir
+        self._workdir = posixpath.normpath(workdir)
         if mode == "exec":
             if not container:
                 raise ValueError("mode='exec' requires a container name")
-            self._wrapper = docker_exec_wrapper(container, workdir=workdir, user=user)
+            self._wrapper = docker_exec_wrapper(container, workdir=self._workdir, user=user)
         else:
             if not image:
                 raise ValueError("mode='run' requires an image name")
             self._wrapper = docker_run_wrapper(
                 image,
-                workdir=workdir,
+                workdir=self._workdir,
                 volumes=volumes,
                 env=env,
                 network=network,
@@ -98,15 +102,49 @@ class DockerWorkspace(WorkspaceBase):
         """
         return self._wrapper[-1] if self._mode == "exec" else None
 
+    def _absolute_path(self, relative_path: str) -> str:
+        """Resolve *relative_path* inside ``workdir``, rejecting escapes.
+
+        Paths are normalised textually (POSIX) and must stay under
+        ``workdir`` — ``../`` traversal, absolute paths outside the root, and
+        symlink-like escapes are refused with :class:`PathTraversalError`
+        (mirrors :class:`~kinetic_sdk.workspace.k8s_workspace.KubernetesWorkspace`).
+        Symlinks inside the container are not resolved here; the caller's
+        backend owns the filesystem.
+        """
+        candidate = posixpath.normpath(
+            relative_path
+            if posixpath.isabs(relative_path)
+            else posixpath.join(self._workdir, relative_path)
+        )
+        try:
+            inside = posixpath.commonpath([self._workdir, candidate]) == self._workdir
+        except ValueError:
+            inside = False
+        if not inside:
+            raise PathTraversalError(
+                f"path {relative_path!r} resolves outside the workspace root {self._workdir!r}"
+            )
+        return candidate
+
     def run_command(
-        self, command: str, *, timeout: float | None = None, cwd: str | None = None
+        self,
+        command: str,
+        *,
+        timeout: float | None = None,
+        cwd: str | None = None,
+        input_text: str | None = None,
     ) -> CommandResult:
         """Build ``<wrapper> bash -c <command>`` and run it via subprocess.run,
         exactly the way ``TerminalTool.command_wrapper`` already does.
+
+        ``input_text`` (optional) is piped to the process's stdin — used by
+        :meth:`write_text` so large content is not limited by shell argument
+        length.
         """
         effective_command = command
         if cwd is not None:
-            effective_command = f"cd {quote(cwd)} && {command}"
+            effective_command = f"cd {quote(self._absolute_path(cwd))} && {command}"
         argv = [*self._wrapper, "bash", "-c", effective_command]
         started = time.monotonic()
         try:
@@ -124,7 +162,7 @@ class DockerWorkspace(WorkspaceBase):
             )
         timed_out = False
         try:
-            output, _ = proc.communicate(timeout=timeout)
+            output, _ = proc.communicate(input=input_text, timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             try:
@@ -147,7 +185,7 @@ class DockerWorkspace(WorkspaceBase):
                 "read_text is not supported without a persistent container "
                 "(mode='run' starts a fresh container per command); use mode='exec'"
             )
-        absolute = f"{self._workdir.rstrip('/')}/{relative_path.lstrip('/')}"
+        absolute = self._absolute_path(relative_path)
         result = self.run_command(f"cat {quote(absolute)}")
         if result.exit_code != 0:
             raise WorkspaceError(
@@ -161,21 +199,21 @@ class DockerWorkspace(WorkspaceBase):
                 "write_text is not supported without a persistent container "
                 "(mode='run' starts a fresh container per command); use mode='exec'"
             )
-        absolute = f"{self._workdir.rstrip('/')}/{relative_path.lstrip('/')}"
+        absolute = self._absolute_path(relative_path)
         parent = absolute.rsplit("/", 1)[0] or "/"
         mkdir_result = self.run_command(f"mkdir -p {quote(parent)}")
         if mkdir_result.exit_code != 0:
             raise WorkspaceError(f"failed to create parent dir: {mkdir_result.output}")
-        # run_command has no stdin wiring, so write via a single quoted
-        # printf redirect rather than piping content through cat/heredoc.
-        write_result = self.run_command(f"printf '%s' {quote(content)} > {quote(absolute)}")
+        # Content is piped via stdin (not embedded in a shell argument), so a
+        # large body is not bounded by the platform's ARG_MAX.
+        write_result = self.run_command(f"cat > {quote(absolute)}", input_text=content)
         if write_result.exit_code != 0:
             raise WorkspaceError(f"failed to write {relative_path!r}: {write_result.output}")
 
     def delete_file(self, relative_path: str) -> None:
         if self._mode != "exec":
             raise WorkspaceError("delete_file is not supported without a persistent container")
-        absolute = f"{self._workdir.rstrip('/')}/{relative_path.lstrip('/')}"
+        absolute = self._absolute_path(relative_path)
         result = self.run_command(f"rm -- {quote(absolute)}")
         if result.exit_code != 0:
             raise WorkspaceError(f"failed to delete {relative_path!r}: {result.output}")
@@ -193,7 +231,7 @@ class DockerWorkspace(WorkspaceBase):
         return sorted(files)
 
     def list_directory(self, relative_path: str = ".") -> list[str]:
-        directory = f"{self._workdir.rstrip('/')}/{relative_path.lstrip('./')}"
+        directory = self._absolute_path(relative_path)
         result = self.run_command(f"find {quote(directory)} -mindepth 1 -maxdepth 1 -printf '%f%y\\n'")
         if result.exit_code != 0:
             raise WorkspaceError(f"failed to list directory: {result.output}")
