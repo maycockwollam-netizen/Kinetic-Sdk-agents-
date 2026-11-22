@@ -136,3 +136,81 @@ def test_run_without_schema_untouched():
     result = agent.run("hi")
     assert result == "plain text, not json"
     assert agent.structured_output is None
+
+
+# --- pseudo-tool (respond) submission -----------------------------------
+
+def _respond(call_id: str, arguments: dict) -> object:
+    from kinetic_sdk.llm.client import LLMResponse, ToolCall
+
+    return LLMResponse(
+        tool_calls=[ToolCall(id=call_id, name="respond", arguments=arguments)],
+        stop_reason="tool_use",
+    )
+
+
+def test_structured_answer_submitted_via_respond_tool() -> None:
+    llm = MockLLMClient([_respond("r1", {"answer": "42", "confidence": 0.9})])
+    agent = Agent(llm, permission_policy=PermissivePolicy())
+
+    assert agent.run("x", output_schema=SCHEMA) == '{"answer": "42", "confidence": 0.9}'
+    assert agent.structured_output == {"answer": "42", "confidence": 0.9}
+    # The respond call got a tool_result so history stays replay-valid.
+    assert agent.state.messages[-1]["role"] == "user"
+    assert agent.state.messages[-1]["content"][0]["type"] == "tool_result"
+
+
+def test_respond_tool_appears_in_schemas_only_during_schema_run() -> None:
+    agent = Agent(MockLLMClient([]), permission_policy=PermissivePolicy())
+    agent.run("x", output_schema=SCHEMA, structured_retries=0)
+    assert "respond" not in [tool["name"] for tool in agent.tool_schemas()]
+
+
+def test_structured_respond_invalid_triggers_correction_then_succeeds() -> None:
+    llm = MockLLMClient([_respond("r1", {"evil": True}), _respond("r2", {"answer": "ok"})])
+    agent = Agent(llm, permission_policy=PermissivePolicy())
+
+    result = agent.run("x", output_schema=SCHEMA, structured_retries=2)
+
+    assert result == '{"answer": "ok"}'
+    assert agent.structured_output == {"answer": "ok"}
+    assert len(llm.calls) == 2
+    history = " ".join(
+        m.get("content", "") if isinstance(m.get("content"), str) else ""
+        for m in agent.state.messages
+    )
+    assert "not satisfy" in history
+
+
+def test_scalar_output_schema_keeps_text_path() -> None:
+    llm = MockLLMClient([text_response("42")])
+    agent = Agent(llm, permission_policy=PermissivePolicy())
+    assert agent.run("x", output_schema={"type": "integer"}, structured_retries=1) == "42"
+    assert agent.structured_output == 42
+
+
+def test_respond_answer_passes_through_answer_verifier() -> None:
+    from kinetic_sdk.agent.verifier import LLMAnswerVerifier
+
+    judge = MockLLMClient([text_response("ACCEPTED: fine")])
+    agent = Agent(
+        MockLLMClient([_respond("r1", {"answer": "42"})]),
+        permission_policy=PermissivePolicy(),
+        answer_verifier=LLMAnswerVerifier(judge),
+    )
+    assert agent.run("x", output_schema=SCHEMA) == '{"answer": "42"}'
+    assert len(judge.calls) == 1
+
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_async_structured_answer_via_respond_tool() -> None:
+    from kinetic_sdk.agent.async_agent import AsyncAgent
+    from kinetic_sdk.testing import AsyncMockLLMClient
+
+    llm = AsyncMockLLMClient([_respond("r1", {"answer": "async"})])
+    agent = AsyncAgent(llm, permission_policy=PermissivePolicy())
+    assert await agent.run("x", output_schema=SCHEMA) == '{"answer": "async"}'
+    assert agent.structured_output == {"answer": "async"}

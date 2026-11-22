@@ -62,7 +62,11 @@ from kinetic_sdk.agent.planning import AnswerVerifier, Plan, PlanStrategy
 from kinetic_sdk.agent.structured import (
     CORRECTION_TEMPLATE,
     DEFAULT_STRUCTURED_RETRIES,
+    OUTPUT_SCHEMA_TOOL,
+    can_use_output_tool,
     check_final_answer,
+    output_schema_tool_schema,
+    output_tool_instruction,
     schema_instruction,
 )
 from kinetic_sdk.agent.stuck_detector import StuckDetector
@@ -382,8 +386,17 @@ class AsyncAgent:
         self._tools[tool.name] = tool
 
     def tool_schemas(self) -> list[dict[str, Any]]:
-        """Return the tool definitions to send to the model."""
-        return [t.to_schema() for t in self._tools.values()]
+        """Return the tool definitions to send to the model.
+
+        When a structured ``output_schema`` run is active the ``respond``
+        pseudo-tool is appended so the model can submit its final answer as a
+        tool call (arguments ARE the answer).
+        """
+        schemas = [t.to_schema() for t in self._tools.values()]
+        active = getattr(self, "_active_output_schema", None)
+        if active is not None:
+            schemas.append(output_schema_tool_schema(active))
+        return schemas
 
     async def run(
         self,
@@ -422,9 +435,15 @@ class AsyncAgent:
             raise RuntimeError("Resolve the pending confirmation before continuing this checkpoint")
         if user_message is not None and self.memory is not None:
             await self._recall_memory(user_message)
+        self._active_output_schema = (
+            output_schema if output_schema is not None and can_use_output_tool(output_schema) else None
+        )
         composed = user_message
         if output_schema is not None:
-            composed = (user_message or "") + "\n\n" + schema_instruction(output_schema)
+            instruction = schema_instruction(output_schema)
+            if self._active_output_schema is not None:
+                instruction += "\n\n" + output_tool_instruction()
+            composed = (user_message or "") + "\n\n" + instruction
         if composed is not None:
             self.state.add_user_message(composed)
 
@@ -486,6 +505,7 @@ class AsyncAgent:
             await self._maybe_consolidate_memories()
         if self.memory is not None:
             await self._clear_working_memory()
+        self._active_output_schema = None
         return final_text
 
     def escalate(self) -> bool:
@@ -674,22 +694,52 @@ class AsyncAgent:
                 {"tool_calls": len(response.tool_calls), "stop_reason": response.stop_reason},
             )
 
-            if not response.tool_calls:
-                final_text = response.content
+            # A structured answer may arrive as plain text OR, while the
+            # ``respond`` pseudo-tool is active, as a tool call whose
+            # arguments ARE the answer.
+            structured_call = next(
+                (call for call in response.tool_calls if call.name == OUTPUT_SCHEMA_TOOL),
+                None,
+            )
+            final_answer: str | None = None
+            if structured_call is not None:
+                assert output_schema is not None  # respond only exists for schema runs
+                final_answer = json.dumps(structured_call.arguments)
+                # Keep history replay-valid: every tool_use gets a tool_result.
+                self.state.add_tool_result(
+                    structured_call.id, "answer recorded", is_error=False
+                )
+                for call in response.tool_calls:
+                    if call.id != structured_call.id:
+                        self.state.add_tool_result(
+                            call.id, "skipped: answer submitted via respond", is_error=True
+                        )
+                decision = await self._check_structured(
+                    output_schema, final_answer, retries_left
+                )
+                if decision == "retry":
+                    retries_left -= 1
+                    iteration += 1
+                    continue
+            elif not response.tool_calls:
+                final_answer = response.content
                 if output_schema is not None:
                     decision = await self._check_structured(
-                        output_schema, final_text, retries_left
+                        output_schema, final_answer, retries_left
                     )
                     if decision == "retry":
                         retries_left -= 1
                         iteration += 1
                         continue
+
+            if final_answer is not None:
+                final_text = final_answer
                 if self.answer_verifier is not None:
-                    accepted, feedback = await self._verify_final_answer(final_text)
+                    accepted, feedback = await self._verify_final_answer(final_answer)
                     if not accepted:
-                        rejected_answer = (final_text, feedback)
+                        rejected_answer = (final_answer, feedback)
                         if verification_retries_left <= 0:
-                            await self._raise_answer_not_verified(final_text, feedback)
+                            await self._raise_answer_not_verified(final_answer, feedback)
                         verification_retries_left -= 1
                         self.state.add_user_message(
                             "The proposed final answer was not verified. Correct it using "
