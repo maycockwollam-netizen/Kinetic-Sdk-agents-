@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import difflib
 import logging
-from typing import TYPE_CHECKING, Any, Callable, ClassVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, TypeVar
 
 from kinetic_sdk.files.snapshots import (
     GitSnapshotStore,
@@ -37,6 +37,23 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from kinetic_sdk.agent.agent import Agent
 
 logger = logging.getLogger(__name__)
+
+
+class FileConcurrentModificationError(RuntimeError):
+    """A file changed under the workspace lock between read and write.
+
+    Raised by :meth:`FileTool._write_under_lease` when the content on disk no
+    longer matches what the edit was built from — another writer modified the
+    file during the read-modify-write window. Prevented lost updates instead
+    of silently overwriting a concurrent edit.
+    """
+
+    def __init__(self, path: str) -> None:
+        super().__init__(f"file was modified concurrently: {path}")
+        self.path = path
+
+
+_T = TypeVar("_T")
 
 
 def _line_contents_and_spans(text: str) -> list[tuple[str, int, int, int]]:
@@ -369,11 +386,14 @@ class FileTool(Tool):
 
     # --- actions --------------------------------------------------------
 
-    def _write_locked(self, path: str, operation: Callable[[], None]) -> None:
+    def _write_locked(self, path: str, operation: Callable[[], _T]) -> _T:
         """Run one backend write under this call's short-lived file lease."""
+        return self._under_lease(path, operation)
+
+    def _under_lease(self, path: str, operation: Callable[[], _T]) -> _T:
+        """Run *operation* under the shared per-file lease (no re-check)."""
         if self._lock_registry is None:
-            operation()
-            return
+            return operation()
         if self._owner_id is None:
             raise ValueError(
                 "FileTool with lock_registry is not bound to an agent; "
@@ -382,7 +402,31 @@ class FileTool(Tool):
         with self._lock_registry.acquire(
             path, self._owner_id, timeout=self.lock_timeout
         ):
-            operation()
+            return operation()
+
+    def _write_under_lease(self, path: str, expected: str, writer: Callable[[], _T]) -> _T:
+        """Re-check *expected* against the current content under the lease.
+
+        This makes a read-modify-write transaction atomic against concurrent
+        writers sharing the :class:`FileLockRegistry`: the lease is held while
+        the current content is read again (must still equal *expected*) and
+        the writer runs. A mismatch raises :class:`FileConcurrentModificationError`
+        so the caller can fail-safe instead of overwriting a concurrent edit.
+        """
+        if self._lock_registry is None:
+            # No shared registry -> no concurrency contract; write directly.
+            return writer()
+        if self._owner_id is None:
+            raise ValueError(
+                "FileTool with lock_registry is not bound to an agent; "
+                "call file_tool.bind(agent) after constructing the agent"
+            )
+        with self._lock_registry.acquire(
+            path, self._owner_id, timeout=self.lock_timeout
+        ):
+            if self.workspace.read_text(path) != expected:
+                raise FileConcurrentModificationError(path)
+            return writer()
 
     def _view(self, path: str, view_range: list[int] | None = None, **_: Any) -> ToolResult:
         try:
@@ -439,15 +483,25 @@ class FileTool(Tool):
     def _create(self, path: str, file_text: str | None = None, **_: Any) -> ToolResult:
         if file_text is None:
             return ToolResult(error="create requires file_text")
+        # Check-then-create runs under the file lease (when a registry is
+        # shared), so two creators cannot both pass the existence check and
+        # one silently overwrite the other's file.
+        created = self._write_locked(
+            path, lambda: self._create_locked(path, file_text)
+        )
+        if not created:
+            return ToolResult(error=f"file already exists: {path} (use str_replace to edit)")
+        self._undo[path] = None  # undo of a create = delete
+        return ToolResult(output=f"created {path}", metadata={"path": path})
+
+    def _create_locked(self, path: str, file_text: str) -> bool:
+        """Create *path* if it does not exist; return whether it was created."""
         try:
             self.workspace.read_text(path)
         except FileNotFoundError:
-            pass
-        else:
-            return ToolResult(error=f"file already exists: {path} (use str_replace to edit)")
-        self._write_locked(path, lambda: self.workspace.write_text(path, file_text))
-        self._undo[path] = None  # undo of a create = delete
-        return ToolResult(output=f"created {path}", metadata={"path": path})
+            self.workspace.write_text(path, file_text)
+            return True
+        return False
 
     def _str_replace(
         self,
@@ -525,10 +579,16 @@ class FileTool(Tool):
                 "match_strategy": strategy,
                 "lines": f"{start_line}-{end_line}",
             }
-        self._write_locked(
-            path,
-            lambda: self._snapshot_and_write(path, content, new_content),
-        )
+        try:
+            self._write_under_lease(
+                path,
+                content,
+                lambda: self._snapshot_and_write(path, content, new_content),
+            )
+        except FileConcurrentModificationError as exc:
+            return ToolResult(
+                error=f"file changed concurrently; re-view and retry ({exc.path})"
+            )
         self._undo[path] = content
         if "match_strategy" in metadata:
             return ToolResult(
@@ -559,9 +619,16 @@ class FileTool(Tool):
         if new_str and not new_str.endswith(("\n", "\r")):
             new_lines[-1] += "\n"
         lines[insert_line:insert_line] = new_lines
-        self._write_locked(
-            path, lambda: self._snapshot_and_write(path, content, "".join(lines))
-        )
+        try:
+            self._write_under_lease(
+                path,
+                content,
+                lambda: self._snapshot_and_write(path, content, "".join(lines)),
+            )
+        except FileConcurrentModificationError as exc:
+            return ToolResult(
+                error=f"file changed concurrently; re-view and retry ({exc.path})"
+            )
         self._undo[path] = content
         return ToolResult(
             output=f"inserted into {path} after line {insert_line}",

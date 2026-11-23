@@ -119,10 +119,19 @@ class Tool(ABC):
     #: Optional side-effect declaration. ``None`` keeps historical fail-safe
     #: behaviour: consumers that need a risk decision must treat the tool as
     #: write-capable.
+    #:
+    #: Advisory metadata, NOT an enforcement boundary: the permission policy
+    #: decides by (tool_name, input) and does not consume this (it does feed
+    #: the write-retry idempotency-key decision). Enforcing confirmation from
+    #: risk_level is not automatic — build that into an Allow/Policy if you
+    #: need it.
     risk_level: ToolRiskLevel | None = None
 
     #: Optional resource-domain declarations. An empty set keeps historical
     #: behaviour and makes no assertion about the tool's capabilities.
+    #
+    #: Advisory metadata for callers/observability only; not consumed by the
+    #: permission policy.
     capabilities: frozenset[ToolCapability] = frozenset()
 
     #: Optional per-tool execution policy. ``None`` uses the agent-wide

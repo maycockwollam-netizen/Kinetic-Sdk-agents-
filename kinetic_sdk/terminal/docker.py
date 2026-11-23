@@ -168,8 +168,11 @@ def docker_run_wrapper(
     for vol in volumes or []:
         _validate_volume(vol, allow_unsafe_mounts=allow_unsafe_mounts)
         argv += ["-v", vol]
-    for key in env or {}:
-        argv += ["-e", key]
+    for key, value in (env or {}).items():
+        # ``-e KEY=value`` passes the caller's value; bare ``-e KEY`` would
+        # read KEY from the HOST environment instead (leaking host secrets and
+        # silently dropping the caller's value).
+        argv += ["-e", f"{key}={value}"]
     if workdir is not None:
         argv += ["-w", workdir]
     argv.append(image)

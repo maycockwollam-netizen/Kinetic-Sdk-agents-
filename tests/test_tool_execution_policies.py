@@ -303,3 +303,19 @@ def test_builtin_tools_declare_the_execution_contract() -> None:
     # it must be cloned rather than shared.
     assert FileTool.thread_safe is False
     assert FileTool.clone_for_subagent is not Tool.clone_for_subagent
+
+
+def test_submit_timed_tool_releases_slot_when_submit_fails() -> None:
+    import threading
+
+    class BoomExecutor:
+        def submit(self, *_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("boom")
+
+    tool = MockTool()
+    agent = _agent(tool)
+    agent._tool_slots = threading.BoundedSemaphore(1)  # noqa: SLF001
+    with pytest.raises(RuntimeError, match="boom"):
+        agent._submit_timed_tool(BoomExecutor(), tool, {})  # type: ignore[arg-type]  # noqa: SLF001
+    # The slot must be released even though submit failed, so capacity is whole.
+    assert agent._tool_slots.acquire(blocking=False)  # noqa: SLF001

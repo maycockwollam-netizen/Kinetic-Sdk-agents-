@@ -598,3 +598,17 @@ def test_consecutive_tool_error_guidance_can_be_disabled():
         any("consecutive tool errors" in text for text in _messages_text(call["messages"]))
         for call in llm.calls
     )
+
+
+def test_agent_run_is_not_reentrant_on_same_instance():
+    agent = Agent(
+        llm=MockLLM([text_response("one"), text_response("two")]),
+        permission_policy=PermissivePolicy(),
+    )
+    assert agent.run("first") == "one"  # completes, lock released
+    # Simulate a concurrent run by holding the instance lock.
+    with agent._run_lock:  # noqa: SLF001
+        with pytest.raises(RuntimeError, match="not re-entrant"):
+            agent.run("second")
+    # Usable again afterwards.
+    assert agent.run("third") == "two"

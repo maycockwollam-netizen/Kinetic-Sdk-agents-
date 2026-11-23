@@ -301,6 +301,9 @@ class AsyncAgent:
         #: Cooperative cancellation flag, set via :meth:`cancel` from any
         #: task. Checked between iterations and between tool calls.
         self._cancel_event = asyncio.Event()
+        #: Re-entrancy guard: one run() at a time per instance (concurrent
+        #: runs on the same AsyncAgent are refused, mirroring the sync Agent).
+        self._run_lock = asyncio.Lock()
         self._pause_event = asyncio.Event()
         self._pause_event.set()
         self._inbox: asyncio.Queue[str] = asyncio.Queue()
@@ -339,6 +342,9 @@ class AsyncAgent:
         #: its system prompt (never written into history).
         self.reflection_on_error = reflection_on_error
         self._pending_reflection = False
+        #: Request-local output schema active during a structured-output run
+        #: (set per-run, cleared on exit). Declared here so the type is stable.
+        self._active_output_schema: dict[str, Any] | None = None
         #: Optional root-run cost guardrail — same contract as the sync
         #: Agent: checked before every LLM call; exhaustion stops the run
         #: gracefully with ``agent.budget_exceeded`` and an explanatory
@@ -399,6 +405,35 @@ class AsyncAgent:
         return schemas
 
     async def run(
+        self,
+        user_message: str | None = None,
+        *,
+        stream: bool = False,
+        output_schema: dict[str, Any] | None = None,
+        structured_retries: int | None = None,
+    ) -> str:
+        """Run the async agent loop (see :meth:`_run_with_guard`).
+
+        Non-re-entrant: one :meth:`run` at a time per instance; a concurrent
+        call raises :class:`RuntimeError` instead of racing on shared state.
+        """
+        if self._run_lock.locked():
+            raise RuntimeError(
+                "AsyncAgent.run() is not re-entrant on a single instance; "
+                "create a separate AsyncAgent per concurrent run"
+            )
+        try:
+            async with self._run_lock:
+                return await self._run_with_guard(
+                    user_message,
+                    stream=stream,
+                    output_schema=output_schema,
+                    structured_retries=structured_retries,
+                )
+        finally:
+            self._active_output_schema = None
+
+    async def _run_with_guard(
         self,
         user_message: str | None = None,
         *,
