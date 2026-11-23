@@ -78,6 +78,13 @@ class LocalWorkspace(WorkspaceBase):
 
         Returns:
             The canonical absolute path inside the workspace.
+
+        Note (TOCTOU): containment is checked here, before the filesystem is
+        touched by the caller, and is then re-verified per operation by the
+        next ``resolve`` call. A malicious concurrent process that swaps a
+        symlink between this check and the subsequent ``open()`` is outside
+        this layer's guarantee (POSIX fd/O_NOFOLLOW would be needed) — a
+        theoretical race, not an exploit observed in this audit.
         """
         candidate = os.path.realpath(os.path.join(self._root, os.fspath(relative_path)))
         try:

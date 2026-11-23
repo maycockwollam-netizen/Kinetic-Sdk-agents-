@@ -346,6 +346,10 @@ class Agent:
         #: Cooperative cancellation flag, set via :meth:`cancel` from any
         #: thread. Checked between iterations and between tool calls.
         self._cancel_event = threading.Event()
+        #: Re-entrancy guard: one ``run()`` at a time per instance. A second
+        #: concurrent ``run()`` (e.g. from another thread) is refused rather
+        #: than letting two calls race on shared state (run_id, mode, state).
+        self._run_lock = threading.Lock()
         #: Cooperative pause gate. Set means the loop may continue; clearing it
         #: pauses only at safe boundaries between completed tool-call rounds.
         self._pause_event = threading.Event()
@@ -394,6 +398,9 @@ class Agent:
         #: diagnose before retrying.
         self.reflection_on_error = reflection_on_error
         self._pending_reflection = False
+        #: Request-local output schema active during a structured-output run
+        #: (set per-run, cleared on exit). Declared here so the type is stable.
+        self._active_output_schema: dict[str, Any] | None = None
         #: Optional root-run cost guardrail (see ``agent/budget.py``). Checked
         #: before every LLM call; on exhaustion the run stops gracefully with
         #: an explanatory final text and an ``agent.budget_exceeded`` event —
@@ -471,6 +478,43 @@ class Agent:
         return schemas
 
     def run(
+        self,
+        user_message: str | None = None,
+        *,
+        stream: bool = False,
+        output_schema: dict[str, Any] | None = None,
+        structured_retries: int | None = None,
+        verify: bool | None = None,
+    ) -> str:
+        """Run the agent loop until it stops calling tools (see :meth:`_run_with_guard`).
+
+        Non-re-entrant: one :meth:`run` at a time per instance. A second
+        concurrent call raises :class:`RuntimeError` instead of racing on the
+        shared instance state (``run_id``, ``mode``, ``state``, request-local
+        schema/reflection flags).
+        """
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "Agent.run() is not re-entrant on a single instance; create a "
+                "separate Agent per concurrent run"
+            )
+        try:
+            return self._run_with_guard(
+                user_message,
+                stream=stream,
+                output_schema=output_schema,
+                structured_retries=structured_retries,
+                verify=verify,
+            )
+        finally:
+            self._run_lock.release()
+            # Request-local state must not linger after an abnormal return
+            # (exception / early stop). A subsequent run() re-initialises what
+            # it needs, but the injected output-schema tool is cleared here so
+            # tool_schemas() is correct between runs.
+            self._active_output_schema = None
+
+    def _run_with_guard(
         self,
         user_message: str | None = None,
         *,
@@ -703,6 +747,20 @@ class Agent:
         history stays replay-valid), emits ``agent.cancelled`` and returns
         the best final text it has. A tool call already executing is NOT
         interrupted — cooperative cancellation cannot preempt running work.
+
+        Important — cancellation is about the CANCELLATION REQUEST, not about
+        stopping work in the outside world. Three distinct states must not be
+        conflated:
+
+        1. The agent has ACCEPTED the cancellation (``agent.cancelled``
+           emitted, ``run()`` returned).
+        2. The agent is no longer WAITING on a tool result (it returned an
+           error tool_result / moved on).
+        3. The underlying tool process/thread has actually STOPPED. Only the
+           tool's own timeout/boundary can guarantee this — Python cannot kill
+           a running thread, and subprocess-based tools keep running until
+           they exit or are killed by their own timeout (GitTool/TerminalTool
+           enforce real timeouts for this reason).
         """
         self._cancel_event.set()
         self._pause_event.set()
@@ -1460,17 +1518,21 @@ class Agent:
                     futures[future] = (i, call, tool, arguments, time.perf_counter())
             for future, (i, call, tool, arguments, started) in futures.items():
                 executed_args[i] = arguments
+                timeout = self._tool_timeout(tool)
                 try:
-                    executed[i] = (
-                        future.result(timeout=self._tool_timeout(tool))
-                        if self._tool_timeout(tool) is not None
-                        else future.result()
-                    )
+                    if timeout is None:
+                        executed[i] = future.result()
+                    else:
+                        # Wait only the REMAINING time since submit (the
+                        # absolute per-call deadline), so a long first result
+                        # does not silently extend later calls' budgets.
+                        elapsed = time.perf_counter() - started
+                        executed[i] = future.result(timeout=timeout - elapsed)
                 except FutureTimeoutError:
                     future.cancel()
                     executed[i] = ToolResult(
                         error=(
-                            f"Tool {call.name!r} timed out after {self._tool_timeout(tool)}s "
+                            f"Tool {call.name!r} timed out after {timeout}s "
                             "(the call may still be running in the background)"
                         ),
                         duration_seconds=time.perf_counter() - started,
@@ -1524,7 +1586,11 @@ class Agent:
         """
         if not self._tool_slots.acquire(blocking=False):
             return None
-        future = executor.submit(self._invoke_tool, tool, arguments)
+        try:
+            future = executor.submit(self._invoke_tool, tool, arguments)
+        except Exception:  # noqa: BLE001 - a failed submit must not leak a slot
+            self._tool_slots.release()
+            raise
         future.add_done_callback(lambda _future: self._tool_slots.release())
         return future
 

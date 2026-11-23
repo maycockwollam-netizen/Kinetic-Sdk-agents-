@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 from kinetic_sdk.workspace.base import CommandResult, WorkspaceBase, WorkspaceError
 
@@ -47,9 +48,11 @@ class RemoteAPIWorkspace(WorkspaceBase):
         workspace_id: str = "default",
         token: str | None = None,
         timeout: float = 30.0,
+        allow_http: bool = False,
     ) -> None:
         if not base_url:
             raise ValueError("base_url must be non-empty")
+        self._validate_scheme(base_url, allow_http)
         self._base_url = base_url.rstrip("/")
         self._workspace_id = workspace_id
         self._token = token
@@ -58,6 +61,33 @@ class RemoteAPIWorkspace(WorkspaceBase):
     @property
     def root_path(self) -> str:
         return f"{self._base_url}#{self._workspace_id}"
+
+    @staticmethod
+    def _validate_scheme(base_url: str, allow_http: bool) -> None:
+        """Refuse plaintext http:// to a remote server (except loopback).
+
+        The bearer token is sent as an ``Authorization`` header, so it must
+        not travel in the clear. Loopback hosts (localhost/127.0.0.1/::1) are
+        allowed for local development; anything else requires https:// unless
+        ``allow_http=True`` is set explicitly.
+        """
+        scheme = urlsplit(base_url).scheme
+        if not scheme:
+            raise ValueError(
+                "base_url must be absolute, e.g. https://host:port or https://host"
+            )
+        if scheme not in ("http", "https"):
+            raise ValueError(f"unsupported scheme {scheme!r}; use http or https")
+        if scheme == "https" or allow_http:
+            return
+        host = urlsplit(base_url).hostname or ""
+        if host in ("localhost", "127.0.0.1", "::1"):
+            return  # local development
+        raise ValueError(
+            "Refusing plaintext http:// for RemoteAPIWorkspace because the "
+            "bearer token travels in the clear; use https:// or, only for "
+            "local development, pass allow_http=True"
+        )
 
     def _post(self, path: str, payload: dict, *, timeout: float | None = None) -> dict:
         body = json.dumps({"workspace_id": self._workspace_id, **payload}).encode("utf-8")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from kinetic_sdk.files import FileTool
 from kinetic_sdk.subagent import FileLockRegistry, agent_id_for
 from kinetic_sdk.workspace import LocalWorkspace
@@ -81,3 +83,31 @@ def test_write_lock_releases_after_success_and_backend_failure(tmp_path):
 
     assert failure.error == "filesystem error: simulated write failure"
     assert registry.owner_of("failure.txt") is None
+
+
+def test_write_under_lease_detects_concurrent_change(tmp_path):
+    from kinetic_sdk.files.tool import FileConcurrentModificationError
+    from kinetic_sdk.workspace import LocalWorkspace
+
+    tool = FileTool(LocalWorkspace(tmp_path), lock_registry=FileLockRegistry(tmp_path), lock_timeout=0)
+    tool.bind(_BoundAgent())
+    tool.workspace.write_text("f.txt", "hello")
+
+    tool._write_under_lease("f.txt", "hello", lambda: None)  # noqa: SLF001  # still matches -> ok
+
+    tool.workspace.write_text("f.txt", "world")  # out-of-band concurrent change
+    with pytest.raises(FileConcurrentModificationError):
+        tool._write_under_lease("f.txt", "hello", lambda: None)  # noqa: SLF001
+
+
+def test_create_returns_already_exists_and_does_not_overwrite(tmp_path):
+    from kinetic_sdk.workspace import LocalWorkspace
+
+    tool = FileTool(LocalWorkspace(tmp_path))
+    first = tool.execute(action="create", path="a.txt", file_text="one")
+    assert first.is_error is False
+
+    second = tool.execute(action="create", path="a.txt", file_text="two")
+    assert second.is_error is True and "already exists" in second.error
+    # Atomic check-then-create must not have clobbered the existing content.
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "one"

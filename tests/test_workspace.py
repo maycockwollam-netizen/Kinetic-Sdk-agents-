@@ -140,3 +140,21 @@ def test_list_files_with_pattern(workspace):
 def test_list_files_excludes_directories(workspace):
     os.mkdir(os.path.join(workspace.root_path, "empty-dir"))
     assert "empty-dir" not in workspace.list_files()
+
+
+def test_remote_api_workspace_requires_https_except_loopback() -> None:
+    from kinetic_sdk.workspace import RemoteAPIWorkspace
+
+    RemoteAPIWorkspace("https://example.com", token="t")  # https anywhere ok
+    RemoteAPIWorkspace("http://127.0.0.1:8765", token="t")  # loopback = local dev
+    RemoteAPIWorkspace("http://localhost:8765", token="t")
+
+    with pytest.raises(ValueError, match="plaintext http"):
+        RemoteAPIWorkspace("http://example.com", token="t")  # non-loopback refused
+
+    RemoteAPIWorkspace("http://example.com", token="t", allow_http=True)  # explicit opt-in
+
+    with pytest.raises(ValueError, match="absolute"):
+        RemoteAPIWorkspace("no-scheme-host", token="t")  # missing scheme
+    with pytest.raises(ValueError, match="unsupported scheme"):
+        RemoteAPIWorkspace("ftp://example.com", token="t")
