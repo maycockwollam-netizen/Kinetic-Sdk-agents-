@@ -142,3 +142,29 @@ def test_result_to_dict_shape() -> None:
     )
     assert result.to_dict()["subagent"] == "alpha"
     assert result.to_dict()["final_message"] == "m"
+
+
+def test_orchestrator_timeout_returns_failed_results_for_pending() -> None:
+    import time
+
+    from kinetic_sdk.testing import text_response as _tr
+
+    specs = {"slow": SubagentSpec(name="slow", system_prompt="p", description="d", model="slow")}
+
+    def slow_llm(model: str) -> MockLLMClient:
+        def slow(messages, tools, system):  # type: ignore[no-untyped-def]
+            time.sleep(0.05)
+            return _tr("done")
+
+        return MockLLMClient([slow])
+
+    results = SubagentOrchestrator(_parent(), specs, max_concurrency=1).run(
+        [OrchestrationTask(task="t", subagent="slow")],
+        budget=SpawnBudget(100),
+        llm_factory=slow_llm,
+        timeout=0.005,
+    )
+    # Timeout fired -> the pending task still yields a failed result (no missing key).
+    assert len(results) == 1
+    assert results[0].success is False
+    assert "timed out" in results[0].error

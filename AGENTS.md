@@ -14,7 +14,7 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   NotRequired` at import time) — the extra caps it to `<1.98.0` on
   `python_version < '3.11'` until upstream fixes; revisit the cap later.
 - Install (real tokenizer, optional): `pip install -e ".[tokens]"` (tiktoken)
-- Run tests: `python -m pytest -q` (786 unit tests + 4 integration deselected
+- Run tests: `python -m pytest -q` (~1400 unit tests + 4 integration deselected
   by default — see "Integration tests" below). NOTE: the litellm tests need
   the `[llm]` extra — install BOTH (`pip install -e ".[dev,llm]"`) or 11
   tests error. The tiktoken tests `importorskip` without `[tokens]`.
@@ -1069,3 +1069,46 @@ AutoGen/ADK. 12 khu vực, quyết định ĐÃ CHỐT như sau:
 - AsyncMCPClient, MCP resources/prompts.
 - Server: SSE streaming endpoint, multi-conversation store, rate limiting.
 - Parallel async subagent (budget đã thread-safe, chưa có orchestrator).
+
+
+## Stage 7 (Upgrade forward, 2026-11-22 — DONE)
+
+A forward feature pass on top of Stages 1-6 (PR #106..#117). Highlights that
+future agents should know about:
+
+- memory/: VectorMemory(path=...) persists entries + embedding vectors
+  (schema-versioned, atomic); memory/consolidation.py folds EPISODIC entries
+  into ONE PERSISTENT summary via a separate LLM; Agent gains
+  memory_consolidator (sync + async). Recall tags tier in the injected
+  message.
+- agent/verifier.py: LLMAnswerVerifier (separate judge model, redacted) plugs
+  into the existing correction loop; Agent/AsyncAgent get reflection_on_error
+  (request-local system-prompt nudge after a tool error).
+- agent/structured.py: `respond` pseudo-tool lets the model submit a structured
+  final answer as a tool call (arguments ARE the answer); object-rooted
+  output_schema auto-injects it; validator (tool/validation.py) now handles
+  anyOf/oneOf/local $ref (unresolvable $ref FAILS CLOSED).
+- agent/budget.py + subagent/budget.py: max_total_cost_usd caps; NaN/Infinity
+  are rejected; RunBudget/SpawnBudget.
+- context/manager.py: keep_user_messages (default True) preserves human
+  guidance turns through compaction; summary spans exclude user turns.
+- observability/otel.py: hierarchical spans (kinetic.llm + kinetic.tool under
+  kinetic.run); run span is attached to the OTel context so sub-agent runs
+  nest; explicit parent context keeps tool spans parented even in worker
+  threads.
+- server/app.py: POST /runs?stream=true returns SSE text/event-stream
+  (_run_agent_streaming + _sse_run).
+- subagent/orchestrator.py: SubagentOrchestrator routes work items to named
+  specs, streams orchestrator.task_* events, failure-isolates, and bounded
+  retry_on_failure. Timeout now yields per-task "batch timed out" results
+  instead of a missing-key crash.
+- plugin/: PluginManifest.checksum (sha256 of directory *.py payload) +
+  min_sdk_version; in-process PluginLoader refuses tampered/too-new plugins
+  BEFORE scan/import (fail-closed).
+- skills/: rank_skills / SkillActivationHook(include_description, max_active)
+  ranked trigger-based activation; Skill.matches/trigger_hits.
+- mcp/: resources + prompts capabilities (server registries + handlers,
+  MCPClient.list_resources/read_resource/list_prompts/get_prompt).
+- codemap/: build_codebase_map(languages=...) scans javascript/typescript/rust/
+  go via best-effort structural import/define extractors (tree-sitter call
+  graph still future work).

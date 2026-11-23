@@ -79,9 +79,9 @@ def _validate_value(value: Any, schema: Any, path: str, root: dict[str, Any]) ->
     if "$ref" in schema:
         target = _resolve_ref(schema["$ref"], root)
         if target is None:
-            # An unresolvable reference cannot be validated — fail open
-            # rather than inventing constraints.
-            return []
+            # An unresolvable reference means the schema itself is broken —
+            # fail closed (reject) rather than silently skipping validation.
+            return [f"{path}: unresolvable $ref {schema['$ref']!r}"]
         return _validate_value(value, target, path, root=root)
 
     # Combinators: anyOf (at least one branch) and oneOf (exactly one).

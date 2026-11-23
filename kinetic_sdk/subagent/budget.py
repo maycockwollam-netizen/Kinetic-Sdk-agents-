@@ -9,6 +9,7 @@ serial task.
 from __future__ import annotations
 
 import json
+import math
 import threading
 from typing import Any, Mapping
 
@@ -70,13 +71,15 @@ class SpawnBudget:
             raise ValueError(
                 f"max_total_tokens must be a non-negative int or None, got {max_total_tokens!r}"
             )
-        if max_total_cost_usd is not None and (
-            isinstance(max_total_cost_usd, bool)
-            or not isinstance(max_total_cost_usd, (int, float))
-            or max_total_cost_usd < 0
+        if max_total_cost_usd is not None and not (
+            isinstance(max_total_cost_usd, (int, float))
+            and not isinstance(max_total_cost_usd, bool)
+            and math.isfinite(max_total_cost_usd)
+            and max_total_cost_usd >= 0
         ):
             raise ValueError(
-                "max_total_cost_usd must be a non-negative number or None, "
+                "max_total_cost_usd must be a finite non-negative number or "
+                "None (NaN/Infinity are rejected), "
                 f"got {max_total_cost_usd!r}"
             )
         self._max_tool_calls = max_total_tool_calls
@@ -127,8 +130,12 @@ class SpawnBudget:
         Raises:
             CostExceededError: When the cost budget is already exhausted.
         """
-        if isinstance(cost_usd, bool) or not isinstance(cost_usd, (int, float)):
-            raise ValueError(f"cost_usd must be a number, got {cost_usd!r}")
+        if (
+            isinstance(cost_usd, bool)
+            or not isinstance(cost_usd, (int, float))
+            or not math.isfinite(float(cost_usd))
+        ):
+            raise ValueError(f"cost_usd must be a finite number, got {cost_usd!r}")
         with self._lock:
             if self._max_cost is not None and self._used_cost + cost_usd > self._max_cost:
                 raise CostExceededError(

@@ -212,8 +212,9 @@ def test_local_ref_resolves_definitions() -> None:
     assert validate_value(schema, {"addr": {"zip": 5}}) != []
 
 
-def test_unknown_local_ref_fails_open() -> None:
+def test_unresolvable_local_ref_fails_closed() -> None:
     from kinetic_sdk.tool.validation import validate_value
 
     schema = {"type": "object", "properties": {"x": {"$ref": "#/$defs/missing"}}}
-    assert validate_value(schema, {"x": {"anything": 1}}) == []
+    problems = validate_value(schema, {"x": {"anything": 1}})
+    assert problems and "unresolvable $ref" in problems[0]

@@ -22,6 +22,7 @@ returns an explanatory final text — no bare exception escapes the loop.
 
 from __future__ import annotations
 
+import math
 import threading
 from typing import Any, Mapping
 
@@ -74,13 +75,15 @@ class RunBudget:
                 "max_total_tokens must be a positive int or None, "
                 f"got {max_total_tokens!r}"
             )
-        if max_total_cost_usd is not None and (
-            isinstance(max_total_cost_usd, bool)
-            or not isinstance(max_total_cost_usd, (int, float))
-            or max_total_cost_usd < 0
+        if max_total_cost_usd is not None and not (
+            isinstance(max_total_cost_usd, (int, float))
+            and not isinstance(max_total_cost_usd, bool)
+            and math.isfinite(max_total_cost_usd)
+            and max_total_cost_usd >= 0
         ):
             raise ValueError(
-                "max_total_cost_usd must be a non-negative number or None, "
+                "max_total_cost_usd must be a finite non-negative number or "
+                "None (NaN/Infinity are rejected), "
                 f"got {max_total_cost_usd!r}"
             )
         self._max_calls = max_llm_calls
@@ -133,7 +136,11 @@ class RunBudget:
                 self._used_tokens += inp
             if isinstance(out, int):
                 self._used_tokens += out
-            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            if (
+                isinstance(cost, (int, float))
+                and not isinstance(cost, bool)
+                and math.isfinite(float(cost))
+            ):
                 self._used_cost += float(cost)
 
     @property

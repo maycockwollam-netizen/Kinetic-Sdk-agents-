@@ -191,3 +191,18 @@ class TestSpawnBudgetCost:
         assert budget.used_cost_usd == 5.0
         assert budget.max_total_cost_usd is None
         assert budget.remaining_cost_usd is None
+
+
+def test_spawn_budget_rejects_non_finite_cost_cap() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        SpawnBudget(max_total_cost_usd=float("nan"))
+    with pytest.raises(ValueError, match="finite"):
+        SpawnBudget(max_total_cost_usd=float("inf"))
+
+
+def test_spawn_budget_record_cost_rejects_non_finite() -> None:
+    budget = SpawnBudget()
+    with pytest.raises(ValueError, match="finite"):
+        budget.record_cost("a", float("nan"))
+    with pytest.raises(ValueError, match="finite"):
+        budget.record_cost("a", float("inf"))
