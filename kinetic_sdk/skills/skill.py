@@ -225,6 +225,16 @@ class Skill:
 
     # --- lazy content accessors -----------------------------------------
 
+    def matches(self, query: str) -> bool:
+        """Whether any *trigger* appears (case-insensitively) in *query*."""
+        message = (query or "").lower()
+        return any(trigger.lower() in message for trigger in self.triggers)
+
+    def trigger_hits(self, query: str) -> int:
+        """How many distinct triggers appear in *query* (0 = no match)."""
+        message = (query or "").lower()
+        return sum(1 for trigger in self.triggers if trigger.lower() in message)
+
     def read_main(self) -> str:
         """Read the full SKILL.md body (everything after the frontmatter).
 
