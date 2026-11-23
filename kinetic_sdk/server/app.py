@@ -306,6 +306,59 @@ class AgentServer:
         self._persist_run(record)
         return record
 
+    def _run_agent_streaming(
+        self,
+        message: str,
+        output_schema: dict | None,
+        session_id: str | None,
+        writer: Callable[[str, dict[str, Any]], None],
+    ) -> RunRecord:
+        """Run an agent while streaming its events to *writer*.
+
+        *writer* is invoked synchronously for every agent bus event (the same
+        shape the event bus delivers, so the caller decides what is SSE data
+        vs. an event boundary). Returns the same :class:`RunRecord` as
+        :meth:`_run_agent`.
+        """
+        from kinetic_sdk.event.bus import Event
+
+        run_id = uuid.uuid4().hex
+        record = RunRecord(run_id=run_id, status="running", final="")
+        with self._lock:
+            while len(self._run_order) >= self._max_runs:
+                self._runs.pop(self._run_order.popleft(), None)
+            self._runs[run_id] = record
+            self._run_order.append(run_id)
+
+        agent = self._make_agent(session_id)
+
+        def _stream(event: Event) -> None:
+            writer(event.type, event.payload or {})
+
+        agent.event_bus.subscribe("*", _stream)
+        try:
+            if session_id is None:
+                final = agent.run(message, stream=True, output_schema=output_schema)
+            else:
+                with self._lock:
+                    final = agent.run(message, stream=True, output_schema=output_schema)
+                    self._session_activity[session_id] = time.monotonic()
+            record.update(
+                status="completed",
+                final=final,
+                structured_output=agent.structured_output,
+                usage=agent.usage.snapshot().to_dict(),
+            )
+        except Exception as exc:  # noqa: BLE001 - never leak a stack over HTTP
+            logger.exception("Run %s failed", run_id)
+            record.update(status="error", error=f"{type(exc).__name__}: {exc}")
+        finally:
+            agent.event_bus.unsubscribe("*", _stream)
+        with self._lock:
+            self._runs[run_id] = record
+        self._persist_run(record)
+        return record
+
     # -- persistence ------------------------------------------------------
 
     def _runs_path(self) -> Path:
@@ -532,6 +585,45 @@ class AgentServer:
             def do_POST(self) -> None:  # noqa: N802
                 self._handle_request(self._do_post)
 
+            def _sse_run(
+                self, message: str, schema: dict[str, Any] | None, session_id: str | None
+            ) -> None:
+                """Stream one run's agent events as a Server-Sent Events stream.
+
+                Each agent bus event becomes an ``event: <type>`` / ``data:
+                <json payload>`` pair; the stream ends with an ``event: done``
+                carrying the final :class:`RunRecord`.
+                """
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self._response_status = 200
+                self.close_connection = True
+
+                def _write(event_type: str, payload: dict[str, Any]) -> None:
+                    data = json.dumps(payload, ensure_ascii=False, default=str)
+                    self.wfile.write(
+                        f"event: {event_type}\ndata: {data}\n\n".encode("utf-8")
+                    )
+                    self.wfile.flush()
+
+                try:
+                    record = server._run_agent_streaming(
+                        message, schema, session_id, _write
+                    )
+                    _write("done", dict(record))
+                except Exception as exc:  # noqa: BLE001 - never leak over HTTP
+                    logger.exception("SSE run failed")
+                    _write("error", {"error": f"{type(exc).__name__}: {exc}"})
+                finally:
+                    try:
+                        self.wfile.flush()
+                    except Exception:  # noqa: BLE001 - best effort
+                        pass
+
             def _do_post(self) -> None:
                 if not self._authed():
                     self._send_json(401, {"error": "unauthorized"})
@@ -564,9 +656,14 @@ class AgentServer:
                 if schema is not None and not isinstance(schema, dict):
                     self._send_json(400, {"error": "'output_schema' must be an object"})
                     return
+                if body.get("stream") is True:
+                    # ``stream: true`` returns a Server-Sent Events stream of the
+                    # agent's events instead of a single JSON result body.
+                    self._sse_run(message, schema, session_id)
+                    return
                 record = server._run_agent(
                     message,
-                    stream=bool(body.get("stream", False)),
+                    stream=False,
                     output_schema=schema,
                     session_id=session_id,
                 )

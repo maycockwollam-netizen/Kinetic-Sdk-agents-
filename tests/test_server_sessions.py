@@ -262,3 +262,22 @@ def test_session_store_persists_runs_across_restart(tmp_path):
         assert second._runs[run_id]["final"] == "seen: hello"
     finally:
         second._httpd.server_close()
+
+
+def test_runs_stream_returns_sse_event_stream(server):
+    root = f"http://127.0.0.1:{server.port}"
+    request = urllib.request.Request(
+        root + "/runs",
+        data=json.dumps({"message": "hi", "stream": True}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        assert response.headers.get("Content-Type", "").startswith("text/event-stream")
+        body = response.read().decode("utf-8")
+
+    assert "event: agent.run_started\n" in body
+    assert "event: agent.run_finished\n" in body
+    assert "event: done\n" in body  # final RunRecord payload
+    assert '"final"' in body
+    assert '"status": "completed"' in body
