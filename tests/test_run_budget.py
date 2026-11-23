@@ -266,3 +266,17 @@ async def test_async_agent_stops_gracefully_when_cost_budget_trips() -> None:
 
     assert result.startswith("Run stopped: budget exceeded")
     assert "cost budget exhausted" in result
+
+
+def test_cost_cap_rejects_nan_and_infinity() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        RunBudget(max_total_cost_usd=float("nan"))
+    with pytest.raises(ValueError, match="finite"):
+        RunBudget(max_total_cost_usd=float("inf"))
+
+
+def test_cost_record_ignores_non_finite() -> None:
+    budget = RunBudget(max_total_cost_usd=1.0)
+    budget.record({"cost_usd": float("nan")})
+    budget.record({"cost_usd": float("inf")})
+    assert budget.used_cost_usd == 0.0

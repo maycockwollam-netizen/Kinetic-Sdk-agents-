@@ -159,3 +159,13 @@ def test_build_codebase_map_ignores_unscanned_extensions_and_python_still_works(
     assert [n.path for n in cm.modules] == ["keep.py"]
     cm_multi = build_codebase_map(tmp_path, languages=("python", "javascript"))
     assert [n.path for n in cm_multi.modules] == ["keep.py"]
+
+
+def test_build_codebase_map_scales_to_many_files(tmp_path):
+    for i in range(120):
+        write(tmp_path, f"m{i:03}.py", f"import os\ndef f{i}():\n    pass\n")
+    for i in range(60):
+        write(tmp_path, f"j{i:03}.js", f'import x from "y{i}"\nexport function g{i}() {{}}\n')
+    cm = build_codebase_map(tmp_path, languages=("python", "javascript"))
+    assert len(cm.modules) == 180
+    assert cm.skipped == ()

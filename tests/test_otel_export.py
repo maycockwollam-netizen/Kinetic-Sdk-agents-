@@ -167,3 +167,43 @@ def test_otel_subagent_run_nests_under_parent_via_context(otel_setup):
     child_spans = [s for s in run_spans if s is not parent_span]
     assert len(child_spans) == 1
     assert child_spans[0].parent.span_id == parent_span.context.span_id
+
+
+def test_otel_parallel_tool_spans_stay_parented_to_run(otel_setup):
+    # Tool spans are opened with an explicit parent context, so even when a
+    # parallel tool batch runs in the executor thread pool the spans still
+    # nest under the run span.
+    provider, exporter = otel_setup
+    bus = EventBus()
+    logger = OTelObservabilityLogger(tracer_provider=provider)
+    logger.attach(bus)
+    from kinetic_sdk.llm.client import LLMResponse, ToolCall
+    from kinetic_sdk.testing import MockTool
+
+    llm = MockLLMClient(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(id="c1", name="echo", arguments={"message": "a"}),
+                    ToolCall(id="c2", name="echo2", arguments={"message": "b"}),
+                ],
+                stop_reason="tool_use",
+            ),
+            text_response("done"),
+        ]
+    )
+    agent = Agent(
+        llm=llm,
+        tools=[MockTool(name="echo", result="a"), MockTool(name="echo2", result="b")],
+        event_bus=bus,
+        permission_policy=PermissivePolicy(),
+        parallel_tool_execution=True,
+    )
+    agent.run("go")
+    logger.flush_and_close()
+
+    run_span = next(s for s in exporter.get_finished_spans() if s.name == "kinetic.run")
+    tool_spans = [s for s in exporter.get_finished_spans() if s.name == "kinetic.tool"]
+    assert len(tool_spans) == 2
+    for tool_span in tool_spans:
+        assert tool_span.parent.span_id == run_span.context.span_id

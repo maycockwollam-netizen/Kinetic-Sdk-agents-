@@ -27,7 +27,14 @@ genuinely independent work — see the module docstring of ``subagent/pool``.
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+)
+from concurrent.futures import (
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -152,27 +159,38 @@ class SubagentOrchestrator:
                     self._run_attempt, task, budget, llm_factory, base_llm_override
                 )] = index
 
-            for future in as_completed(list(futures), timeout=timeout):
-                index = futures[future]
-                task = tasks[index]
-                attempts, success, final, error, agent_id = future.result()
-                if not success and max(retry_on_failure, 0) >= 1:
-                    # One retry, same spec, then give up.
-                    self._bump_retry(index, task)
-                    a2, s2, f2, e2, _ = self._run_attempt(
-                        task, budget, llm_factory, base_llm_override
+            try:
+                for future in as_completed(list(futures), timeout=timeout):
+                    index = futures[future]
+                    task = tasks[index]
+                    attempts, success, final, error, agent_id = future.result()
+                    if not success and max(retry_on_failure, 0) >= 1:
+                        # One retry, same spec, then give up.
+                        self._bump_retry(index, task)
+                        a2, s2, f2, e2, _ = self._run_attempt(
+                            task, budget, llm_factory, base_llm_override
+                        )
+                        attempts, success, final, error = attempts + a2, s2, f2, e2
+                    self._bump_finished(index, task, success=success, error=None if success else error)
+                    results[index] = OrchestrationResult(
+                        task=task,
+                        success=success,
+                        final_message=final,
+                        error=None if success else error,
+                        agent_id=agent_id,
+                        attempts=attempts,
                     )
-                    attempts, success, final, error = attempts + a2, s2, f2, e2
-                self._bump_finished(index, task, success=success, error=None if success else error)
-                results[index] = OrchestrationResult(
-                    task=task,
-                    success=success,
-                    final_message=final,
-                    error=None if success else error,
-                    agent_id=agent_id,
-                    attempts=attempts,
-                )
+            except FutureTimeoutError:
+                # The batch deadline expired: tasks that never produced a
+                # result must still yield one (not a missing key).
+                pass
 
+        for index, task in enumerate(tasks):
+            if index not in results:
+                self._bump_finished(index, task, success=False, error="batch timed out")
+                results[index] = OrchestrationResult(
+                    task=task, success=False, error="batch timed out", attempts=1
+                )
         return [results[i] for i in range(len(tasks))]
 
     def _run_attempt(

@@ -131,3 +131,26 @@ def test_vector_memory_without_path_stays_in_memory() -> None:
     assert memory.path is None
     memory.add("cats")
     assert memory.search("cat query")  # still ranks
+
+
+def test_vector_memory_preserves_lifecycle_fields_on_reload(tmp_path) -> None:
+    from kinetic_sdk.memory import MemorySource, MemoryTier
+
+    path = tmp_path / "lifecycle.json"
+    memory = VectorMemory(FakeEmbeddings(), path=path)
+    entry = memory.add(
+        "fact",
+        metadata={"k": "v"},
+        tier=MemoryTier.EPISODIC,
+        source=MemorySource.LLM_INFERENCE,
+        ttl_seconds=3600,
+    )
+
+    reloaded = VectorMemory(FakeEmbeddings(), path=path)
+    got = reloaded.all()[0]
+    assert got.id == entry.id
+    assert got.text == "fact"
+    assert got.tier is MemoryTier.EPISODIC
+    assert got.source is MemorySource.LLM_INFERENCE
+    assert got.metadata == {"k": "v"}
+    assert got.expires_at == entry.expires_at

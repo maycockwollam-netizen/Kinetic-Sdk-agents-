@@ -37,6 +37,7 @@ context.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import uuid
 import weakref
@@ -158,7 +159,12 @@ class _GuardedLLMClient(LLMClient):
             if inp + out > 0:
                 self._budget.record_token_usage(self._agent_id, inp + out)
             cost = response.usage.get("cost_usd")
-            if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost > 0:
+            if (
+                isinstance(cost, (int, float))
+                and not isinstance(cost, bool)
+                and math.isfinite(float(cost))
+                and cost > 0
+            ):
                 self._budget.record_cost(self._agent_id, float(cost))
         return response
 
@@ -182,7 +188,12 @@ class _GuardedLLMClient(LLMClient):
                     if inp + out > 0:
                         self._budget.record_token_usage(self._agent_id, inp + out)
                     cost = event.delta.usage.get("cost_usd")
-                    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost > 0:
+                    if (
+                        isinstance(cost, (int, float))
+                        and not isinstance(cost, bool)
+                        and math.isfinite(float(cost))
+                        and cost > 0
+                    ):
                         self._budget.record_cost(self._agent_id, float(cost))
             yield event
 
