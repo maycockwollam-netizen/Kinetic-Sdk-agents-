@@ -306,3 +306,93 @@ class TestRealStdioIntegration:
             assert result["content"][0]["text"] == "xin chào"
             error_result = client.call_tool("fail", {})
             assert error_result["isError"] is True
+
+
+def _method_responder(method_results: dict) -> Callable[[JsonRpcMessage], list[JsonRpcMessage]]:
+    def responder(msg: JsonRpcMessage) -> list[JsonRpcMessage]:
+        if isinstance(msg, JsonRpcNotification):
+            return []
+        if msg.method == "initialize":
+            return [JsonRpcResponse(id=msg.id, result={"protocolVersion": "2025-03-26"})]
+        if msg.method in method_results:
+            return [JsonRpcResponse(id=msg.id, result=method_results[msg.method])]
+        return [JsonRpcResponse.make_error(msg.id, -32601, "method not known")]
+    return responder
+
+
+class TestResourcePromptClient:
+    def _client(self, method_results: dict) -> MCPClient:
+        client = MCPClient(FakeTransport(_method_responder(method_results)))
+        client.initialize()
+        return client
+
+    def test_list_resources_and_read(self) -> None:
+        client = self._client({
+            "resources/list": {"resources": [{"uri": "docs://readme", "name": "readme", "mimeType": "text/plain"}]},
+            "resources/read": {"contents": [{"uri": "docs://readme", "mimeType": "text/plain", "text": "hello"}]},
+        })
+        assert client.list_resources()[0]["uri"] == "docs://readme"
+        assert client.read_resource("docs://readme")["contents"][0]["text"] == "hello"
+        assert [m.method for m in client._transport.sent if isinstance(m, JsonRpcRequest) and m.method != "initialize"] == [
+            "resources/list", "resources/read"
+        ]
+
+    def test_list_prompts_and_get(self) -> None:
+        client = self._client({
+            "prompts/list": {"prompts": [{"name": "review", "description": "d"}]},
+            "prompts/get": {"messages": [{"role": "user", "content": {"type": "text", "text": "hi"}}]},
+        })
+        assert client.list_prompts()[0]["name"] == "review"
+        assert client.get_prompt("review", {"a": "b"})["messages"] == [
+            {"role": "user", "content": {"type": "text", "text": "hi"}}
+        ]
+
+    def test_methods_require_initialize(self) -> None:
+        client = MCPClient(FakeTransport())
+        with pytest.raises(MCPClientError):
+            client.list_resources()
+        with pytest.raises(MCPClientError):
+            client.read_resource("x")
+        with pytest.raises(MCPClientError):
+            client.list_prompts()
+        with pytest.raises(MCPClientError):
+            client.get_prompt("p")
+
+    def test_read_resource_validates_uri_and_prompts_get_validates_name(self) -> None:
+        client = self._client({})
+        with pytest.raises(MCPClientError, match="non-empty"):
+            client.read_resource("")
+        with pytest.raises(MCPClientError, match="non-empty"):
+            client.get_prompt("")
+
+
+def test_client_server_resources_prompts_round_trip() -> None:
+    from kinetic_sdk.mcp.server import MCPServer, PromptArgument, ServerPrompt
+    from kinetic_sdk.security import PermissivePolicy
+
+    server = MCPServer(
+        tools=[],
+        permission_policy=PermissivePolicy(),
+        resources={"docs://r": "resource content"},
+        prompts={
+            "review": ServerPrompt(
+                description="Review",
+                arguments=(PromptArgument(name="lang", required=True),),
+                template="Review {lang} code",
+            )
+        },
+    )
+
+    def responder(msg: JsonRpcMessage) -> list[JsonRpcMessage]:
+        if isinstance(msg, JsonRpcNotification):
+            server.handle_message(msg)  # advance the MCP handshake state
+            return []
+        response = server.handle_message(msg)
+        return [response] if response is not None else []
+
+    client = MCPClient(FakeTransport(responder))
+    client.initialize()
+    assert client.list_resources()[0]["uri"] == "docs://r"
+    assert client.read_resource("docs://r")["contents"][0]["text"] == "resource content"
+    assert client.list_prompts()[0]["name"] == "review"
+    assert client.get_prompt("review", {"lang": "python"})["messages"][0]["content"]["text"] == "Review python code"

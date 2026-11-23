@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -67,6 +68,35 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+@dataclass(frozen=True)
+class PromptArgument:
+    """One input field a server prompt may require."""
+
+    name: str
+    description: str = ""
+    required: bool = False
+
+
+@dataclass(frozen=True)
+class ServerPrompt:
+    """A server-side prompt: metadata, declared arguments, and a template.
+
+    ``template`` is rendered for ``prompts/get`` by filling ``{name}``
+    placeholders with the caller-provided argument values (missing names are
+    left as ``{placeholder}`` so the model still sees the intent).
+    """
+
+    description: str
+    arguments: tuple[PromptArgument, ...] = ()
+    template: str = "{prompt}"
+
+    def render(self, values: dict[str, str]) -> str:
+        text = self.template
+        for key, value in values.items():
+            text = text.replace("{" + key + "}", value)
+        return text
+
+
 class MCPServer:
     """Serve Kinetic tools to an external MCP client.
 
@@ -87,6 +117,8 @@ class MCPServer:
         audit_logger: AuditLogger | None = None,
         server_name: str = "kinetic-agent-sdk",
         server_version: str = "0.1.0",
+        resources: dict[str, str] | None = None,
+        prompts: dict[str, ServerPrompt] | None = None,
     ) -> None:
         self._tools: dict[str, Tool] = {}
         for tool in tools:
@@ -98,6 +130,10 @@ class MCPServer:
         )
         self.audit_logger = audit_logger if audit_logger is not None else InMemoryAuditLogger()
         self._server_info = {"name": server_name, "version": server_version}
+        # uri -> text content (served read-only over resources/*).
+        self._resources: dict[str, str] = dict(resources or {})
+        # prompt name -> definition (served over prompts/*).
+        self._prompts: dict[str, ServerPrompt] = dict(prompts or {})
         self._state = _AWAITING_INITIALIZE
         #: The protocol version the connected client proposed (for diagnostics).
         self.client_protocol_version: str | None = None
@@ -123,6 +159,10 @@ class MCPServer:
             "ping": self._on_ping,
             "tools/list": self._on_tools_list,
             "tools/call": self._on_tools_call,
+            "resources/list": self._on_resources_list,
+            "resources/read": self._on_resources_read,
+            "prompts/list": self._on_prompts_list,
+            "prompts/get": self._on_prompts_get,
         }.get(message.method)
         if handler is None:
             return JsonRpcResponse.make_error(
@@ -161,17 +201,123 @@ class MCPServer:
         client_info = params.get("clientInfo")
         self.client_info = client_info if isinstance(client_info, dict) else None
         self._state = _AWAITING_INITIALIZED_NOTIFICATION
+        capabilities: dict[str, Any] = {"tools": {"listChanged": False}}
+        if self._resources:
+            capabilities["resources"] = {"subscribe": False, "listChanged": False}
+        if self._prompts:
+            capabilities["prompts"] = {"listChanged": False}
         return JsonRpcResponse(
             id=request.id,
             result={
                 "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {"tools": {"listChanged": False}},
+                "capabilities": capabilities,
                 "serverInfo": dict(self._server_info),
             },
         )
 
     def _on_ping(self, request: JsonRpcRequest) -> JsonRpcResponse:
         return JsonRpcResponse(id=request.id, result={})
+
+    def _on_resources_list(self, request: JsonRpcRequest) -> JsonRpcResponse:
+        not_ready = self._require_ready(request)
+        if not_ready is not None:
+            return not_ready
+        items = [
+            {
+                "uri": uri,
+                "name": uri.rstrip("/").rsplit("/", 1)[-1],
+                "mimeType": "text/plain",
+            }
+            for uri in sorted(self._resources)
+        ]
+        return JsonRpcResponse(id=request.id, result={"resources": items})
+
+    def _on_resources_read(self, request: JsonRpcRequest) -> JsonRpcResponse:
+        not_ready = self._require_ready(request)
+        if not_ready is not None:
+            return not_ready
+        params = request.params if isinstance(request.params, dict) else {}
+        uri = params.get("uri")
+        if not isinstance(uri, str) or not uri:
+            return JsonRpcResponse.make_error(
+                request.id, INVALID_PARAMS, "resources/read params miss a string 'uri'"
+            )
+        content = self._resources.get(uri)
+        if content is None:
+            return JsonRpcResponse.make_error(
+                request.id, INVALID_PARAMS, f"Unknown resource uri: {uri!r}"
+            )
+        return JsonRpcResponse(
+            id=request.id,
+            result={
+                "contents": [
+                    {"uri": uri, "mimeType": "text/plain", "text": content}
+                ]
+            },
+        )
+
+    def _on_prompts_list(self, request: JsonRpcRequest) -> JsonRpcResponse:
+        not_ready = self._require_ready(request)
+        if not_ready is not None:
+            return not_ready
+        items = [
+            {
+                "name": name,
+                "description": prompt.description,
+                "arguments": [
+                    {
+                        "name": arg.name,
+                        "description": arg.description,
+                        "required": arg.required,
+                    }
+                    for arg in prompt.arguments
+                ],
+            }
+            for name, prompt in sorted(self._prompts.items())
+        ]
+        return JsonRpcResponse(id=request.id, result={"prompts": items})
+
+    def _on_prompts_get(self, request: JsonRpcRequest) -> JsonRpcResponse:
+        not_ready = self._require_ready(request)
+        if not_ready is not None:
+            return not_ready
+        params = request.params if isinstance(request.params, dict) else {}
+        name = params.get("name")
+        if not isinstance(name, str) or not name:
+            return JsonRpcResponse.make_error(
+                request.id, INVALID_PARAMS, "prompts/get params miss a string 'name'"
+            )
+        prompt = self._prompts.get(name)
+        if prompt is None:
+            return JsonRpcResponse.make_error(
+                request.id, INVALID_PARAMS, f"Unknown prompt: {name!r}"
+            )
+        arguments = params.get("arguments")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return JsonRpcResponse.make_error(
+                request.id, INVALID_PARAMS, "'arguments' must be an object"
+            )
+        missing = [
+            arg.name for arg in prompt.arguments if arg.required and arg.name not in arguments
+        ]
+        if missing:
+            return JsonRpcResponse.make_error(
+                request.id,
+                INVALID_PARAMS,
+                f"prompt {name!r} misses required arguments {missing}",
+            )
+        rendered = prompt.render({str(key): str(value) for key, value in arguments.items()})
+        return JsonRpcResponse(
+            id=request.id,
+            result={
+                "description": prompt.description,
+                "messages": [
+                    {"role": "user", "content": {"type": "text", "text": rendered}}
+                ],
+            },
+        )
 
     def _on_tools_list(self, request: JsonRpcRequest) -> JsonRpcResponse:
         not_ready = self._require_ready(request)
