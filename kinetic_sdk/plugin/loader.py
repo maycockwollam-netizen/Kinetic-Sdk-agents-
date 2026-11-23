@@ -34,11 +34,12 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from kinetic_sdk import __version__ as _SDK_VERSION
 from kinetic_sdk.plugin.exceptions import (
     PluginLoadError,
     PluginVetError,
 )
-from kinetic_sdk.plugin.manifest import PluginManifest
+from kinetic_sdk.plugin.manifest import PluginManifest, compute_plugin_checksum
 from kinetic_sdk.plugin.scanner import ScanResult, scan_plugin
 from kinetic_sdk.security.audit import AuditLogger, InMemoryAuditLogger
 from kinetic_sdk.tool.base import Tool
@@ -47,6 +48,26 @@ logger = logging.getLogger(__name__)
 
 #: Audit event type used for every load attempt.
 AUDIT_EVENT_PLUGIN_LOAD = "plugin_load"
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    """Coerce a dotted version string to a comparable integer tuple.
+
+    ``"0.2.0"`` -> ``(0, 2, 0)``; pre-release suffixes and non-numeric
+    tails are ignored. Invalid values degrade to ``(0,)`` so a malformed
+    requirement can never block loading (the integrity check only refuses
+    when the installed SDK is genuinely older).
+    """
+    parts: list[int] = []
+    for part in value.split("."):
+        num = ""
+        for ch in part:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        parts.append(int(num) if num else 0)
+    return tuple(parts) or (0,)
 
 
 def _utcnow() -> datetime:
@@ -92,6 +113,11 @@ class PluginLoader:
             self._audit_load(manifest, None, outcome="failed", error=error)
             raise PluginLoadError(f"plugin {manifest.name!r}: {error}")
 
+        integrity_error = self._integrity_error(manifest)
+        if integrity_error is not None:
+            self._audit_load(manifest, None, outcome="rejected", error=integrity_error)
+            raise PluginLoadError(f"plugin {manifest.name!r}: {integrity_error}")
+
         result = scan_plugin(manifest)
         if not result.clean:
             categories = sorted(
@@ -124,6 +150,34 @@ class PluginLoader:
             manifest, result, outcome="loaded", tools=[tool.name for tool in tools]
         )
         return tools
+
+    def _integrity_error(self, manifest: PluginManifest) -> str | None:
+        """Return a refusal reason when *manifest* fails integrity checks.
+
+        Two guards, both refuse BEFORE any import/scan of untrusted code:
+
+        * ``checksum`` — a directory plugin's on-disk ``*.py`` payload must
+          still match the pinned sha256 set when the manifest was issued, so
+          tampered or renamed source cannot load under an old manifest.
+        * ``min_sdk_version`` — the plugin must not require a newer SDK than
+          the one installed (API-drift guard).
+        """
+        if manifest.checksum is not None:
+            if manifest.source != "directory" or not manifest.directory:
+                return "a checksum can only be enforced on a directory plugin"
+            actual = compute_plugin_checksum(manifest.directory)
+            if actual != manifest.checksum:
+                return (
+                    "checksum mismatch: plugin source no longer matches the "
+                    "pinned checksum (it may have been tampered with or renamed)"
+                )
+        if manifest.min_sdk_version is not None:
+            if _version_tuple(_SDK_VERSION) < _version_tuple(manifest.min_sdk_version):
+                return (
+                    f"plugin requires SDK >= {manifest.min_sdk_version}, "
+                    f"installed SDK is {_SDK_VERSION}"
+                )
+        return None
 
     # --- import machinery ------------------------------------------------------
 
