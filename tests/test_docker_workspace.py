@@ -137,3 +137,75 @@ def test_docker_workspace_container_name() -> None:
     assert _workspace().container_name == "dev"
     run_ws = DockerWorkspace(mode="run", image="python:3.12")
     assert run_ws.container_name is None
+
+
+def test_default_timeout_validated() -> None:
+    with pytest.raises(ValueError, match="default_timeout"):
+        DockerWorkspace(mode="exec", container="c", default_timeout=-1)
+    with pytest.raises(ValueError, match="default_timeout"):
+        DockerWorkspace(mode="exec", container="c", default_timeout=float("nan"))
+
+
+def test_run_command_applies_default_timeout(monkeypatch) -> None:
+    import subprocess
+
+    ws = _workspace()
+    recorded: dict[str, object] = {}
+
+    class FakeProc:
+        returncode = 0
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def communicate(self, input: object = None, timeout: object = None):  # type: ignore[no-untyped-def]
+            recorded["timeout"] = timeout
+            return "ok", None
+
+    monkeypatch.setattr(subprocess, "Popen", FakeProc)
+
+    ws.run_command("cat /x")  # no explicit timeout -> default applies
+    assert recorded["timeout"] == ws._default_timeout  # noqa: SLF001
+    ws.run_command("cat /x", timeout=7)
+    assert recorded["timeout"] == 7
+
+
+def test_file_ops_leave_timeout_to_run_command_default() -> None:
+    ws = _workspace(default_timeout=25)
+    seen: list[dict] = []
+
+    def record(command: str, **kwargs: object) -> CommandResult:
+        seen.append(kwargs)
+        return CommandResult(output="ok", exit_code=0, duration_seconds=0.0)
+
+    ws.run_command = record  # type: ignore[method-assign]
+    ws.read_text("a.txt")
+    ws.write_text("a.txt", "x")
+    ws.delete_file("a.txt")
+    ws.list_files()
+    ws.list_directory(".")
+    assert seen
+    # None of the file ops pass their own timeout; run_command's default is used.
+    assert all("timeout" not in kwargs for kwargs in seen)
+
+
+def test_read_text_timeout_reaches_the_subprocess(monkeypatch) -> None:
+    import subprocess
+
+    ws = _workspace(default_timeout=11)
+    recorded: dict[str, object] = {}
+
+    class FakeProc:
+        returncode = 0
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def communicate(self, input: object = None, timeout: object = None):  # type: ignore[no-untyped-def]
+            recorded["timeout"] = timeout
+            return "file content", None
+
+    monkeypatch.setattr(subprocess, "Popen", FakeProc)
+
+    assert ws.read_text("a.txt") == "file content"
+    assert recorded["timeout"] == 11

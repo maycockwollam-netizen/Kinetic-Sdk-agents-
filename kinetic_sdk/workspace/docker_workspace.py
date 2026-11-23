@@ -18,6 +18,7 @@ with the existing wrapper functions, then run it exactly the way
 
 from __future__ import annotations
 
+import math
 import os
 import posixpath
 import signal
@@ -50,6 +51,11 @@ class DockerWorkspace(WorkspaceBase):
             values use the wrapper's writable ``/tmp`` default.
         allow_unsafe_mounts: Whether ``run`` mode may mount sensitive host
             paths. Defaults to ``False``.
+        default_timeout: Wall-clock seconds applied to every command this
+            workspace runs (read_text/write_text/delete_file/list_* and any
+            :meth:`run_command` without an explicit ``timeout``). Guards
+            against a stuck Docker CLI or container hanging FileTool-style
+            operations forever. Defaults to ``30.0``.
     """
 
     def __init__(
@@ -65,11 +71,20 @@ class DockerWorkspace(WorkspaceBase):
         network: str | None = "none",
         tmpfs: list[str] | None = None,
         allow_unsafe_mounts: bool = False,
+        default_timeout: float = 30.0,
     ) -> None:
         if mode not in ("exec", "run"):
             raise ValueError(f"mode must be 'exec' or 'run', got {mode!r}")
         if not workdir or not workdir.startswith("/"):
             raise ValueError("workdir must be an absolute POSIX path")
+        if (
+            isinstance(default_timeout, bool)
+            or not isinstance(default_timeout, (int, float))
+            or not math.isfinite(default_timeout)
+            or default_timeout <= 0
+        ):
+            raise ValueError("default_timeout must be a finite positive number")
+        self._default_timeout = float(default_timeout)
         self._mode = mode
         self._workdir = posixpath.normpath(workdir)
         if mode == "exec":
@@ -141,7 +156,12 @@ class DockerWorkspace(WorkspaceBase):
         ``input_text`` (optional) is piped to the process's stdin — used by
         :meth:`write_text` so large content is not limited by shell argument
         length.
+
+        A command that omits ``timeout`` uses this workspace's configured
+        :attr:`default_timeout` (30s), so a stuck Docker CLI or container
+        cannot hang file operations (read/write/delete/list) indefinitely.
         """
+        effective_timeout = timeout if timeout is not None else self._default_timeout
         effective_command = command
         if cwd is not None:
             effective_command = f"cd {quote(self._absolute_path(cwd))} && {command}"
@@ -162,7 +182,7 @@ class DockerWorkspace(WorkspaceBase):
             )
         timed_out = False
         try:
-            output, _ = proc.communicate(input=input_text, timeout=timeout)
+            output, _ = proc.communicate(input=input_text, timeout=effective_timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             try:
@@ -176,7 +196,7 @@ class DockerWorkspace(WorkspaceBase):
             exit_code=proc.returncode if proc.returncode is not None else -1,
             duration_seconds=round(duration, 3),
             timed_out=timed_out,
-            error=(f"command timed out after {timeout}s" if timed_out else None),
+            error=(f"command timed out after {effective_timeout}s" if timed_out else None),
         )
 
     def read_text(self, relative_path: str) -> str:
