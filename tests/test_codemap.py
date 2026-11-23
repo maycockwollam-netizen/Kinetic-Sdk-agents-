@@ -115,3 +115,47 @@ def test_tool_renders_all_queries_and_suggests_typo(tmp_path):
     for query in ("imports_of", "importers_of", "impact_of"):
         error = tool.execute(query=query, module="bee")
         assert error.is_error and "Suggestions: b." in error.error
+
+
+def test_build_codebase_map_multilingual_js_ts(tmp_path):
+    write(tmp_path, "app.js", 'import {x} from "react";\nimport "./style.css";\nexport function render() {\n  const count = 1;\n}\nexport class Widget {}\n')
+    write(tmp_path, "lib.ts", 'import express from "express";\nexport async function serve() {}\ninterface Foo {}\n')
+    cm = build_codebase_map(tmp_path, languages=("javascript", "typescript"))
+
+    nodes = {node.module_name: node for node in cm.modules}
+    assert set(nodes["app"].imports) == {"./style.css", "react"}
+    assert {"render", "Widget"} <= set(nodes["app"].defines)
+    assert set(nodes["lib"].imports) == {"express"}
+    assert "serve" in nodes["lib"].defines
+
+
+def test_build_codebase_map_multilingual_rust(tmp_path):
+    write(tmp_path, "main.rs",
+          'use std::collections::HashMap;\nextern crate serde;\n'
+          'fn main() {}\nstruct Config {}\nenum Mode {}\nconst MAX: u32 = 5;\n')
+    cm = build_codebase_map(tmp_path, languages=("rust",))
+    node = next(n for n in cm.modules if n.module_name == "main")
+
+    assert "std::collections::HashMap" in node.imports
+    assert "serde" in node.imports
+    assert {"main", "Config", "Mode", "MAX"} <= set(node.defines)
+
+
+def test_build_codebase_map_multilingual_go(tmp_path):
+    write(tmp_path, "main.go",
+          'import (\n  "fmt"\n  "os"\n)\nimport "math"\n'
+          'func main() {}\ntype Config struct {}\nconst Version = "1"\n')
+    cm = build_codebase_map(tmp_path, languages=("go",))
+    node = next(n for n in cm.modules if n.module_name == "main")
+
+    assert {"fmt", "os", "math"} <= set(node.imports)
+    assert {"main", "Config", "Version"} <= set(node.defines)
+
+
+def test_build_codebase_map_ignores_unscanned_extensions_and_python_still_works(tmp_path):
+    write(tmp_path, "noop.txt", "not code")
+    write(tmp_path, "keep.py", "import os\ndef fine(): pass\n")
+    cm = build_codebase_map(tmp_path)  # default: python only
+    assert [n.path for n in cm.modules] == ["keep.py"]
+    cm_multi = build_codebase_map(tmp_path, languages=("python", "javascript"))
+    assert [n.path for n in cm_multi.modules] == ["keep.py"]
