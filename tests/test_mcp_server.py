@@ -18,6 +18,8 @@ from kinetic_sdk.mcp.server import (
     METHOD_NOT_FOUND,
     SERVER_NOT_INITIALIZED,
     MCPServer,
+    PromptArgument,
+    ServerPrompt,
 )
 from kinetic_sdk.mcp.transport import StdioTransport
 from kinetic_sdk.security import AllowListPolicy, InMemoryAuditLogger, PermissivePolicy
@@ -101,7 +103,7 @@ class TestHandshake:
     def test_unknown_method_error(self) -> None:
         server = _make_server()
         _handshake(server)
-        response = server.handle_message(JsonRpcRequest(id=9, method="resources/list"))
+        response = server.handle_message(JsonRpcRequest(id=9, method="completions/get"))
         assert response.is_error
         assert response.error["code"] == METHOD_NOT_FOUND
 
@@ -337,3 +339,75 @@ class TestServeOverPipes:
             client_writer.close()  # EOF is the server's shutdown signal
         thread.join(timeout=5)
         assert not thread.is_alive()
+
+
+class TestResourcesPrompts:
+    def _server(self) -> MCPServer:
+        return _make_server(
+            permission_policy=PermissivePolicy(),
+            resources={"docs://readme": "# Readme\nHello world"},
+            prompts={
+                "review": ServerPrompt(
+                    description="Review code",
+                    arguments=(PromptArgument(name="language", required=True),),
+                    template="Review this {language} code",
+                ),
+                "nowhite": ServerPrompt(description="No args", template="plain {extra}"),
+            },
+        )
+
+    def test_initialize_declares_capabilities_when_present(self) -> None:
+        response = self._server().handle_message(
+            JsonRpcRequest(id=1, method="initialize", params={"protocolVersion": "2025-03-26"})
+        )
+        caps = response.result["capabilities"]  # type: ignore[union-attr]
+        assert "resources" in caps and "prompts" in caps
+
+    def test_initialize_omits_capabilities_when_absent(self) -> None:
+        server = _make_server(permission_policy=PermissivePolicy())
+        response = server.handle_message(
+            JsonRpcRequest(id=1, method="initialize", params={"protocolVersion": "2025-03-26"})
+        )
+        caps = response.result["capabilities"]  # type: ignore[union-attr]
+        assert "resources" not in caps and "prompts" not in caps
+
+    def test_resources_list_and_read(self) -> None:
+        server = self._server()
+        _handshake(server)
+        listed = server.handle_message(JsonRpcRequest(id=1, method="resources/list"))
+        assert listed.result["resources"] == [  # type: ignore[union-attr]
+            {"uri": "docs://readme", "name": "readme", "mimeType": "text/plain"}
+        ]
+        read = server.handle_message(
+            JsonRpcRequest(id=2, method="resources/read", params={"uri": "docs://readme"})
+        )
+        assert read.result["contents"][0]["text"] == "# Readme\nHello world"  # type: ignore[union-attr]
+        miss = server.handle_message(
+            JsonRpcRequest(id=3, method="resources/read", params={"uri": "docs://nope"})
+        )
+        assert miss.is_error and miss.error["code"] == INVALID_PARAMS  # type: ignore[index]
+
+    def test_prompts_list_and_get(self) -> None:
+        server = self._server()
+        _handshake(server)
+        listed = server.handle_message(JsonRpcRequest(id=1, method="prompts/list"))
+        prompts = listed.result["prompts"]  # type: ignore[union-attr]
+        assert {p["name"] for p in prompts} == {"review", "nowhite"}
+        assert next(p for p in prompts if p["name"] == "review")["arguments"][0]["required"] is True
+
+        got = server.handle_message(
+            JsonRpcRequest(id=2, method="prompts/get", params={"name": "review", "arguments": {"language": "python"}})
+        )
+        assert got.result["messages"][0]["content"]["text"] == "Review this python code"  # type: ignore[union-attr]
+
+        missing = server.handle_message(JsonRpcRequest(id=3, method="prompts/get", params={"name": "review"}))
+        assert missing.is_error and "language" in missing.error["message"]  # type: ignore[index]
+
+        unknown = server.handle_message(JsonRpcRequest(id=4, method="prompts/get", params={"name": "nope"}))
+        assert unknown.is_error
+
+    def test_resources_and_prompts_gated_to_ready(self) -> None:
+        server = self._server()  # no handshake
+        for method in ("resources/list", "resources/read", "prompts/list", "prompts/get"):
+            response = server.handle_message(JsonRpcRequest(id=9, method=method, params={}))
+            assert response.is_error and response.error["code"] == SERVER_NOT_INITIALIZED  # type: ignore[index]

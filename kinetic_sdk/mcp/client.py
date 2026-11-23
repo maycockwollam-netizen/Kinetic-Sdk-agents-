@@ -185,6 +185,72 @@ class MCPClient:
             timeout or self._request_timeout,
         )
 
+    def list_resources(self, timeout: float | None = None) -> list[dict[str, Any]]:
+        """Return the server's resource descriptors (``uri`` / name / mimeType).
+
+        Raises:
+            MCPClientError: Called before :meth:`initialize` completed or the
+                response is malformed.
+        """
+        self._require_initialized("list_resources")
+        result = self._request("resources/list", {}, timeout or self._request_timeout)
+        if not isinstance(result, dict) or not isinstance(result.get("resources"), list):
+            raise MCPClientError(
+                f"Malformed resources/list response: expected a 'resources' list, got {result!r}"
+            )
+        return result["resources"]
+
+    def read_resource(self, uri: str, timeout: float | None = None) -> dict[str, Any]:
+        """Read one resource by *uri*; returns the MCP ``{"contents": [...]}`` dict.
+
+        Raises:
+            MCPClientError: Not initialized, malformed response, or empty uri.
+            MCPServerError: Unknown resource at protocol level.
+        """
+        self._require_initialized("read_resource")
+        if not isinstance(uri, str) or not uri:
+            raise MCPClientError("read_resource requires a non-empty 'uri'")
+        result = self._request(
+            "resources/read", {"uri": uri}, timeout or self._request_timeout
+        )
+        if not isinstance(result, dict):
+            raise MCPClientError(f"Malformed resources/read response: {result!r}")
+        return result
+
+    def list_prompts(self, timeout: float | None = None) -> list[dict[str, Any]]:
+        """Return the server's prompt descriptors (name / description / arguments)."""
+        self._require_initialized("list_prompts")
+        result = self._request("prompts/list", {}, timeout or self._request_timeout)
+        if not isinstance(result, dict) or not isinstance(result.get("prompts"), list):
+            raise MCPClientError(
+                f"Malformed prompts/list response: expected a 'prompts' list, got {result!r}"
+            )
+        return result["prompts"]
+
+    def get_prompt(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Fetch a rendered prompt by *name*; returns `{"description", "messages"}`.
+
+        Raises:
+            MCPClientError: Not initialized or missing name.
+            MCPServerError: Unknown prompt or missing required arguments.
+        """
+        self._require_initialized("get_prompt")
+        if not isinstance(name, str) or not name:
+            raise MCPClientError("get_prompt requires a non-empty 'name'")
+        result = self._request(
+            "prompts/get",
+            {"name": name, "arguments": arguments or {}},
+            timeout or self._request_timeout,
+        )
+        if not isinstance(result, dict):
+            raise MCPClientError(f"Malformed prompts/get response: {result!r}")
+        return result
+
     def close(self) -> None:
         """Close the underlying transport. Idempotent."""
         self._transport.close()

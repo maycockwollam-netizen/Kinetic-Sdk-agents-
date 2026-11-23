@@ -53,7 +53,7 @@ from kinetic_sdk.mcp.protocol import (
     encode,
 )
 from kinetic_sdk.mcp.registry import MCPServerConfig, MCPServerRegistry
-from kinetic_sdk.mcp.server import MCPServer
+from kinetic_sdk.mcp.server import MCPServer, PromptArgument, ServerPrompt
 from kinetic_sdk.mcp.transport import (
     MCPTimeoutError,
     MCPTransportError,
@@ -70,6 +70,8 @@ __all__ = [
     "MCPClientError",
     "MCPHandshakeError",
     "MCPServerError",
+    "PromptArgument",
+    "ServerPrompt",
     "MCPServer",
     "MCPServerConfig",
     "MCPServerRegistry",
