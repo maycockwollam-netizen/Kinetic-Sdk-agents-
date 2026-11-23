@@ -28,7 +28,11 @@ import logging
 import os
 import shutil
 
-from kinetic_sdk.skills.activation import SkillActivationHook, select_active_skills
+from kinetic_sdk.skills.activation import (
+    SkillActivationHook,
+    rank_skills,
+    select_active_skills,
+)
 from kinetic_sdk.skills.exceptions import (
     SkillNotFoundError,
     SkillParseError,
@@ -66,6 +70,7 @@ __all__ = [
     "ZipSkillError",
     "ZipSkillLoader",
     "add_skill_from_zip",
+    "rank_skills",
     "select_active_skills",
     "vet_skill",
 ]
