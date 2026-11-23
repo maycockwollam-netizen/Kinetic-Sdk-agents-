@@ -95,6 +95,11 @@ from kinetic_sdk.subagent.manifest import (
     SubagentSpec,
     load_subagent_spec,
 )
+from kinetic_sdk.subagent.orchestrator import (
+    OrchestrationResult,
+    OrchestrationTask,
+    SubagentOrchestrator,
+)
 from kinetic_sdk.subagent.pool import (
     SubagentPool,
     SubagentResultMerger,
@@ -106,6 +111,9 @@ __all__ = [
     "DEFAULT_MAX_CONSECUTIVE_REPEATS",
     "DEFAULT_MAX_TOTAL_TOOL_CALLS",
     "BATCH_TOOL_NAME",
+    "OrchestrationResult",
+    "OrchestrationTask",
+    "SubagentOrchestrator",
     "DELEGATE_TOOL_NAME",
     "AsyncDelegateTool",
     "AsyncLLMFactory",
