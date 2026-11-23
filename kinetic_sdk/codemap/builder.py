@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -11,6 +12,22 @@ from kinetic_sdk.codemap.models import CodebaseMap, ModuleNode
 from kinetic_sdk.workspace.manager import LocalWorkspace
 
 DEFAULT_EXCLUDE = (".venv", "venv", "node_modules", "__pycache__", ".git")
+
+#: File extensions each supported language is discovered under. Python is
+#: parsed with the stdlib ``ast`` (exact); the others are best-effort
+#: structural scans with no third-party tree-sitter dependency.
+LANGUAGE_EXTENSIONS: dict[str, tuple[str, ...]] = {
+    "python": (".py",),
+    "javascript": (".js", ".mjs", ".cjs"),
+    "typescript": (".ts", ".mts", ".cts", ".tsx"),
+    "rust": (".rs",),
+    "go": (".go",),
+}
+
+#: Languages enabled by default. Pass ``languages=("python", "javascript", ...)``
+#: to scan more; a file whose extension matches several enabled languages is
+#: assigned to the FIRST matching language in this order.
+DEFAULT_LANGUAGES: tuple[str, ...] = ("python",)
 
 
 def _module_name(path: str) -> str:
@@ -98,27 +115,82 @@ def _defines(tree: ast.Module) -> set[str]:
     return found
 
 
-def build_codebase_map(root_path: str | os.PathLike[str], *, exclude: Iterable[str] = DEFAULT_EXCLUDE) -> CodebaseMap:
-    """Walk *root_path*, parse every Python file, and build a static map.
+def build_codebase_map(
+    root_path: str | os.PathLike[str],
+    *,
+    exclude: Iterable[str] = DEFAULT_EXCLUDE,
+    languages: Iterable[str] = DEFAULT_LANGUAGES,
+) -> CodebaseMap:
+    """Walk *root_path* and build a static import map for the enabled languages.
 
-    Parse and decoding failures remain visible as empty nodes in ``skipped``;
-    a partial graph is useful only when its blind spots are explicit.
+    ``python`` is parsed exactly with the stdlib ``ast`` (relative imports,
+    attribute-vs-submodule resolution). The other supported languages
+    (``javascript`` / ``typescript`` / ``rust`` / ``go``) are best-effort
+    structural scans with no extra dependency: imports/requires/uses are
+    captured as raw spec strings and top-level declarations (functions,
+    classes, structs, enums, consts, ...) as name strings. Parse and decoding
+    failures stay visible as empty nodes in ``skipped``.
+
+    Args:
+        root_path: Repository root to walk.
+        exclude: Directory names skipped when walking.
+        languages: Enabled language names (subset of
+            :data:`LANGUAGE_EXTENSIONS` keys). A file whose extension belongs
+            to several enabled languages is assigned to the FIRST in this order.
     """
     workspace = LocalWorkspace(root_path)
     root = Path(workspace.root_path)
     excluded = set(exclude)
-    files: list[tuple[Path, str, str]] = []
+    enabled = [lang for lang in languages if lang in LANGUAGE_EXTENSIONS]
+    ext_to_lang: dict[str, str] = {}
+    for lang in enabled:
+        for ext in LANGUAGE_EXTENSIONS[lang]:
+            ext_to_lang.setdefault(ext, lang)
+
+    grouped: dict[str, list[tuple[Path, str, str]]] = {lang: [] for lang in enabled}
     for directory, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(name for name in dirnames if name not in excluded)
         for filename in sorted(filenames):
-            if filename.endswith(".py"):
-                absolute = Path(directory) / filename
-                relative = absolute.relative_to(root).as_posix()
-                files.append((absolute, relative, _module_name(relative)))
+            file_lang = ext_to_lang.get(Path(filename).suffix)
+            if file_lang is None:
+                continue
+            absolute = Path(directory) / filename
+            relative = absolute.relative_to(root).as_posix()
+            grouped[file_lang].append((absolute, relative, _module_name(relative)))
+
+    nodes: list[ModuleNode] = []
+    skipped: list[str] = []
+    for lang, files in grouped.items():
+        if lang == "python":
+            nodes.extend(_build_python_nodes(root, files, skipped))
+        else:
+            for absolute, relative, module_name in files:
+                try:
+                    text = absolute.read_text(encoding="utf-8")
+                except (UnicodeDecodeError, OSError):
+                    nodes.append(ModuleNode(relative, module_name, (), ()))
+                    skipped.append(relative)
+                    continue
+                nodes.append(
+                    ModuleNode(
+                        relative,
+                        module_name,
+                        tuple(sorted(_structural_imports(lang, text))),
+                        tuple(sorted(_structural_defines(lang, text))),
+                    )
+                )
+    return CodebaseMap(str(root), tuple(sorted(nodes, key=lambda item: item.module_name)), tuple(sorted(skipped)))
+
+
+def _build_python_nodes(
+    root: Path,
+    files: list[tuple[Path, str, str]],
+    skipped: list[str],
+) -> list[ModuleNode]:
+    """Parse the discovered ``.py`` files with the stdlib ``ast``."""
     known_modules = {module_name for _, _, module_name in files}
     package_name = root.name if (root / "__init__.py").is_file() else None
     nodes: list[ModuleNode] = []
-    skipped: list[str] = []
     for absolute, relative, module_name in files:
         is_package = absolute.name == "__init__.py"
         try:
@@ -135,4 +207,87 @@ def build_codebase_map(root_path: str | os.PathLike[str], *, exclude: Iterable[s
                 tuple(sorted(_defines(tree))),
             )
         )
-    return CodebaseMap(str(root), tuple(sorted(nodes, key=lambda item: item.module_name)), tuple(sorted(skipped)))
+    return nodes
+
+
+# --- best-effort structural scanners for the non-Python languages ----------
+
+_JS_IMPORT_PATTERNS = (
+    re.compile(r"""\bfrom\s+['"]([^'"]+)['"]"""),
+    re.compile(r"""\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)"""),
+    re.compile(r"""\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)"""),
+    re.compile(r"""\bimport\s+['"]([^'"]+)['"]"""),
+)
+_JS_DEFINE_PATTERNS = (
+    re.compile(r"""\b(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)"""),
+    re.compile(r"""\b(?:export\s+)?class\s+([A-Za-z_$][\w$]*)"""),
+    re.compile(r"""\b(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*="""),
+)
+_RUST_IMPORT_PATTERNS = (
+    re.compile(r"\buse\s+([^;\n]+);"),
+    re.compile(r"\bextern\s+crate\s+([a-z_0-9:]+)"),
+)
+_RUST_DEFINE_PATTERNS = (
+    re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)"),
+    re.compile(r"\bstruct\s+([A-Z][A-Za-z0-9_]*)"),
+    re.compile(r"\benum\s+([A-Z][A-Za-z0-9_]*)"),
+    re.compile(r"\btype\s+([A-Za-z_][A-Za-z0-9_:]*)\s*="),
+    re.compile(r"\bconst\s+([A-Z_][A-Z0-9_]*)\s*:"),
+)
+_GO_IMPORT_PATTERNS = (
+    re.compile(r'import\s+[a-zA-Z_]+\s+"([^"]+)"'),
+    re.compile(r'import\s+"([^"]+)"'),
+    re.compile(r'import\s*\(([^)]*)\)'),
+)
+_GO_DEFINE_PATTERNS = (
+    re.compile(r"\bfunc\s+(?:\([^)]*\)\s+)?([A-Za-z_]\w*)\s*\("),
+    re.compile(r"\btype\s+([A-Za-z_]\w*)\s+(struct|interface)\b"),
+    re.compile(r"\btype\s+([A-Za-z_]\w*)\s*="),
+    re.compile(r"\b(?:const|var)\s+([A-Za-z_]\w*)\s*="),
+)
+
+
+def _structural_imports(language: str, text: str) -> list[str]:
+    """Best-effort list of import spec strings for a non-Python language."""
+    if language in ("javascript", "typescript"):
+        js_specs: list[str] = []
+        for pattern in _JS_IMPORT_PATTERNS:
+            js_specs.extend(m.group(1).strip() for m in pattern.finditer(text))
+        return [spec for spec in js_specs if spec]
+    if language == "rust":
+        rust_specs: list[str] = []
+        for match in _RUST_IMPORT_PATTERNS[0].finditer(text):
+            rust_specs.append(match.group(1).strip().rstrip(";").strip())
+        for match in _RUST_IMPORT_PATTERNS[1].finditer(text):
+            rust_specs.append(match.group(1).strip())
+        return [spec for spec in rust_specs if spec]
+    if language == "go":
+        go_specs: list[str] = []
+        for match in _GO_IMPORT_PATTERNS[0].finditer(text):
+            go_specs.append(match.group(1))
+        for match in _GO_IMPORT_PATTERNS[1].finditer(text):
+            go_specs.append(match.group(1))
+        for block in _GO_IMPORT_PATTERNS[2].finditer(text):
+            go_specs.extend(re.findall(r'"([^"]+)"', block.group(1)))
+        return [spec for spec in go_specs if spec]
+    return []
+
+
+def _structural_defines(language: str, text: str) -> list[str]:
+    """Best-effort top-level declaration names for a non-Python language."""
+    patterns: tuple[re.Pattern[str], ...]
+    if language in ("javascript", "typescript"):
+        patterns = _JS_DEFINE_PATTERNS
+    elif language == "rust":
+        patterns = _RUST_DEFINE_PATTERNS
+    elif language == "go":
+        patterns = _GO_DEFINE_PATTERNS
+    else:
+        return []
+    found: set[str] = set()
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            name = match.group(1).strip()
+            if name:
+                found.add(name)
+    return sorted(found)
