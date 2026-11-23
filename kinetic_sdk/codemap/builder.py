@@ -9,7 +9,11 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from kinetic_sdk.codemap.models import CodebaseMap, ModuleNode
+from kinetic_sdk.codemap.tree_sitter import TreeSitterScanner
 from kinetic_sdk.workspace.manager import LocalWorkspace
+
+#: Shared optional tree-sitter scanner (lazy — no-op until first use).
+_TREE_SITTER = TreeSitterScanner()
 
 DEFAULT_EXCLUDE = (".venv", "venv", "node_modules", "__pycache__", ".git")
 
@@ -120,6 +124,7 @@ def build_codebase_map(
     *,
     exclude: Iterable[str] = DEFAULT_EXCLUDE,
     languages: Iterable[str] = DEFAULT_LANGUAGES,
+    use_tree_sitter: bool = False,
 ) -> CodebaseMap:
     """Walk *root_path* and build a static import map for the enabled languages.
 
@@ -137,6 +142,9 @@ def build_codebase_map(
         languages: Enabled language names (subset of
             :data:`LANGUAGE_EXTENSIONS` keys). A file whose extension belongs
             to several enabled languages is assigned to the FIRST in this order.
+        use_tree_sitter: When ``True`` (and the optional ``[codemap]`` extra is
+            installed), non-Python languages are parsed exactly with
+            tree-sitter; otherwise they keep the best-effort regex scan.
     """
     workspace = LocalWorkspace(root_path)
     root = Path(workspace.root_path)
@@ -171,12 +179,18 @@ def build_codebase_map(
                     nodes.append(ModuleNode(relative, module_name, (), ()))
                     skipped.append(relative)
                     continue
+                scanned = _TREE_SITTER.scan(lang, text) if use_tree_sitter else None
+                if scanned is not None:
+                    imports, defines = scanned
+                else:
+                    imports = _structural_imports(lang, text)
+                    defines = _structural_defines(lang, text)
                 nodes.append(
                     ModuleNode(
                         relative,
                         module_name,
-                        tuple(sorted(_structural_imports(lang, text))),
-                        tuple(sorted(_structural_defines(lang, text))),
+                        tuple(sorted(imports)),
+                        tuple(sorted(defines)),
                     )
                 )
     return CodebaseMap(str(root), tuple(sorted(nodes, key=lambda item: item.module_name)), tuple(sorted(skipped)))

@@ -29,6 +29,14 @@ tokens = ["tiktoken>=0.7"]
 ui = ["rich>=13.0", "textual>=0.60"]
 browser = ["playwright>=1.40"]
 otel = ["opentelemetry-sdk>=1.25"]
+codemap = [
+    "tree-sitter>=0.24",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-javascript>=0.23",
+    "tree-sitter-typescript>=0.23",
+    "tree-sitter-rust>=0.23",
+    "tree-sitter-go>=0.23",
+]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
 
 [project.scripts]
