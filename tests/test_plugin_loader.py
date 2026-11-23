@@ -266,3 +266,66 @@ class TestAuditLog:
         assert any(
             f["category"] == "direct_network" for f in entry["scan"]["flags"]
         )
+
+
+class TestIntegrityGuards:
+    def test_directory_manifest_pins_a_checksum(self, tmp_path):
+        import re
+
+        from ._helpers import write_plugin
+
+        directory = write_plugin(tmp_path, "hello")
+        manifest = PluginManifest.from_directory(directory)
+        assert manifest.checksum is not None
+        assert re.fullmatch(r"[0-9a-f]{64}", manifest.checksum)
+        from kinetic_sdk.plugin.manifest import compute_plugin_checksum
+        assert compute_plugin_checksum(directory) == manifest.checksum
+
+    def test_tampered_source_rejected_before_import(self, tmp_path):
+        from ._helpers import write_plugin
+
+        directory = write_plugin(
+            tmp_path, "tamper-me", modules={"plugin.py": "def make_tools():\n    return []\n"}
+        )
+        manifest = PluginManifest.from_directory(directory)
+        with open(directory / "plugin.py", "a", encoding="utf-8") as handle:
+            handle.write("\n# tampered\n")
+
+        with pytest.raises(PluginLoadError, match="checksum mismatch"):
+            PluginLoader().load(manifest)
+
+    def test_min_sdk_version_too_new_is_rejected(self, tmp_path):
+        from dataclasses import replace
+
+        from ._helpers import write_plugin
+
+        directory = write_plugin(
+            tmp_path, "newer-plugin", modules={"plugin.py": "def make_tools():\n    return []\n"}
+        )
+        manifest = replace(PluginManifest.from_directory(directory), min_sdk_version="999.0.0")
+
+        with pytest.raises(PluginLoadError, match="requires SDK"):
+            PluginLoader().load(manifest)
+
+    def test_min_sdk_version_compatible_loads(self, tmp_path):
+        from dataclasses import replace
+
+        from ._helpers import write_plugin
+
+        directory = write_plugin(tmp_path, "compatible")
+        manifest = replace(PluginManifest.from_directory(directory), min_sdk_version="0.1.0")
+
+        tools = PluginLoader().load(manifest)
+        assert len(tools) == 1
+
+    def test_checksum_only_enforced_for_directory_plugins(self):
+        manifest = PluginManifest(
+            name="ep",
+            version=None,
+            entry_point="mod:factory",
+            source="entry_point",
+            declared_capabilities=frozenset({"tool"}),
+            checksum="a" * 64,
+        )
+        with pytest.raises(PluginLoadError, match="only be enforced on a directory"):
+            PluginLoader().load(manifest)

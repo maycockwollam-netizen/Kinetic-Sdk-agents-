@@ -21,6 +21,7 @@ static scanner has passed.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass, field
@@ -102,6 +103,16 @@ class PluginManifest:
     memory_limit: str = "512m"
     cpu_limit: float = 1.0
     pids_limit: int = 128
+    #: Optional sha256 (hex) of the plugin's executable source payload. Set
+    #: automatically by :meth:`from_directory`; the loader refuses to import
+    #: a directory plugin whose on-disk content does not still match this
+    #: pinned digest, so a tampered/renamed plugin cannot silently load under
+    #: a previously-issued manifest.
+    checksum: str | None = None
+    #: Optional minimum SDK version the plugin was written against (e.g.
+    #: ``"0.2.0"``). The loader refuses to import a plugin that requires a
+    #: newer SDK than the one installed, catching API-drift before import.
+    min_sdk_version: str | None = None
 
     def __post_init__(self) -> None:
         if len(self.name) > MAX_NAME_LENGTH or not SKILL_NAME_PATTERN.match(self.name):
@@ -140,6 +151,20 @@ class PluginManifest:
         ):
             raise PluginManifestError(
                 f"plugin {self.name!r}: docker resource limits must be positive"
+            )
+        if self.checksum is not None and (
+            not isinstance(self.checksum, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", self.checksum)
+        ):
+            raise PluginManifestError(
+                f"plugin {self.name!r}: checksum must be a 64-char lowercase hex sha256"
+            )
+        if self.min_sdk_version is not None and (
+            not isinstance(self.min_sdk_version, str)
+            or not self.min_sdk_version.strip()
+        ):
+            raise PluginManifestError(
+                f"plugin {self.name!r}: min_sdk_version must be a non-empty string or None"
             )
         capabilities = frozenset(self.declared_capabilities)
         if not capabilities:
@@ -232,6 +257,8 @@ class PluginManifest:
             memory_limit=frontmatter.get("memory_limit", "512m"),
             cpu_limit=float(frontmatter.get("cpu_limit", "1.0")),
             pids_limit=int(frontmatter.get("pids_limit", "128")),
+            checksum=compute_plugin_checksum(directory),
+            min_sdk_version=frontmatter.get("sdk_version") or None,
         )
 
     @classmethod
@@ -253,3 +280,33 @@ class PluginManifest:
             source="entry_point",
             declared_capabilities=frozenset({"tool"}),
         )
+
+
+def compute_plugin_checksum(directory: str | os.PathLike[str]) -> str:
+    """sha256 hex of a directory plugin's executable source payload.
+
+    The digest covers every ``*.py`` file under *directory* (in sorted
+    root-relative order, skipping ``__pycache__``), including its relative
+    path in the hashed bytes, so renaming files or changing content changes
+    the digest. Used by :meth:`PluginManifest.from_directory` to pin a
+    manifest to its source, and re-computed by the loader to detect tampering
+    before import.
+    """
+    root = os.path.realpath(os.fspath(directory))
+    digest = hashlib.sha256()
+    for relative in _iter_py_files(root):
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        path = os.path.join(root, relative)
+        digest.update(Path(path).read_bytes())
+    return digest.hexdigest()
+
+
+def _iter_py_files(root: str) -> list[str]:
+    files: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name != "__pycache__"]
+        for filename in filenames:
+            if filename.endswith(".py"):
+                files.append(os.path.relpath(os.path.join(dirpath, filename), root))
+    return sorted(files)
