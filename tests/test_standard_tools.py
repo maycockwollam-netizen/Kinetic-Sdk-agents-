@@ -358,3 +358,49 @@ def test_glob_finds_python_files_and_excludes_symlink_escape(workspace, tmp_path
     assert not result.is_error
     assert result.output == "src/main.py"
     outside.unlink()
+
+
+def test_terminal_runs_in_cwd(tmp_path) -> None:
+    result = TerminalTool().execute(command="pwd", cwd=str(tmp_path))
+    assert not result.is_error
+    assert result.output.strip() == str(tmp_path)
+    assert result.metadata.get("cwd") == str(tmp_path)
+
+
+def test_terminal_invalid_cwd_rejected() -> None:
+    result = TerminalTool().execute(command="pwd", cwd="/no/such/dir-xyz")
+    assert result.is_error and "not a directory" in result.error
+
+
+def test_terminal_env_merges_over_tool_env() -> None:
+    tool = TerminalTool(env={"FOO": "bar"})
+    result = tool.execute(command='printf "%s" "$FOO$BAR"', env={"BAR": "baz"})
+    assert not result.is_error
+    assert result.output == "barbaz"
+    # Per-call env can add to an inherited (None) tool env too.
+    tool2 = TerminalTool()
+    result2 = tool2.execute(command='printf "%s" "${VAR_X:-none}"', env={"VAR_X": "ok"})
+    assert not result2.is_error and result2.output == "ok"
+
+
+def test_terminal_tail_truncation_keeps_the_end() -> None:
+    result = TerminalTool(max_output_chars=200).execute(
+        command="python3 -c \"print('x' * 1000)\"", truncation="tail"
+    )
+    assert result.metadata["truncated"] is True
+    assert "cắt bớt" in result.output
+    assert result.output.rstrip().endswith("xxx")
+
+
+def test_terminal_progress_callback_streams_lines() -> None:
+    seen: list[str] = []
+
+    def on_line(line: str) -> None:
+        seen.append(line)
+
+    tool = TerminalTool(progress_callback=on_line)
+    result = tool.execute(command="for i in 1 2 3; do echo line-$i; done")
+    assert not result.is_error
+    assert seen == ["line-1", "line-2", "line-3"]
+    # The final result still assembles the full output in order.
+    assert result.output.replace("\n", " ").strip() == "line-1 line-2 line-3"
