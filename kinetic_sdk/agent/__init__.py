@@ -23,6 +23,7 @@ from kinetic_sdk.agent.planning import (
     StaticPlanStrategy,
     VerificationResult,
 )
+from kinetic_sdk.agent.result import AgentResult
 from kinetic_sdk.agent.settings import AgentSettings
 from kinetic_sdk.agent.stuck_detector import StuckDetector
 from kinetic_sdk.agent.verifier import LLMAnswerVerifier
@@ -30,6 +31,7 @@ from kinetic_sdk.agent.verifier import LLMAnswerVerifier
 __all__ = [
     "Agent",
     "AnswerNotVerifiedError",
+    "AgentResult",
     "AgentSettings",
     "AgentMode",
     "AnswerVerifier",

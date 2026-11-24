@@ -113,6 +113,37 @@ def test_mock_response_without_usage_is_silence():
     assert agent.usage.snapshot().calls == 0
 
 
+def test_agent_exposes_last_result():
+    from kinetic_sdk import AgentResult
+
+    llm = MockLLMClient([text_response("final answer")])
+    agent = Agent(llm=llm, permission_policy=PermissivePolicy())
+    out = agent.run("hi")
+    assert out == "final answer"  # run() still returns the str
+    r = agent.last_result
+    assert isinstance(r, AgentResult)
+    assert r.final_text == "final answer"
+    assert r.run_id == agent.run_id
+    assert r.mode is not None
+    assert r.cancelled is False
+    assert r.duration_seconds is not None
+    assert "calls" in r.usage and "cost_usd" in r.usage
+    d = r.to_dict()
+    assert d["final_text"] == "final answer"
+
+
+def test_last_result_carries_structured_output():
+    from kinetic_sdk import AgentResult
+
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+    llm = MockLLMClient([text_response('{"answer": "42"}')])
+    agent = Agent(llm=llm, permission_policy=PermissivePolicy())
+    agent.run("question", output_schema=schema)
+    r = agent.last_result
+    assert isinstance(r, AgentResult)
+    assert r.structured_output == {"answer": "42"}
+
+
 def test_tool_result_carries_tokens_approx():
     from kinetic_sdk.testing import MockTool, tool_response
 

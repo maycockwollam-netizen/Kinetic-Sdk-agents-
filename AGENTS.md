@@ -1320,3 +1320,8 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   `score > 0` filter on the Rust path as the Python fallback; memory
   consolidation is serialised (no duplicate summaries); `FileHistoryTool`
   restore now goes through the shared `FileLockRegistry` lease.
+- **Rich `AgentResult`** (`agent/result.py`). `Agent.run()` still returns the
+  final `str`, but now `agent.last_result` exposes an `AgentResult` with
+  `final_text`, parsed `structured_output`, `run_id`, mode, a usage snapshot
+  and `duration_seconds` (plus `cancelled`/`error`), exported from
+  `kinetic_sdk` and the full `to_dict()` for servers/CLIs/traces.
