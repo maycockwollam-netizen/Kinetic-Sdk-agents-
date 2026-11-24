@@ -12,12 +12,15 @@ from kinetic_sdk.agent.agent import Agent, AnswerNotVerifiedError
 from kinetic_sdk.agent.planning import VerificationResult
 from kinetic_sdk.security.policy import PermissivePolicy
 from kinetic_sdk.subagent import (
+    FirstSuccessMerger,
+    MajorityVoteMerger,
     SpawnBudget,
     SubagentPool,
     SubagentSpec,
+    map_reduce_subagents,
     spawn_subagent_pool,
 )
-from kinetic_sdk.subagent.delegation import DelegationResult
+from kinetic_sdk.subagent.delegation import DelegationResult, SubagentStatus
 from kinetic_sdk.subagent.pool import _SerializedLLMClient
 from kinetic_sdk.testing import MockLLMClient, text_response
 
@@ -169,3 +172,63 @@ def test_spawn_pool_forwards_llm_factory() -> None:
 
     assert spawn_subagent_pool(parent, [_spec("one")], llm_factory=factory) == "done"
     assert built_models == [parent.llm.model]
+
+
+def test_map_reduce_runs_items_and_joins() -> None:
+    def handler(messages, tools, system):  # type: ignore[no-untyped-def]
+        last = next(
+            m["content"]
+            for m in reversed(messages)
+            if m.get("role") == "user" and isinstance(m.get("content"), str)
+        )
+        return text_response(f"processed {last}")
+
+    parent = Agent(
+        llm=MockLLMClient([handler] * 10),
+        permission_policy=PermissivePolicy(),
+    )
+    outcome = map_reduce_subagents(parent, _spec("worker"), ["a", "b", "c"], max_concurrency=1)
+    assert [r.final_message for r in outcome.results] == ["processed a", "processed b", "processed c"]
+    assert len(outcome) == 3
+    assert "processed a" in outcome.merged and "processed c" in outcome.merged
+
+
+def test_map_reduce_preserves_order_and_isolates_failures(monkeypatch) -> None:
+    calls: list[int] = []
+
+    def fake_run(parent, spec, task, budget, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(int(task))
+        if task == "1":
+            raise RuntimeError("boom")
+        return DelegationResult(f"ok {task}", "id")
+
+    monkeypatch.setattr("kinetic_sdk.subagent.pool.run_subagent", fake_run)
+    parent = Agent(llm=MockLLMClient([]), permission_policy=PermissivePolicy())
+    outcome = map_reduce_subagents(parent, _spec("w"), ["0", "1", "2"], max_concurrency=1)
+    assert [r is None for r in outcome.results] == [False, True, False]
+    assert calls == [0, 1, 2]
+
+
+def test_first_success_merger() -> None:
+    results = [
+        DelegationResult("bad", "a1", status=SubagentStatus.NEEDS_MORE_INFO),
+        DelegationResult("good", "a2", status=SubagentStatus.SUCCESS),
+        DelegationResult("good2", "a3", status=SubagentStatus.SUCCESS),
+    ]
+    assert FirstSuccessMerger().merge(results) == "good"
+    assert FirstSuccessMerger().merge([None, None]) == ""
+
+
+def test_majority_vote_merger() -> None:
+    results = [
+        DelegationResult("m1", "a1", status=SubagentStatus.SUCCESS, data={"choice": "x"}),
+        DelegationResult("m2", "a2", status=SubagentStatus.SUCCESS, data={"choice": "y"}),
+        DelegationResult("m3", "a3", status=SubagentStatus.SUCCESS, data={"choice": "x"}),
+    ]
+    assert MajorityVoteMerger().merge(results) == "x (2 votes)"
+    # tie -> earliest value wins
+    tie = [
+        DelegationResult("m", "a1", data={"choice": "y"}),
+        DelegationResult("m", "a2", data={"choice": "x"}),
+    ]
+    assert MajorityVoteMerger().merge(tie).startswith("y")

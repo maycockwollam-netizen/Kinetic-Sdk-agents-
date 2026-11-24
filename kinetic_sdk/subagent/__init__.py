@@ -104,8 +104,13 @@ from kinetic_sdk.subagent.orchestrator import (
     SubagentOrchestrator,
 )
 from kinetic_sdk.subagent.pool import (
+    FirstSuccessMerger,
+    MajorityVoteMerger,
+    MapPromptFor,
+    MapReduceOutcome,
     SubagentPool,
     SubagentResultMerger,
+    map_reduce_subagents,
     spawn_subagent_pool,
 )
 from kinetic_sdk.subagent.tool import DELEGATE_TOOL_NAME, DelegateTool
@@ -126,8 +131,13 @@ __all__ = [
     "SubagentFailurePolicy",
     "classify_subagent_error",
     "DELEGATE_TOOL_NAME",
+    "FirstSuccessMerger",
+    "MajorityVoteMerger",
+    "MapPromptFor",
+    "MapReduceOutcome",
     "DelegationTree",
     "SubagentNode",
+    "map_reduce_subagents",
     "reconstruct_delegation_tree",
     "AsyncDelegateTool",
     "AsyncLLMFactory",

@@ -1239,3 +1239,10 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   injects ONE "wrap up now" coaching turn when the shared budget is down to
   `BACK_PRESSURE_AT_REMAINING` (1) tool calls, so a child lands a best-effort
   partial result instead of being hard-blocked by `BudgetExceededError`.
+- **Map-reduce for sub-agents** (`subagent/pool.py`). `map_reduce_subagents`
+  runs ONE `SubagentSpec` concurrently over a list of items (each item ->
+  `task_prompt` via a `prompt_for(item, index)` callback) under one shared
+  `SpawnBudget`, preserving order / isolating worker failures, and returns a
+  `MapReduceOutcome(merged, results)`. Built-in mergers: verbatim join
+  (default), `FirstSuccessMerger` (first SUCCESS result), `MajorityVoteMerger`
+  (consensus over structured `data`/`choice`). Use only for independent items.

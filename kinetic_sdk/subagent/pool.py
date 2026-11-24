@@ -9,13 +9,19 @@ serial task.
 from __future__ import annotations
 
 import threading
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from typing import Any, Iterator, Protocol, Sequence
+from dataclasses import dataclass
+from typing import Any, Callable, Iterator, Protocol, Sequence
 
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.llm.client import LLMClient, LLMResponse, Message, StreamEvent
 from kinetic_sdk.subagent.budget import SpawnBudget
-from kinetic_sdk.subagent.delegation import DelegationResult, run_subagent
+from kinetic_sdk.subagent.delegation import (
+    DelegationResult,
+    SubagentStatus,
+    run_subagent,
+)
 from kinetic_sdk.subagent.manifest import SubagentSpec
 
 
@@ -188,3 +194,139 @@ def spawn_subagent_pool(
             parent._raise_answer_not_verified(merged, feedback)  # noqa: SLF001
 
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Map-reduce: run ONE spec over a list of items in parallel, then collapse.
+# ---------------------------------------------------------------------------
+
+
+def _result_vote_value(result: DelegationResult) -> str:
+    """A stable atom to vote on from a structured sub-agent result.
+
+    Prefers the structured ``data`` (a bare string, or a ``choice`` field of a
+    dict); falls back to the final message. Lets a MajorityVoteMerger work on
+    structured handoffs (from ``SubagentSpec.result_schema``).
+    """
+    data = result.data
+    if isinstance(data, str):
+        return data
+    if isinstance(data, dict):
+        choice = data.get("choice")
+        if isinstance(choice, str):
+            return choice
+        if "answer" in data and isinstance(data["answer"], str):
+            return data["answer"]
+    return result.final_message
+
+
+class FirstSuccessMerger:
+    """Return the FIRST succeeded result; otherwise the first non-None one.
+
+    Useful when the item generous redundancy (several workers answer the same
+    question) or when a single authoritative answer is enough.
+    """
+
+    def merge(self, results: Sequence[DelegationResult | None]) -> str:
+        first = next(
+            (r for r in results if r is not None and r.status is SubagentStatus.SUCCESS),
+            None,
+        )
+        if first is None:
+            first = next((r for r in results if r is not None), None)
+        return first.final_message if first is not None else ""
+
+
+class MajorityVoteMerger:
+    """Pick the most common value across structured results (ties -> earliest).
+
+    Votes come from :func:`_result_vote_value`. Use it to run several
+    independent sub-agents on the SAME question and take a consensus.
+    """
+
+    def merge(self, results: Sequence[DelegationResult | None]) -> str:
+        counts: Counter[str] = Counter()
+        order: dict[str, int] = {}
+        for rank, result in enumerate(results):
+            if result is None:
+                continue
+            value = _result_vote_value(result)
+            counts[value] += 1
+            order.setdefault(value, rank)
+        if not counts:
+            return ""
+        winner = max(counts, key=lambda value: (counts[value], -order[value]))
+        votes = counts[winner]
+        suffix = "s" if votes != 1 else ""
+        return f"{winner} ({votes} vote{suffix})"
+
+
+#: Map item (index) -> task prompt for a sub-agent.
+MapPromptFor = Callable[[Any, int], str]
+
+
+@dataclass
+class MapReduceOutcome:
+    """Result of :func:`map_reduce_subagents` (merged text + per-item results)."""
+
+    merged: str
+    results: list[DelegationResult | None]
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+
+def map_reduce_subagents(
+    parent: Agent,
+    spec: SubagentSpec,
+    items: Sequence[Any],
+    *,
+    prompt_for: MapPromptFor | None = None,
+    merger: SubagentResultMerger | None = None,
+    budget: SpawnBudget | None = None,
+    max_concurrency: int = 3,
+    llm_factory: Any | None = None,
+    timeout: float | None = None,
+) -> MapReduceOutcome:
+    """Run *spec* concurrently over *items* (map) and collapse the results (reduce).
+
+    Each item is turned into a ``task_prompt`` via ``prompt_for(item, index)``
+    (default ``str(item)``) and dispatched to its own sub-agent worker sharing
+    one ``SpawnBudget``. The per-item :class:`DelegationResult`s (order
+    preserved; ``None`` for a worker that raised) are then collapsed by
+    ``merger`` (default: a verbatim join, ``FirstSuccessMerger`` picks the
+    first success, ``MajorityVoteMerger`` takes a consensus of `data`).
+
+    Only for genuinely independent items — a single agent is cheaper for a
+    small serial task.
+    """
+    budget = budget or SpawnBudget()
+    base_override = (
+        _SerializedLLMClient(parent.llm)
+        if llm_factory is None and max_concurrency > 1
+        else None
+    )
+    results: list[DelegationResult | None] = [None] * len(items)
+
+    with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+        futures: dict[Future[DelegationResult], int] = {}
+        for index, item in enumerate(items):
+            task_prompt = prompt_for(item, index) if prompt_for is not None else str(item)
+            futures[executor.submit(
+                run_subagent,
+                parent,
+                spec,
+                task_prompt,
+                budget,
+                llm_factory=llm_factory,
+                _base_llm_override=base_override,
+            )] = index
+        for future in as_completed(list(futures), timeout=timeout):
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception:  # noqa: BLE001 - isolate one failing worker
+                results[index] = None
+
+    merger = merger or _default_merge
+    return MapReduceOutcome(merged=merger.merge(results), results=results)
