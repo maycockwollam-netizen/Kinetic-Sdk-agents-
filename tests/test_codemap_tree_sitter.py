@@ -62,6 +62,18 @@ def test_builder_use_tree_sitter_js(tmp_path) -> None:
     assert {"render", "Widget"} <= set(node.defines)
 
 
+def test_tree_sitter_captures_dynamic_imports() -> None:
+    # A dynamic import("...") inside a function body is still an import spec;
+    # `import` as a dynamic-call callee is the ``import`` token node, not an
+    # identifier, which previously slipped through.
+    imports, _ = _scan(
+        "javascript",
+        'export async function load() { const m = await import("./mod.js"); return m; }\n'
+        'function legacy() { const x = require("old"); return x; }\n',
+    )
+    assert set(imports) == {"./mod.js", "old"}
+
+
 def test_tree_sitter_only_extracts_top_level_definitions() -> None:
     imports, defines = _scan(
         "javascript",

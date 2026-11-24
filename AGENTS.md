@@ -1168,3 +1168,16 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   serialize as invalid JSON). `llm/usage.py` imports `math`.
 - **`tool/validation.py` module docstring updated** — it still said "No
   `$ref`, no combinators" after #118/#119 shipped them.
+- **`server/app.py` now serialises runs PER SESSION, not globally.** The old
+  code held the server-wide `_lock` for the whole `agent.run(...)` of any
+  session request, so one long run blocked every other session (and blocked
+  `_make_agent`, which needs that lock). New `_session_locks` map +
+  `_session_lock(session_id)` serialises only same-session runs on the shared
+  cached Agent; different sessions run concurrently. The WebSocket `/runs/stream`
+  path (which previously ran the cached agent with NO lock, racing the
+  non-reentrant `run()` guard) now takes the same per-session lock. Session
+  locks are dropped alongside their agent in `_purge_expired_sessions`.
+- **codemap tree-sitter captures dynamic `import("...")`.** The callee of a
+  dynamic import is the literal `import` token node, not an `identifier`, so
+  `_import_specs` (which matched `require`/`import` identifiers) missed it.
+  Now both are collected, including inside function bodies.

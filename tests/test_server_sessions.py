@@ -73,6 +73,64 @@ def test_server_rejects_nonpositive_resource_bounds():
         AgentServer(_factory, port=0, max_concurrent_requests=0)
 
 
+def test_different_sessions_run_concurrently():
+    """A long run in one session must not block a different session's run."""
+
+    def timing_factory(session_id: str | None = None) -> Agent:
+        if session_id == "slow":
+            def slow(messages, _tools, _system):
+                time.sleep(0.3)
+                return text_response("slow done")
+
+            return Agent(llm=MockLLMClient([slow]), permission_policy=PermissivePolicy())
+
+        def fast(messages, _tools, _system):
+            return text_response("fast done")
+
+        return Agent(llm=MockLLMClient([fast]), permission_policy=PermissivePolicy())
+
+    import threading
+
+    value = AgentServer(timing_factory, port=0)
+    try:
+        box: dict[str, object] = {}
+        thread = threading.Thread(
+            target=lambda: box.setdefault("slow", value._run_agent("s", stream=False, output_schema=None, session_id="slow"))
+        )
+        thread.start()
+        time.sleep(0.02)  # let the slow session start and hold its lock
+        started = time.monotonic()
+        fast_record = value._run_agent("f", stream=False, output_schema=None, session_id="fast")
+        elapsed = time.monotonic() - started
+        thread.join()
+        assert fast_record["status"] == "completed"
+        assert elapsed < 0.2, f"fast session blocked by slow session for {elapsed:.3f}s"
+    finally:
+        value._httpd.server_close()
+
+
+def test_same_session_serialises_runs():
+    """Two runs on ONE cached agent must still be serialised (no race)."""
+
+    def slow_factory(session_id: str | None = None) -> Agent:
+        def slow(messages, _tools, _system):
+            time.sleep(0.1)
+            return text_response("done")
+
+        return Agent(llm=MockLLMClient([slow] * 10), permission_policy=PermissivePolicy())
+
+    value = AgentServer(slow_factory, port=0)
+    try:
+        started = time.monotonic()
+        first = value._run_agent("a", stream=False, output_schema=None, session_id="same")
+        second = value._run_agent("b", stream=False, output_schema=None, session_id="same")
+        elapsed = time.monotonic() - started
+        assert first["status"] == "completed" and second["status"] == "completed"
+        assert elapsed >= 0.19, f"same-session runs overlapped: {elapsed:.3f}s"
+    finally:
+        value._httpd.server_close()
+
+
 def test_openai_completion_uses_model_as_session_id(server):
     root = f"http://127.0.0.1:{server.port}"
     result = _post(root + "/v1/chat/completions", {"model": "openai-session", "messages": [{"role": "user", "content": "hello"}], "stream": False})
