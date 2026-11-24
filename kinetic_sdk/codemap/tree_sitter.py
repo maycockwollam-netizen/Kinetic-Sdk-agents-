@@ -33,8 +33,13 @@ _IMPORT_NODES: dict[str, tuple[str, ...]] = {
 
 
 @functools.lru_cache(maxsize=None)
-def loaded_language(language: str) -> object | None:
-    """The tree-sitter ``Language`` for *language*, or ``None`` if unavailable."""
+def loaded_language(language: str, variant: str | None = None) -> object | None:
+    """The tree-sitter ``Language`` for *language*, or ``None`` if unavailable.
+
+    ``variant`` refines the grammar within one language family, currently only
+    ``".tsx"`` for ``typescript`` (JSX is not valid plain TypeScript, so the
+    TSX grammar must be picked per file).
+    """
     module = _GRAMMAR_MODULES.get(language)
     if module is None:
         return None
@@ -42,11 +47,14 @@ def loaded_language(language: str) -> object | None:
         imported = importlib.import_module(module)
         from tree_sitter import Language
 
-        # Most grammars expose ``language()``; tree-sitter-typescript exposes
-        # ``language_typescript()`` / ``language_tsx()`` instead.
-        getter = getattr(imported, "language", None)
-        if getter is None:
-            getter = getattr(imported, "language_typescript", None)
+        if variant == ".tsx" and module == "tree_sitter_typescript":
+            getter = getattr(imported, "language_tsx", None)
+        else:
+            # Most grammars expose ``language()``; tree-sitter-typescript
+            # exposes ``language_typescript()`` / ``language_tsx()``.
+            getter = getattr(imported, "language", None)
+            if getter is None:
+                getter = getattr(imported, "language_typescript", None)
         if getter is None:
             return None
         return Language(getter())
@@ -162,48 +170,83 @@ def _strip_quotes(text: str) -> str:
     return text.strip("\"'`").strip()
 
 
+#: Node type of each language's root, whose DIRECT children are top-level.
+_ROOT_TYPES: dict[str, tuple[str, ...]] = {
+    "javascript": ("program",),
+    "typescript": ("program",),
+    "rust": ("source_file",),
+    "go": ("source_file",),
+}
+
+
 class TreeSitterScanner:
     """Parse one non-Python source with tree-sitter and extract imports/defines.
 
     ``scan(language, text)`` returns ``(imports, defines)`` as sorted lists,
-    or ``None`` when the grammar for *language* is not installed.
+    or ``None`` when the grammar for *language* is not installed. Imports are
+    collected anywhere in the file, but only TOP-LEVEL declarations become
+    defines (nested functions/classes/consts are deliberately excluded).
+
+    ``variant`` refines the grammar per file (currently ``".tsx"`` for
+    ``typescript``) and is passed through to :func:`loaded_language`.
     """
 
     def __init__(self) -> None:
         self._parsers: dict[str, object] = {}
 
-    def available(self, language: str) -> bool:
-        return language in _GRAMMAR_MODULES and loaded_language(language) is not None
+    def available(self, language: str, variant: str | None = None) -> bool:
+        return language in _GRAMMAR_MODULES and loaded_language(language, variant) is not None
 
-    def scan(self, language: str, text: str) -> tuple[list[str], list[str]] | None:
-        parser = self._parser(language)
+    def scan(
+        self, language: str, text: str, variant: str | None = None
+    ) -> tuple[list[str], list[str]] | None:
+        parser = self._parser(language, variant)
         if parser is None:
             return None
 
         tree = parser.parse(text.encode("utf-8"))  # type: ignore[attr-defined]
         imports: set[str] = set()
         defines: set[str] = set()
-        self._walk(tree.root_node, language, imports, defines)  # type: ignore[attr-defined]
+        self._walk(tree.root_node, language, imports, defines, top_level=True)  # type: ignore[attr-defined]
         return sorted(imports), sorted(defines)
 
-    def _parser(self, language: str) -> object | None:
-        if language in self._parsers:
-            return self._parsers[language]
-        loaded = loaded_language(language)
+    def _parser(self, language: str, variant: str | None = None) -> object | None:
+        key = f"{language}:{variant or ''}"
+        if key in self._parsers:
+            return self._parsers[key]
+        loaded = loaded_language(language, variant)
         if loaded is None:
             return None
         from tree_sitter import Parser
 
         parser = Parser(loaded)  # type: ignore[arg-type]  # starts as a Language at runtime
-        self._parsers[language] = parser
+        self._parsers[key] = parser
         return parser
 
     def _walk(
-        self, node: object, language: str, imports: set[str], defines: set[str]
+        self,
+        node: object,
+        language: str,
+        imports: set[str],
+        defines: set[str],
+        *,
+        top_level: bool,
     ) -> None:
         node_type = node.type  # type: ignore[attr-defined]
         if node_type in _IMPORT_NODES[language]:
             imports.update(_import_specs(language, node))
-        defines.update(_define_names(language, node))
+        if top_level:
+            defines.update(_define_names(language, node))
+        # Definitions stay top-level only under the file root and, for
+        # javascript/typescript, under an ``export`` wrapper whose declaration
+        # IS a top-level item; anything deeper (function/class bodies, blocks)
+        # never collects definitions.
+        keep_top_level = top_level and (
+            node_type in _ROOT_TYPES[language]
+            or (
+                language in ("javascript", "typescript")
+                and node_type == "export_statement"
+            )
+        )
         for child in node.children:  # type: ignore[attr-defined]
-            self._walk(child, language, imports, defines)  # type: ignore[attr-defined]
+            self._walk(child, language, imports, defines, top_level=keep_top_level)  # type: ignore[attr-defined]

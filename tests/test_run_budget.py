@@ -280,3 +280,10 @@ def test_cost_record_ignores_non_finite() -> None:
     budget.record({"cost_usd": float("nan")})
     budget.record({"cost_usd": float("inf")})
     assert budget.used_cost_usd == 0.0
+
+
+def test_cost_record_ignores_negative_values() -> None:
+    budget = RunBudget(max_total_cost_usd=1.0)
+    budget.record({"cost_usd": -0.5})
+    budget.record({"cost_usd": -100})
+    assert budget.used_cost_usd == 0.0

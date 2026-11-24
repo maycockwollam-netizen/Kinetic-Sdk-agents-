@@ -168,3 +168,30 @@ def test_orchestrator_timeout_returns_failed_results_for_pending() -> None:
     assert len(results) == 1
     assert results[0].success is False
     assert "timed out" in results[0].error
+
+
+def test_orchestrator_timeout_is_a_hard_deadline() -> None:
+    """run() returns at the deadline instead of waiting for in-flight workers."""
+    import time
+
+    specs = {"slow": SubagentSpec(name="slow", system_prompt="p", description="d", model="slow")}
+
+    def slow_llm(model: str) -> MockLLMClient:
+        def slow(messages, tools, system):  # type: ignore[no-untyped-def]
+            time.sleep(0.3)
+            return text_response("done")
+
+        return MockLLMClient([slow])
+
+    start = time.monotonic()
+    results = SubagentOrchestrator(_parent(), specs, max_concurrency=1).run(
+        [OrchestrationTask(task="t", subagent="slow")],
+        budget=SpawnBudget(100),
+        llm_factory=slow_llm,
+        timeout=0.01,
+    )
+    elapsed = time.monotonic() - start
+    # Returned immediately at the deadline — long before the 0.3s worker ends.
+    assert elapsed < 0.2
+    assert results[0].success is False
+    assert "timed out" in results[0].error

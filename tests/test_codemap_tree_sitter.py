@@ -62,6 +62,47 @@ def test_builder_use_tree_sitter_js(tmp_path) -> None:
     assert {"render", "Widget"} <= set(node.defines)
 
 
+def test_tree_sitter_only_extracts_top_level_definitions() -> None:
+    imports, defines = _scan(
+        "javascript",
+        "function outer() {\n  function inner() {}\n  const local = 123;\n}\n"
+        "export function render() {}\nclass Widget { method() {} }\n",
+    )
+    assert {"outer", "render", "Widget"} <= set(defines)
+    assert "inner" not in defines
+    assert "local" not in defines
+    assert "method" not in defines
+
+    _, rust_defines = _scan(
+        "rust",
+        "fn main() { fn helper() {} }\nstruct S {}\nmod m { fn nested() {} }\n",
+    )
+    assert {"main", "S"} <= set(rust_defines)
+    assert "helper" not in rust_defines
+    assert "nested" not in rust_defines
+
+
+def test_tree_sitter_tsx_uses_the_tsx_grammar() -> None:
+    jssx = "export const App = () => <div>{x}</div>;\n"
+    # Plain TypeScript grammar cannot parse JSX -> nothing extracted.
+    assert _scan("typescript", jssx) == ([], [])
+    # The ".tsx" variant uses the TSX grammar and extracts the declaration.
+    scanner = TreeSitterScanner()
+    tsx = scanner.scan("typescript", jssx, variant=".tsx")
+    assert tsx is not None
+    imports, defines = tsx
+    assert imports == []
+    assert defines == ["App"]
+
+
+def test_builder_use_tree_sitter_tsx(tmp_path) -> None:
+    write = _writer(tmp_path)
+    write("app.tsx", "export const App = () => <div>{x}</div>;\n")
+    cm = build_codebase_map(tmp_path, languages=("typescript",), use_tree_sitter=True)
+    node = next(n for n in cm.modules if n.module_name == "app")
+    assert node.defines == ("App",)
+
+
 def _writer(root):
     def write(path: str, content: str) -> None:
         target = root / path

@@ -14,7 +14,7 @@ SDK inside the KINETIC coding agent. Architecture is inspired by OpenHands
   NotRequired` at import time) — the extra caps it to `<1.98.0` on
   `python_version < '3.11'` until upstream fixes; revisit the cap later.
 - Install (real tokenizer, optional): `pip install -e ".[tokens]"` (tiktoken)
-- Run tests: `python -m pytest -q` (~1400 unit tests + 4 integration deselected
+- Run tests: `python -m pytest -q` (~1450 unit tests + 4 integration deselected
   by default — see "Integration tests" below). NOTE: the litellm tests need
   the `[llm]` extra — install BOTH (`pip install -e ".[dev,llm]"`) or 11
   tests error. The tiktoken tests `importorskip` without `[tokens]`.
@@ -1110,5 +1110,46 @@ future agents should know about:
 - mcp/: resources + prompts capabilities (server registries + handlers,
   MCPClient.list_resources/read_resource/list_prompts/get_prompt).
 - codemap/: build_codebase_map(languages=...) scans javascript/typescript/rust/
-  go via best-effort structural import/define extractors (tree-sitter call
-  graph still future work).
+  go via best-effort structural import/define extractors; exact tree-sitter
+  scanning shipped later (see Stage 8).
+
+## Stage 8 (Audit backlog 2, 2026-11-24 — DONE)
+
+Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
+
+- **`subagent/orchestrator.py` `timeout` is now a HARD deadline.** Two PRs touch
+  this: #118 turned a missing-key crash into per-task `"batch timed out"`
+  results; this pass removed the `with ThreadPoolExecutor` block that made
+  `__exit__` wait for in-flight workers AFTER the deadline. Now a timeout
+  calls `executor.shutdown(wait=False, cancel_futures=True)` so `run()` returns
+  at the deadline. Running sub-agents finish in background daemon threads (their
+  shared-budget/event side effects persist), queued tasks are cancelled, and
+  late results are never collected.
+- **Negative `cost_usd` is rejected everywhere.** #118 already rejected
+  NaN/Infinity; this pass adds the `>= 0` guard: `RunBudget.record` IGNORES a
+  negative cost (same silent-skip as non-finite), `SpawnBudget.record_cost`
+  raises `ValueError`. A negative cost could previously shrink the counter and
+  let spend continue past a real cap.
+- **`VectorMemory._persist` race condition fixed.** The snapshot used to be
+  taken under `_lock` then released before serialize+`os.replace`, so a
+  concurrent writer could rename an OLDER snapshot last and drop newer entries
+  from disk. New `_persist_lock` covers snapshot -> serialize -> rename; the
+  data `_lock` is only used for the snapshot itself (disk I/O stays off the hot
+  path). Deterministic regression test pins the old interleaving.
+- **CodeMap exact tree-sitter scanning (P3 from the audit, #119) + scope fix.**
+  `codemap/tree_sitter.py` `TreeSitterScanner` parses javascript/typescript/
+  rust/go grammatically. This pass makes `_walk` SCOPE-AWARE: only the file
+  root's children (and JS/TS `export_statement` wrappers) yield definitions —
+  nested functions/classes/consts are excluded, matching the Python `_defines`
+  contract. `.tsx` files now parse with the `language_tsx()` grammar via a
+  `variant` parameter (`scan(language, text, variant=...)` / builder passes the
+  file suffix); plain TypeScript grammar cannot parse JSX.
+- **`agent/async_agent.py` + `workspace/docker.py` #120/#121:** DockerWorkspace
+  gained a default per-command timeout (#120); #121 added a non-reentrant
+  `run()` guard, per-call absolute deadlines for parallel tool submits,
+  FileTool read-modify-write under the file lease, docker `-e KEY=value`
+  (never bare `-e KEY`), and RemoteAPIWorkspace refusing plaintext http to
+  non-loopback hosts.
+- Tool tests: tree-sitter needs the `[codemap]` extra (`importorskip` otherwise);
+  the two new regression tests (vector persist race, orchestrator hard
+  deadline) pass with the fixes and FAIL against the pre-fix code.

@@ -134,8 +134,11 @@ class SpawnBudget:
             isinstance(cost_usd, bool)
             or not isinstance(cost_usd, (int, float))
             or not math.isfinite(float(cost_usd))
+            or float(cost_usd) < 0
         ):
-            raise ValueError(f"cost_usd must be a finite number, got {cost_usd!r}")
+            raise ValueError(
+                f"cost_usd must be a finite non-negative number, got {cost_usd!r}"
+            )
         with self._lock:
             if self._max_cost is not None and self._used_cost + cost_usd > self._max_cost:
                 raise CostExceededError(

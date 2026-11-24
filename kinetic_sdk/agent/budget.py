@@ -140,6 +140,7 @@ class RunBudget:
                 isinstance(cost, (int, float))
                 and not isinstance(cost, bool)
                 and math.isfinite(float(cost))
+                and float(cost) >= 0
             ):
                 self._used_cost += float(cost)
 

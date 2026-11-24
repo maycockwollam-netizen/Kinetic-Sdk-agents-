@@ -179,7 +179,9 @@ def build_codebase_map(
                     nodes.append(ModuleNode(relative, module_name, (), ()))
                     skipped.append(relative)
                     continue
-                scanned = _TREE_SITTER.scan(lang, text) if use_tree_sitter else None
+                # The file suffix picks the grammar variant (e.g. ".tsx" needs
+                # the TSX grammar, not plain TypeScript).
+                scanned = _TREE_SITTER.scan(lang, text, variant=absolute.suffix) if use_tree_sitter else None
                 if scanned is not None:
                     imports, defines = scanned
                 else:
