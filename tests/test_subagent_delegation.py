@@ -16,6 +16,7 @@ from kinetic_sdk.subagent import (
     SpawnBudget,
     SubagentError,
     SubagentSpec,
+    SubagentStatus,
     agent_id_for,
     run_subagent,
     spawn_subagent,
@@ -403,3 +404,51 @@ def test_subagent_charges_cost_from_usage() -> None:
     assert result.final_message == "child done"
     assert budget.used_cost_usd == pytest.approx(0.012)
     assert budget.used_tokens == 15
+
+
+def test_structured_result_carries_data_and_status() -> None:
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["success", "needs_more_info", "out_of_scope", "error"],
+            },
+            "reason": {"type": "string"},
+        },
+        "required": ["status"],
+        "additionalProperties": False,
+    }
+    spec = SubagentSpec(
+        name="structured",
+        system_prompt="You answer with JSON only.",
+        description="d",
+        result_schema=result_schema,
+    )
+    child_llm = MockLLMClient(
+        [
+            text_response(
+                '{"status": "needs_more_info", "reason": "need the file paths"}'
+            )
+        ]
+    )
+    parent = Agent(llm=child_llm, permission_policy=PermissivePolicy())
+    result = run_subagent(
+        parent, spec, "figure out what is missing", SpawnBudget(100)
+    )
+
+    assert result.status is SubagentStatus.NEEDS_MORE_INFO
+    assert result.data == {"status": "needs_more_info", "reason": "need the file paths"}
+    assert "need the file paths" in result.final_message
+
+
+def test_plain_text_handoff_keeps_success_status_when_no_schema() -> None:
+    spec = SubagentSpec(name="plain", system_prompt="p", description="d")
+    parent = Agent(
+        llm=MockLLMClient([text_response("plain done")]),
+        permission_policy=PermissivePolicy(),
+    )
+    result = run_subagent(parent, spec, "go", SpawnBudget(100))
+    assert result.status is SubagentStatus.SUCCESS
+    assert result.data is None
+    assert result.final_message == "plain done"

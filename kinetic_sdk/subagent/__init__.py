@@ -68,6 +68,7 @@ from kinetic_sdk.subagent.budget import (
 from kinetic_sdk.subagent.delegation import (
     DelegationResult,
     LLMFactory,
+    SubagentStatus,
     agent_id_for,
     run_subagent,
     spawn_subagent,
@@ -114,6 +115,7 @@ __all__ = [
     "OrchestrationResult",
     "OrchestrationTask",
     "SubagentOrchestrator",
+    "SubagentStatus",
     "DELEGATE_TOOL_NAME",
     "AsyncDelegateTool",
     "AsyncLLMFactory",

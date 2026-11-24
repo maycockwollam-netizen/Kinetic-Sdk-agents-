@@ -22,9 +22,9 @@ budget instance) — that is how multi-level trees share one budget.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
-from kinetic_sdk.security.redact import redact_secrets
+from kinetic_sdk.security.redact import redact_secrets, redact_value
 from kinetic_sdk.subagent.budget import (
     DEFAULT_MAX_CONSECUTIVE_REPEATS,
     SpawnBudget,
@@ -220,12 +220,16 @@ class DelegateTool(Tool):
         except Exception as exc:  # noqa: BLE001 - never sink the parent's loop
             logger.exception("Delegation to %r failed", spec.name)
             return ToolResult(error=f"{type(exc).__name__}: {exc}")
-        return ToolResult(
-            output={
-                "subagent": spec.name,
-                "agent_id": result.agent_id,
-                # Redacted before entering the parent's context: the
-                # sub-agent's final message may quote secrets it handled.
-                "final_message": redact_secrets(result.final_message),
-            }
-        )
+        output: dict[str, Any] = {
+            "subagent": spec.name,
+            "agent_id": result.agent_id,
+            "status": result.status.value,
+            # Redacted before entering the parent's context: the sub-agent's
+            # final message (and structured data) may quote secrets it handled.
+            "final_message": redact_secrets(result.final_message),
+        }
+        if result.data is not None:
+            output["data"] = redact_value(result.data)
+        if result.error is not None:
+            output["error"] = result.error
+        return ToolResult(output=output)

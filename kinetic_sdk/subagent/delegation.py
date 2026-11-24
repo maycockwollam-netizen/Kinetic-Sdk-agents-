@@ -43,6 +43,7 @@ import uuid
 import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from kinetic_sdk.agent.agent import Agent
@@ -93,6 +94,32 @@ def agent_id_for(agent: Agent) -> str:
         return known
 
 
+#: Parent-visible outcome of a sub-agent delegation. Sub-agents with a
+#: ``result_schema`` may signal ``needs_more_info`` / ``out_of_scope`` by
+#: emitting those literal strings as the ``status`` field of their result
+#: object; the other values are assigned by ``run_subagent``.
+class SubagentStatus(str, Enum):  # noqa: D101 - values are self-explanatory
+    SUCCESS = "success"
+    NEEDS_MORE_INFO = "needs_more_info"
+    OUT_OF_SCOPE = "out_of_scope"
+    ERROR = "error"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    REPETITION_LIMIT = "repetition_limit"
+    #: Reserved for a wall-clock per-subagent timeout (later version).
+    TIMED_OUT = "timed_out"
+
+
+def _status_from_data(data: Any) -> SubagentStatus | None:
+    """Return the explicit outcome a sub-agent put in its result, if any."""
+    if isinstance(data, dict):
+        value = data.get("status")
+        if isinstance(value, str):
+            for status in SubagentStatus:
+                if status.value == value:
+                    return status
+    return None
+
+
 @dataclass(frozen=True)
 class DelegationResult:
     """What the parent receives after a sub-agent run: the outcome boundary.
@@ -103,10 +130,20 @@ class DelegationResult:
             parent's context.
         agent_id: Stable id of the spawned sub-agent (matches the audit
             trail's ``agent_id``).
+        status: Outcome classifier for the parent (see :class:`SubagentStatus`).
+            ``success`` is the default; a sub-agent with a ``result_schema``
+            may report ``needs_more_info`` / ``out_of_scope`` via the
+            ``status`` field of its structured result.
+        data: The parsed structured result when ``SubagentSpec.result_schema``
+            was set (``None`` otherwise or when parsing failed).
+        error: Failure detail when ``status`` is ``error`` / a guardrail.
     """
 
     final_message: str
     agent_id: str
+    status: SubagentStatus = SubagentStatus.SUCCESS
+    data: Any = None
+    error: str | None = None
 
 
 class _GuardedLLMClient(LLMClient):
@@ -434,8 +471,26 @@ def run_subagent(
         isolate_tools=isolate_tools,
     )
     agent_id = agent_id_for(sub_agent)
+    status = SubagentStatus.SUCCESS
+    data: Any = None
+    error: str | None = None
     try:
-        final_message = sub_agent.run(task_prompt)
+        if spec.result_schema:
+            # Structured handoff: the child is asked to return a value that
+            # matches `result_schema`; the parsed value rides back in `data`.
+            final_message = sub_agent.run(task_prompt, output_schema=spec.result_schema)
+            data = sub_agent.structured_output
+            explicit = _status_from_data(data)
+            if explicit is not None:
+                status = explicit
+            elif data is None:
+                # A schema was requested but not produced (parse/validate
+                # failed after the retries) — surface it as an error, not a
+                # silent success.
+                status = SubagentStatus.ERROR
+                error = "sub-agent did not produce a result matching result_schema"
+        else:
+            final_message = sub_agent.run(task_prompt)
     except BudgetExceededError as exc:
         _audit_finish(parent_agent, spec, agent_id, "budget_exceeded", str(exc))
         raise
@@ -448,4 +503,10 @@ def run_subagent(
         )
         raise
     _audit_finish(parent_agent, spec, agent_id, "completed", final_message)
-    return DelegationResult(final_message=final_message, agent_id=agent_id)
+    return DelegationResult(
+        final_message=final_message,
+        agent_id=agent_id,
+        status=status,
+        data=data,
+        error=error,
+    )

@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from kinetic_sdk.skills.exceptions import SkillParseError
 from kinetic_sdk.skills.skill import (
@@ -62,6 +63,14 @@ class SubagentSpec:
             spawned agent receives ONLY these tools — the tool names refer
             to tools registered on the parent (e.g. ``glob``, ``grep``,
             ``file_editor``, ``delegate``).
+        result_schema: Optional JSON Schema (the subset validated by
+            ``kinetic_sdk.tool.validation``) the sub-agent's FINAL answer
+            must satisfy. When set, the child runs with ``output_schema=``
+            and the parsed value is exposed as
+            :attr:`~kinetic_sdk.subagent.delegation.DelegationResult.data`
+            (with ``status`` derived from the result's ``status`` field when
+            it carries one). ``None`` keeps the historical plain-text
+            ``final_message`` handoff.
     """
 
     name: str
@@ -69,6 +78,7 @@ class SubagentSpec:
     description: str = ""
     model: str | None = None
     tools: tuple[str, ...] = ()
+    result_schema: dict[str, Any] | None = None
 
     def to_markdown(self) -> str:
         """Serialize this spec back to flat-frontmatter Markdown.
@@ -100,6 +110,11 @@ class SubagentSpec:
             raise SubagentSpecError(
                 f"Sub-agent {self.name!r} must declare a non-empty system_prompt "
                 "(sub-agents never inherit the parent's system message)"
+            )
+        if self.result_schema is not None and not isinstance(self.result_schema, dict):
+            raise SubagentSpecError(
+                f"Sub-agent {self.name!r} result_schema must be a JSON Schema "
+                "object, got {self.result_schema!r}"
             )
 
 

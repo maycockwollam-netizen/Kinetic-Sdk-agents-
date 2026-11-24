@@ -15,6 +15,7 @@ from kinetic_sdk.subagent import (
     SpawnBudget,
     SubagentError,
     SubagentSpec,
+    SubagentStatus,
     async_agent_id_for,
     run_async_subagent,
     spawn_async_subagent,
@@ -212,6 +213,38 @@ async def test_async_agent_auto_upgrades_sync_delegate_tool():
     )
     parent2.add_tool(SyncDelegateTool([_spec("worker2")]))
     assert isinstance(parent2._tools["delegate"], AsyncDelegateTool)
+
+
+async def test_async_structured_result_carries_status():
+    result_schema = {
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["success", "needs_more_info", "out_of_scope", "error"],
+            },
+            "reason": {"type": "string"},
+        },
+        "required": ["status"],
+        "additionalProperties": False,
+    }
+    spec = SubagentSpec(
+        name="structured",
+        system_prompt="p",
+        description="d",
+        result_schema=result_schema,
+    )
+    parent = AsyncAgent(
+        llm=AsyncMockLLMClient(
+            [_done('{"status": "out_of_scope", "reason": "not my expertise"}')]
+        ),
+        permission_policy=PermissivePolicy(),
+    )
+    result = await run_async_subagent(
+        parent, spec, "do it", SpawnBudget(100)
+    )
+    assert result.status is SubagentStatus.OUT_OF_SCOPE
+    assert result.data == {"status": "out_of_scope", "reason": "not my expertise"}
 
 
 async def test_async_delegate_tool_sync_execute_raises():
