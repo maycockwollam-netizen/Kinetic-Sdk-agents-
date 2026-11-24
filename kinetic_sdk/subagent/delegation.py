@@ -82,6 +82,31 @@ SubagentFailurePolicy = Callable[
 ]
 
 
+def unwrap_guarded_client(client: LLMClient) -> LLMClient:
+    """Strip guard layers from *client* so a client is never charged twice.
+
+    Handles a :class:`_GuardedLLMClient` directly and any wrapper exposing an
+    ``inner`` / ``_inner`` attribute whose innermost client is a guard (e.g.
+    the pool's ``_SerializedLLMClient`` wrapping an already-guarded parent
+    client). Used before wrapping a fresh guard so ``charge_root_tool_calls``
+    + delegation don't double-count tool calls into the shared
+    ``SpawnBudget``.
+    """
+    seen: set[int] = set()
+    while True:
+        if isinstance(client, _GuardedLLMClient):
+            client = client.inner  # type: ignore[assignment]
+            continue
+        inner = getattr(client, "inner", None)
+        if inner is None:
+            inner = getattr(client, "_inner", None)
+        if isinstance(inner, _GuardedLLMClient) and id(inner) not in seen:
+            seen.add(id(inner))
+            client = inner  # type: ignore[assignment]
+            continue
+        return client
+
+
 def classify_subagent_error(exc: Exception) -> "SubagentStatus":
     """Map a delegation exception to a :class:`SubagentStatus`.
 
@@ -382,12 +407,12 @@ def spawn_subagent(
     entry naming the outcome.
     """
     base_llm = _base_llm_override if _base_llm_override is not None else parent_agent.llm
-    if isinstance(base_llm, _GuardedLLMClient):
-        # Never stack guards: when a sub-agent spawns its own sub-agent, the
-        # parent's client is already guarded — wrapping it again would charge
-        # every call twice and would feed the child's calls into the parent's
-        # circuit breaker (breakers must stay strictly per-agent).
-        base_llm = base_llm.inner
+    # Never stack guards: when a sub-agent spawns its own sub-agent (or the
+    # pool/orchestrator wraps an already-guarded parent client in a
+    # serialising wrapper), the client may already carry a guard. Strip those
+    # layers — wrapping again would charge every call twice and would feed the
+    # child's calls into the parent's circuit breaker (breakers stay per-agent).
+    base_llm = unwrap_guarded_client(base_llm)
     requested_model = spec.model or getattr(base_llm, "model", None)
     if llm_factory is not None:
         if requested_model is None:

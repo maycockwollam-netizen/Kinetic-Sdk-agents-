@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import time
+import weakref
 from typing import Any
 
 from kinetic_sdk.tool.base import Tool, ToolResult
@@ -66,7 +67,10 @@ class BrowserTool(Tool):
         self._active_index = 0
         self._console_logs: list[dict[str, str]] = []
         self._network_requests: list[dict[str, Any]] = []
-        self._request_started: dict[int, float] = {}
+        #: Weak-map of in-flight request object -> start time. Keying by the object
+        # (not ``id()``) means aborted requests never leak and a GC-recycled
+        # ``id()`` can never be attributed to a different request.
+        self._request_started: "weakref.WeakKeyDictionary[Any, float]" = weakref.WeakKeyDictionary()
         self._downloads: list[dict[str, str]] = []
         # "local" | "docker-cdp" — recorded after the first launch.
         self.launch_mode = "local"
@@ -228,11 +232,11 @@ class BrowserTool(Tool):
         self._console_logs.append({"type": message.type, "text": message.text})
 
     def _record_request_start(self, request: Any) -> None:
-        self._request_started[id(request)] = time.monotonic()
+        self._request_started[request] = time.monotonic()
 
     def _record_response(self, response: Any) -> None:
         request = response.request
-        started = self._request_started.pop(id(request), time.monotonic())
+        started = self._request_started.pop(request, time.monotonic())
         self._network_requests.append(
             {"url": request.url, "method": request.method, "status": response.status,
              "duration": round(time.monotonic() - started, 4)}

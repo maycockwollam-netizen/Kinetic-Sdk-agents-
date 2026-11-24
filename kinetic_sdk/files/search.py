@@ -256,6 +256,11 @@ class GrepTool(_WorkspaceSearchTool):
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
             returncode = process.wait()
+            if process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except (OSError, ValueError):
+                    pass
         if returncode not in (0, 1, -signal.SIGTERM):
             raise WorkspaceError("ripgrep failed")
         return matches

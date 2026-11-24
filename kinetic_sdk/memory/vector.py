@@ -138,6 +138,9 @@ class VectorMemory(MemoryProvider):
                     [vector for _index, _entry, vector in filtered],
                     limit,
                 )
+                # Match the pure-Python fallback: drop non-positive scores so
+                # both ranking paths agree on what counts as a match.
+                ranked = [(index, score) for index, score in ranked if score > 0]
                 by_index = {index: entry for index, entry, _vector in filtered}
                 return [by_index[index] for index, _score in ranked]
             except Exception:  # noqa: BLE001 - ranking must never break search

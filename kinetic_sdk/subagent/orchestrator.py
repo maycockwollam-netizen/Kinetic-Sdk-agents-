@@ -41,7 +41,7 @@ from typing import Any, Mapping, Sequence
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.event.bus import Event, EventBus
 from kinetic_sdk.subagent.budget import SpawnBudget
-from kinetic_sdk.subagent.delegation import run_subagent
+from kinetic_sdk.subagent.delegation import run_subagent, unwrap_guarded_client
 from kinetic_sdk.subagent.manifest import SubagentSpec
 
 
@@ -154,7 +154,7 @@ class SubagentOrchestrator:
         if llm_factory is None and self.max_concurrency > 1:
             from kinetic_sdk.subagent.pool import _SerializedLLMClient
 
-            base_llm_override = _SerializedLLMClient(self.parent.llm)
+            base_llm_override = _SerializedLLMClient(unwrap_guarded_client(self.parent.llm))
 
         results: dict[int, OrchestrationResult] = {}
         executor = ThreadPoolExecutor(max_workers=self.max_concurrency)
@@ -175,10 +175,11 @@ class SubagentOrchestrator:
                     if not success and max(retry_on_failure, 0) >= 1:
                         # One retry, same spec, then give up.
                         self._bump_retry(index, task)
-                        a2, s2, f2, e2, _ = self._run_attempt(
+                        a2, s2, f2, e2, retry_agent_id = self._run_attempt(
                             task, budget, llm_factory, base_llm_override
                         )
                         attempts, success, final, error = attempts + a2, s2, f2, e2
+                        agent_id = retry_agent_id  # keep the agent that actually produced the result
                     self._bump_finished(index, task, success=success, error=None if success else error)
                     results[index] = OrchestrationResult(
                         task=task,

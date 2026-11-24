@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from urllib.request import Request
+
+import pytest
+
 from kinetic_sdk.web import WebFetchResponse, WebFetchTool
+from kinetic_sdk.web.tool import WebFetchError, _SSRFRedirectHandler
 
 
 def _fake_fetcher(payload: str, status: int = 200, content_type: str = "text/html"):
@@ -58,6 +63,15 @@ def test_rejects_non_http_scheme() -> None:
     assert r.is_error and "only http(s)" in r.error
     r2 = tool.execute(url="ftp://example.com/x")
     assert r2.is_error
+
+
+def test_redirect_handler_rejects_private_target() -> None:
+    # A public page redirecting to a private/cloud-metadata host must be cut.
+    handler = _SSRFRedirectHandler(())
+    with pytest.raises(WebFetchError, match="redirect refused"):
+        handler.redirect_request(
+            Request("http://example.com/page"), None, 302, "Found", {}, "http://169.254.169.254/latest/meta-data"
+        )
 
 
 def test_allowed_host_short_circuits_ssrf_check() -> None:

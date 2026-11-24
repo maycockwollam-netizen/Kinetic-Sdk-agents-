@@ -18,6 +18,7 @@ never breaks a run.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Protocol
 
 from kinetic_sdk.llm.client import LLMClient
@@ -110,6 +111,11 @@ class LLMMemoryConsolidator:
         return summary
 
 
+#: Serialises read -> summarise -> add -> delete so two concurrent
+#: consolidations cannot both fold the same episodic batch into duplicates.
+_consolidation_lock = threading.Lock()
+
+
 def consolidate_episodic(
     provider: MemoryProvider,
     consolidator: MemoryConsolidator | None,
@@ -131,6 +137,15 @@ def consolidate_episodic(
     """
     if consolidator is None:
         return None, 0
+    with _consolidation_lock:
+        return _consolidate_locked(provider, consolidator, scope)
+
+
+def _consolidate_locked(
+    provider: MemoryProvider,
+    consolidator: MemoryConsolidator,
+    scope: dict[str, str] | None,
+) -> tuple[str | None, int]:
     episodic = provider.all(tiers={MemoryTier.EPISODIC}, scope=scope)
     if not episodic:
         return None, 0

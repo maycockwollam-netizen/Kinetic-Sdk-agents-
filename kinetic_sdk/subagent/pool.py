@@ -21,6 +21,7 @@ from kinetic_sdk.subagent.delegation import (
     DelegationResult,
     SubagentStatus,
     run_subagent,
+    unwrap_guarded_client,
 )
 from kinetic_sdk.subagent.manifest import SubagentSpec
 
@@ -108,7 +109,7 @@ class SubagentPool:
         executor waits for them on shutdown.
         """
         base_llm_override = (
-            _SerializedLLMClient(parent.llm)
+            _SerializedLLMClient(unwrap_guarded_client(parent.llm))
             if llm_factory is None and self.max_concurrency > 1
             else None
         )
@@ -302,7 +303,7 @@ def map_reduce_subagents(
     """
     budget = budget or SpawnBudget()
     base_override = (
-        _SerializedLLMClient(parent.llm)
+        _SerializedLLMClient(unwrap_guarded_client(parent.llm))
         if llm_factory is None and max_concurrency > 1
         else None
     )

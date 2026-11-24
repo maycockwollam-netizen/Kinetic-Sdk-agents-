@@ -174,6 +174,20 @@ def test_spawn_pool_forwards_llm_factory() -> None:
     assert built_models == [parent.llm.model]
 
 
+def test_unwrap_guarded_client_through_serialized_wrapper() -> None:
+    from kinetic_sdk.subagent.budget import RepetitionCircuitBreaker, SpawnBudget
+    from kinetic_sdk.subagent.delegation import _GuardedLLMClient, unwrap_guarded_client
+
+    base = MockLLMClient([])
+    guarded = _GuardedLLMClient(
+        base, budget=SpawnBudget(100), breaker=RepetitionCircuitBreaker(3), agent_id="a"
+    )
+    serialized = _SerializedLLMClient(guarded)  # pool wraps a guarded parent client
+    assert unwrap_guarded_client(serialized) is base
+    assert unwrap_guarded_client(guarded) is base
+    assert unwrap_guarded_client(base) is base  # plain client unchanged
+
+
 def test_map_reduce_runs_items_and_joins() -> None:
     def handler(messages, tools, system):  # type: ignore[no-untyped-def]
         last = next(

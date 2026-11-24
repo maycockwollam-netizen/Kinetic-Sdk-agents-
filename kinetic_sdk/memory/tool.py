@@ -178,7 +178,11 @@ class MemoryForgetTool(Tool):
             return ToolResult(error="refusing to delete persistent memory by scope; delete a specific id instead")
         before = len(self.provider.all(tiers=parsed_tiers, scope=scope, include_expired=True))
         self.provider.clear(scope, tiers=parsed_tiers)
-        return ToolResult(output={"deleted": before, "scope": scope})
+        # Count the actual deletions from a post-clear read, so a concurrent
+        # insertion between the count and the clear isn't misreported either
+        # way.
+        after = len(self.provider.all(tiers=parsed_tiers, scope=scope, include_expired=True))
+        return ToolResult(output={"deleted": max(0, before - after), "scope": scope})
 
 
 def _parse_tiers(values: list[str] | None) -> set[MemoryTier] | None:

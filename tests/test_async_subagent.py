@@ -277,6 +277,24 @@ async def test_async_back_pressure_injects_wrap_up():
     )
 
 
+async def test_async_factory_called_for_inherited_model():
+    # spec.model is None (the common case) — the factory must still build a
+    # per-worker client (mirroring the sync spawn), NOT silently share one.
+    built: list[str] = []
+
+    def factory(model: str) -> AsyncMockLLMClient:
+        built.append(model)
+        return AsyncMockLLMClient([_done("ok")])
+
+    parent = AsyncAgent(llm=AsyncMockLLMClient([]), permission_policy=PermissivePolicy())
+    spec = SubagentSpec(name="w", system_prompt="p", description="d")
+    result = await run_async_subagent(
+        parent, spec, "t", SpawnBudget(100), llm_factory=factory
+    )
+    assert built, "llm_factory was not called for an inherited model"
+    assert result.final_message == "ok"
+
+
 async def test_async_delegate_tool_sync_execute_raises():
     tool = AsyncDelegateTool([_spec()])
     with pytest.raises(NotImplementedError):
