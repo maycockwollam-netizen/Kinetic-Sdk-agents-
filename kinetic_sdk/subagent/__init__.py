@@ -113,6 +113,10 @@ from kinetic_sdk.subagent.pool import (
     map_reduce_subagents,
     spawn_subagent_pool,
 )
+from kinetic_sdk.subagent.review import (
+    ProduceReviewResult,
+    produce_and_review,
+)
 from kinetic_sdk.subagent.tool import DELEGATE_TOOL_NAME, DelegateTool
 from kinetic_sdk.subagent.tree import (
     DelegationTree,
@@ -131,6 +135,8 @@ __all__ = [
     "SubagentFailurePolicy",
     "classify_subagent_error",
     "DELEGATE_TOOL_NAME",
+    "ProduceReviewResult",
+    "produce_and_review",
     "FirstSuccessMerger",
     "MajorityVoteMerger",
     "MapPromptFor",

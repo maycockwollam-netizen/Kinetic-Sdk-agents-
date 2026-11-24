@@ -1246,3 +1246,11 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   `MapReduceOutcome(merged, results)`. Built-in mergers: verbatim join
   (default), `FirstSuccessMerger` (first SUCCESS result), `MajorityVoteMerger`
   (consensus over structured `data`/`choice`). Use only for independent items.
+- **Produce-then-review** (`subagent/review.py`). `produce_and_review` runs a
+  *producer* spec to draft an answer, a *critic* spec to check it against
+  criteria (a `result_schema` with a boolean `approved` + optional `feedback`
+  enables auto-accept), and re-runs the producer with the critic's feedback up
+  to `max_revisions` times. Returns a `ProduceReviewResult` (accepted result,
+  approved flag, revision count, producer run, all critic verdicts) so the
+  caller can escalate an unapproved outcome. A critic without an approval
+  signal is treated conservatively (reject).
