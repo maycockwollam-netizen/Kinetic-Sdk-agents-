@@ -1213,3 +1213,12 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   factory already wired its own state_store) and resumes the saved
   conversation, so sessions survive a server restart; expired sessions drop
   their file. This is distinct from `session_store_dir` (the run index).
+- **Structured sub-agent handoff.** `SubagentSpec.result_schema` (a JSON
+  Schema validated by `tool/validation`) makes the child run with
+  `output_schema=`; `DelegationResult` gains `data` (the parsed value) and
+  `status` (`SubagentStatus`: success / needs_more_info / out_of_scope /
+  error / budget_exceeded / repetition_limit; timed_out reserved). A child
+  can signal `needs_more_info`/`out_of_scope` via the `status` field of its
+  result object. `DelegateTool`/`AsyncDelegateTool` surface status + data
+  (redacted) in the `ToolResult` output. No schema = the historical
+  plain-text `final_message` handoff (fully backward compatible).

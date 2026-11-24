@@ -39,7 +39,11 @@ from kinetic_sdk.subagent.budget import (
     RepetitionCircuitBreaker,
     SpawnBudget,
 )
-from kinetic_sdk.subagent.delegation import DelegationResult
+from kinetic_sdk.subagent.delegation import (
+    DelegationResult,
+    SubagentStatus,
+    _status_from_data,
+)
 from kinetic_sdk.subagent.exceptions import (
     BudgetExceededError,
     RepetitionLimitError,
@@ -327,8 +331,23 @@ async def run_async_subagent(
         llm_factory=llm_factory,
     )
     agent_id = async_agent_id_for(sub_agent)
+    status = SubagentStatus.SUCCESS
+    data: Any = None
+    error: str | None = None
     try:
-        final_message = await sub_agent.run(task_prompt)
+        if spec.result_schema:
+            final_message = await sub_agent.run(
+                task_prompt, output_schema=spec.result_schema
+            )
+            data = sub_agent.structured_output
+            explicit = _status_from_data(data)
+            if explicit is not None:
+                status = explicit
+            elif data is None:
+                status = SubagentStatus.ERROR
+                error = "sub-agent did not produce a result matching result_schema"
+        else:
+            final_message = await sub_agent.run(task_prompt)
     except BudgetExceededError as exc:
         _audit_finish_async(parent_agent, spec, agent_id, "budget_exceeded", str(exc))
         raise
@@ -341,4 +360,10 @@ async def run_async_subagent(
         )
         raise
     _audit_finish_async(parent_agent, spec, agent_id, "completed", final_message)
-    return DelegationResult(final_message=final_message, agent_id=agent_id)
+    return DelegationResult(
+        final_message=final_message,
+        agent_id=agent_id,
+        status=status,
+        data=data,
+        error=error,
+    )
