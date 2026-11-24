@@ -1254,3 +1254,9 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   approved flag, revision count, producer run, all critic verdicts) so the
   caller can escalate an unapproved outcome. A critic without an approval
   signal is treated conservatively (reject).
+- **Natural-language routing** (`subagent/recruiter.py`). `route_subagent`
+  asks an LLM to pick the best `SubagentSpec` for a plain-language task from
+  the `name: description` catalogue and to rewrite the task into a
+  self-contained prompt; `delegate_naturally` then runs it through the normal
+  isolated `run_subagent` path. Unknown-name / unparseable routing raises
+  `SubagentError`.

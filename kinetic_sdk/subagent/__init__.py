@@ -113,6 +113,10 @@ from kinetic_sdk.subagent.pool import (
     map_reduce_subagents,
     spawn_subagent_pool,
 )
+from kinetic_sdk.subagent.recruiter import (
+    delegate_naturally,
+    route_subagent,
+)
 from kinetic_sdk.subagent.review import (
     ProduceReviewResult,
     produce_and_review,
@@ -135,6 +139,8 @@ __all__ = [
     "SubagentFailurePolicy",
     "classify_subagent_error",
     "DELEGATE_TOOL_NAME",
+    "delegate_naturally",
+    "route_subagent",
     "ProduceReviewResult",
     "produce_and_review",
     "FirstSuccessMerger",
