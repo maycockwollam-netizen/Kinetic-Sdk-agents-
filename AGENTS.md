@@ -1274,3 +1274,9 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   MAX -> deep tier) then routes within the matching `tiers` registry via
   `delegate_naturally`. Classifier failure/absence falls back to the MAX
   (safe) tier; empty tiers fall back to the other.
+- **`WebFetchTool`** (`web/tool.py`) — fetch a single http(s) URL as readable,
+  redacted, size-capped text (HTML stripped, urllib only, no extra dep).
+  SSRF guard is fail-closed: non-http(s) reject, resolved
+  private/loopback/reserved IPs reject unless the host matches an explicit
+  `allowed_hosts` suffix. Bounded body (`max_bytes`) + tail-biased output cap
+  (`max_chars`), secret-redacted, `fetcher` injectable for tests.
