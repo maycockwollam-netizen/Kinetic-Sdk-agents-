@@ -92,9 +92,16 @@ def _import_specs(language: str, node: object) -> list[str]:
         if node_type == "import_statement":
             string = _descendant(node, "string")
             return [_strip_quotes(_text(string))] if string else []
-        # require("x") / import("x") dynamic call
+        # require("x") / import("x") dynamic call. The callee of ``require``
+        # is an ``identifier`` node, but a dynamic ``import("...")`` callee
+        # is the literal ``import`` token node — handle both.
         call = _children(node, "identifier")
         if call and _text(call[0]) in ("require", "import"):
+            string = _descendant(node, "string")
+            return [_strip_quotes(_text(string))] if string else []
+        if node_type == "call_expression" and any(
+            child.type == "import" for child in node.children  # type: ignore[attr-defined]
+        ):
             string = _descendant(node, "string")
             return [_strip_quotes(_text(string))] if string else []
         return []

@@ -141,6 +141,10 @@ class AgentServer:
         self._max_runs = max_runs
         self._sessions: dict[str, Agent] = {}
         self._session_activity: dict[str, float] = {}
+        #: Per-session run locks. ``_lock`` still guards the session maps
+        #: themselves; only the cached Agent's run() is serialised per session
+        #: so a long run in one session never blocks another session's run.
+        self._session_locks: dict[str, threading.Lock] = {}
         self._lock = threading.Lock()
         #: Optional on-disk store for run history. When set, run records are
         #: appended to ``<dir>/runs.jsonl`` and reloaded on startup, so a
@@ -251,6 +255,16 @@ class AgentServer:
             if active_at < cutoff:
                 self._sessions.pop(session_id, None)
                 self._session_activity.pop(session_id, None)
+                self._session_locks.pop(session_id, None)
+
+    def _session_lock(self, session_id: str) -> threading.Lock:
+        """Return the run lock for *session_id*, creating it if needed."""
+        with self._lock:
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._session_locks[session_id] = lock
+            return lock
 
     def _make_agent(self, session_id: str | None) -> Agent:
         if session_id is None:
@@ -280,14 +294,16 @@ class AgentServer:
             self._run_order.append(run_id)
         try:
             agent = self._make_agent(session_id)
-            # ConversationState is mutable; serialise session runs with the
-            # server's existing lock so concurrent requests cannot interleave
-            # turns on the same cached agent.
+            # ConversationState is mutable; serialise session runs PER SESSION
+            # (never globally) so a long run in one session cannot block a
+            # different session's run. Two runs on the SAME cached agent are
+            # still serialised by that session's lock.
             if session_id is None:
                 final = agent.run(message, stream=stream, output_schema=output_schema)
             else:
-                with self._lock:
+                with self._session_lock(session_id):
                     final = agent.run(message, stream=stream, output_schema=output_schema)
+                with self._lock:
                     self._session_activity[session_id] = time.monotonic()
             record.update(
                 status="completed",
@@ -340,8 +356,9 @@ class AgentServer:
             if session_id is None:
                 final = agent.run(message, stream=True, output_schema=output_schema)
             else:
-                with self._lock:
+                with self._session_lock(session_id):
                     final = agent.run(message, stream=True, output_schema=output_schema)
+                with self._lock:
                     self._session_activity[session_id] = time.monotonic()
             record.update(
                 status="completed",
@@ -753,8 +770,9 @@ class AgentServer:
 
                 agent.event_bus.subscribe("*", publish)
                 try:
-                    with server._lock:
+                    with server._session_lock(model):
                         agent.run(message, stream=True)
+                    with server._lock:
                         server._session_activity[model] = time.monotonic()
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("OpenAI streaming run failed")
@@ -817,7 +835,16 @@ class AgentServer:
 
                     agent.event_bus.subscribe("*", publish)
                     try:
-                        final = agent.run(message)
+                        if session_id is None:
+                            final = agent.run(message)
+                        else:
+                            # Same per-session serialisation as /runs: a WS
+                            # turn and a /runs turn on one cached agent must
+                            # not race its non-reentrant run().
+                            with server._session_lock(session_id):
+                                final = agent.run(message)
+                            with server._lock:
+                                server._session_activity[session_id] = time.monotonic()
                         self._ws_send(json.dumps({"type": "run.completed", "final": final}))
                     except Exception as exc:  # noqa: BLE001 - never drop a connection on a run error
                         logger.exception("WebSocket run failed")
