@@ -22,7 +22,7 @@ import os
 import signal
 import subprocess
 import time
-from typing import Any, ClassVar
+from typing import Any, Callable, ClassVar
 
 from kinetic_sdk.tool.base import Tool, ToolResult
 from kinetic_sdk.workspace.base import WorkspaceBase, WorkspaceError
@@ -63,6 +63,27 @@ class TerminalTool(Tool):
                 "description": "Optional wall-clock seconds for this call "
                 "(capped by the tool's max_timeout).",
             },
+            "cwd": {
+                "type": "string",
+                "description": "Optional directory to run in (resolved through "
+                "the workspace when one is configured).",
+            },
+            "env": {
+                "type": "object",
+                "description": "Optional extra environment variables for this "
+                "call (merged over the tool-level env).",
+            },
+            "max_output_chars": {
+                "type": "integer",
+                "description": "Optional per-call output cap (>= 200).",
+            },
+            "truncation": {
+                "type": "string",
+                "enum": ["both", "head", "tail"],
+                "description": "Where to keep output when it exceeds the cap: "
+                "'both' (head+tail, default), 'head', or 'tail' (keep the end — "
+                "good for build logs where the error is last).",
+            },
         },
         "required": ["command"],
     }
@@ -98,6 +119,8 @@ class TerminalTool(Tool):
         max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
         env: dict[str, str] | None = None,
         command_wrapper: list[str] | None = None,
+        truncation: str = "both",
+        progress_callback: Callable[[str], None] | None = None,
     ) -> None:
         if timeout <= 0 or max_timeout <= 0:
             raise ValueError("timeout values must be positive")
@@ -105,10 +128,16 @@ class TerminalTool(Tool):
             raise ValueError("timeout must not exceed max_timeout")
         if max_output_chars < 200:
             raise ValueError("max_output_chars must be >= 200")
+        if truncation not in ("both", "head", "tail"):
+            raise ValueError("truncation must be 'both', 'head' or 'tail'")
         self.workspace = workspace
         self.timeout = timeout
         self.max_timeout = max_timeout
         self.max_output_chars = max_output_chars
+        self.truncation = truncation
+        #: Optional callback invoked with each produced output line as it
+        #: arrives (library/UI streaming; the agent loop is wired later).
+        self.progress_callback = progress_callback
         #: Optional argv prefix placed before ``bash -c <command>`` — a
         #: sandbox adapter (e.g. ``docker exec -i <container>`` from
         #: ``terminal/docker.py``) turns itself into exactly this prefix,
@@ -121,7 +150,15 @@ class TerminalTool(Tool):
         self.env = env
 
     def execute(  # type: ignore[override]
-        self, command: str, timeout: float | None = None, **_: Any
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        max_output_chars: int | None = None,
+        truncation: str | None = None,
+        timeout: float | None = None,
+        **_: Any,
     ) -> ToolResult:
         # Named-parameter signature by design: the agent loop always invokes
         # tools via execute(**model_arguments) after schema validation, so
@@ -133,13 +170,19 @@ class TerminalTool(Tool):
         )
         if effective_timeout <= 0:
             return ToolResult(error="timeout must be positive")
+        limit = self.max_output_chars if max_output_chars is None else max(200, int(max_output_chars))
+        style = self.truncation if truncation is None else truncation
+        if style not in ("both", "head", "tail"):
+            return ToolResult(error="truncation must be 'both', 'head' or 'tail'")
 
         if self.workspace is not None:
+            # The workspace backend owns execution; cwd/env are not forwarded
+            # there (callers run at the workspace root / preconfigured env).
             try:
                 result = self.workspace.run_command(command, timeout=effective_timeout)
             except WorkspaceError as exc:
                 return ToolResult(error=f"workspace command failed: {exc}")
-            output, truncated_here = self._truncate(result.output)
+            output, truncated_here = self._truncate(result.output, limit, style)
             workspace_metadata: dict[str, Any] = {
                 "exit_code": result.exit_code,
                 "duration_seconds": result.duration_seconds,
@@ -163,42 +206,40 @@ class TerminalTool(Tool):
                 )
             return ToolResult(output=output, metadata=workspace_metadata)
 
-        cwd = None
+        resolved_cwd: str | None = None
+        if cwd is not None:
+            resolved_cwd = os.path.abspath(cwd)
+            if not os.path.isdir(resolved_cwd):
+                return ToolResult(error=f"cwd is not a directory: {resolved_cwd!r}")
+        call_env = self._merged_env(env)
         started = time.monotonic()
         try:
             proc = subprocess.Popen(
                 [*self.command_wrapper, "bash", "-c", command],
-                cwd=cwd,
+                cwd=resolved_cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 errors="replace",
                 start_new_session=True,  # own process group -> kill the whole tree
-                env=self.env,
+                env=call_env,
             )
         except OSError as exc:
             return ToolResult(error=f"failed to start shell: {exc}")
 
-        try:
-            # NOTE: don't unpack as `output, _` — `_` is this method's **kwargs
-            # name, and rebinding it confuses both readers and type checkers.
-            output, _err = proc.communicate(timeout=effective_timeout)
-            timed_out = False
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            output, _err = proc.communicate()
+        if self.progress_callback is not None:
+            output, timed_out = self._run_with_progress(proc, effective_timeout)
+        else:
+            output, timed_out = self._communicate(proc, effective_timeout)
 
         duration = time.monotonic() - started
-        output, truncated = self._truncate(output or "")
+        output, truncated = self._truncate(output or "", limit, style)
         metadata: dict[str, Any] = {
             "exit_code": proc.returncode,
             "duration_seconds": round(duration, 3),
             "timed_out": timed_out,
             "truncated": truncated,
+            "cwd": resolved_cwd,
         }
         if timed_out:
             return ToolResult(
@@ -214,15 +255,75 @@ class TerminalTool(Tool):
             )
         return ToolResult(output=output, metadata=metadata)
 
-    def _truncate(self, text: str) -> tuple[str, bool]:
-        if len(text) <= self.max_output_chars:
+    def _merged_env(self, call_env: dict[str, str] | None) -> dict[str, str] | None:
+        """Combine tool-level and per-call env (`None` inherits the parent env)."""
+        if self.env is None:
+            return call_env  # None inherits os.environ; a dict replaces for this call
+        if call_env is None:
+            return self.env
+        merged = dict(self.env)
+        merged.update(call_env)
+        return merged
+
+    @staticmethod
+    def _kill_group(proc: subprocess.Popen) -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _communicate(self, proc: subprocess.Popen, timeout: float) -> tuple[str, bool]:
+        """Collect all output via ``communicate`` (no streaming)."""
+        try:
+            output, _err = proc.communicate(timeout=timeout)
+            return output or "", False
+        except subprocess.TimeoutExpired:
+            self._kill_group(proc)
+            output, _err = proc.communicate()
+            return output or "", True
+
+    def _run_with_progress(self, proc: subprocess.Popen, timeout: float) -> tuple[str, bool]:
+        """Read output line-by-line, invoking ``progress_callback`` per line."""
+        assert proc.stdout is not None  # we always spawn with stdout=PIPE
+        import threading
+
+        stream = proc.stdout
+        buffer: list[str] = []
+
+        def reader() -> None:
+            # Text-mode iterator yields each line (with a trailing newline).
+            for line in stream:
+                buffer.append(line)
+                stripped = line.rstrip("\n")
+                if stripped and self.progress_callback is not None:
+                    self.progress_callback(stripped)
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            self._kill_group(proc)
+            proc.wait()
+        thread.join(timeout=2.0)
+        try:
+            buffer.append(stream.read())
+        except (OSError, ValueError):
+            pass
+        return "".join(buffer), timed_out
+
+    def _truncate(self, text: str, limit: int, style: str) -> tuple[str, bool]:
+        """Cut *text* to *limit* chars, keeping head/tail/both per *style*."""
+        if len(text) <= limit:
             return text, False
-        head = self.max_output_chars * 2 // 3
-        tail = self.max_output_chars - head
-        omitted = len(text) - head - tail
-        return (
-            text[:head]
-            + f"\n[... {omitted} ký tự ở giữa đã được cắt bớt ...]\n"
-            + text[-tail:],
-            True,
-        )
+        omitted = len(text) - limit
+        marker = f"\n[... {omitted} ký tự ở giữa đã được cắt bớt ...]\n"
+        if style == "head":
+            return text[:limit] + marker, True
+        if style == "tail":
+            return marker + text[-limit:], True
+        head = limit * 2 // 3
+        tail = limit - head
+        return text[:head] + marker + text[-tail:], True

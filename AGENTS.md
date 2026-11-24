@@ -1280,3 +1280,10 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   private/loopback/reserved IPs reject unless the host matches an explicit
   `allowed_hosts` suffix. Bounded body (`max_bytes`) + tail-biased output cap
   (`max_chars`), secret-redacted, `fetcher` injectable for tests.
+- **Terminal ergonomics** (`terminal/tool.py`). `TerminalTool` gained a
+  per-call `cwd` (absolute-dir checked), per-call `env` (merged over the
+  tool-level env; `None` still inherits os.environ), per-call
+  `max_output_chars`, `truncation` (`"both"` default, `"head"`, or `"tail"` —
+  keep the end of a long build log), and an optional `progress_callback`
+  invoked per output line as the command streams (library/UI; the agent-loop
+  wiring is separate).
