@@ -1260,3 +1260,9 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   self-contained prompt; `delegate_naturally` then runs it through the normal
   isolated `run_subagent` path. Unknown-name / unparseable routing raises
   `SubagentError`.
+- **Complexity-tier routing** (`subagent/recruiter.py`).
+  `delegate_by_complexity(parent, tiers, task, ...)` classifies the task
+  (with the parent's classifier or a supplied one: FLASH -> cheap tier,
+  MAX -> deep tier) then routes within the matching `tiers` registry via
+  `delegate_naturally`. Classifier failure/absence falls back to the MAX
+  (safe) tier; empty tiers fall back to the other.
