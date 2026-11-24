@@ -360,6 +360,18 @@ def test_glob_finds_python_files_and_excludes_symlink_escape(workspace, tmp_path
     outside.unlink()
 
 
+def test_grep_structured_output(workspace, tmp_path) -> None:
+    (tmp_path / "a.txt").write_text("hello world\nfoo bar\n", encoding="utf-8")
+    result = GrepTool(workspace).execute(pattern="hello", structured=True)
+    assert not result.is_error
+    item = result.output[0]
+    assert item["file"] == "a.txt" and item["line"] == 1 and "hello" in item["text"]
+    # Non-structured stays the historical text shape.
+    text = GrepTool(workspace).execute(pattern="hello")
+    assert not text.is_error
+    assert isinstance(text.output, str) and "a.txt:1:" in text.output
+
+
 def test_terminal_runs_in_cwd(tmp_path) -> None:
     result = TerminalTool().execute(command="pwd", cwd=str(tmp_path))
     assert not result.is_error

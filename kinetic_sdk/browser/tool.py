@@ -12,6 +12,9 @@ from kinetic_sdk.workspace.base import WorkspaceBase
 # CDP port used when launching the browser inside a ``DockerWorkspace``.
 _CDP_PORT = 9222
 
+#: Default cap on a ``snapshot`` action's ``body_text``.
+_DEFAULT_SNAPSHOT_CHARS = 8_000
+
 
 class BrowserTool(Tool):
     """Control headless Playwright pages through a compact action schema.
@@ -40,7 +43,7 @@ class BrowserTool(Tool):
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": [
-                "navigate", "click", "type", "screenshot",
+                "navigate", "click", "type", "screenshot", "snapshot",
                 "get_console_logs", "get_network_requests", "wait_for_selector",
                 "new_tab", "close_tab", "switch_tab", "list_tabs",
                 "get_downloads",
@@ -50,6 +53,7 @@ class BrowserTool(Tool):
             "text": {"type": "string"},
             "index": {"type": "integer", "minimum": 0},
             "timeout": {"type": "number", "minimum": 0},
+            "max_chars": {"type": "integer", "minimum": 0, "description": "Optional cap on a snapshot's body_text."},
         },
         "required": ["action"],
     }
@@ -295,6 +299,8 @@ class BrowserTool(Tool):
                 metadata={"image_base64": base64.b64encode(image).decode("ascii"),
                           "media_type": "image/png"},
             )
+        if action == "snapshot":
+            return self._snapshot(page, params)
         if action == "get_console_logs":
             return ToolResult(output=list(self._console_logs))
         if action == "get_network_requests":
@@ -305,6 +311,42 @@ class BrowserTool(Tool):
             )
             return ToolResult(output="selector found")
         return ToolResult(error=f"unsupported browser action: {action!r}")
+
+    def _snapshot(self, page: Any, params: dict[str, Any]) -> ToolResult:
+        """A readable text snapshot of the active page (URL + title + body)."""
+        url: Any = ""
+        title: Any = ""
+        body: Any = ""
+        for label, getter in (
+            ("title", lambda: page.title()),
+            ("body", lambda: page.inner_text("body")),
+        ):
+            try:
+                value = getter()
+                if label == "title":
+                    title = value or ""
+                else:
+                    body = value or ""
+            except Exception:  # noqa: BLE001 - any page API may be unavailable
+                pass
+        try:
+            url = page.url or ""
+        except Exception:  # noqa: BLE001
+            url = ""
+        raw = params.get("max_chars")
+        limit = _DEFAULT_SNAPSHOT_CHARS if raw is None else max(0, int(raw))
+        body = body.strip()
+        truncated = len(body) > limit
+        if truncated:
+            body = body[:limit] + "...(cut)"
+        return ToolResult(
+            output={
+                "url": url,
+                "title": title,
+                "body_text": body,
+                "truncated": truncated,
+            }
+        )
 
     def _tab_action(self, action: str, params: dict[str, Any]) -> ToolResult:
         if action == "list_tabs":
