@@ -376,6 +376,7 @@ class AsyncAgent:
         tool_list = list(tools or [])
         self._tools: dict[str, Tool] = {}
         for tool in tool_list:
+            tool = self._adopt_delegate(tool)
             if tool.name in self._tools:
                 raise ValueError(f"Duplicate tool name: {tool.name!r}")
             self._tools[tool.name] = tool
@@ -387,9 +388,36 @@ class AsyncAgent:
 
         Raises if a tool with the same name is already registered.
         """
+        tool = self._adopt_delegate(tool)
         if tool.name in self._tools:
             raise ValueError(f"Duplicate tool name: {tool.name!r}")
         self._tools[tool.name] = tool
+
+    def _adopt_delegate(self, tool: Tool) -> Tool:
+        """Upgrade a SYNC :class:`DelegateTool` to an async-native subclass.
+
+        Delegation in an async agent must not run the child's sync loop in a
+        worker thread: the sync ``execute`` only bridges via ``asyncio.to_thread``.
+        When a sync ``DelegateTool`` is handed to an :class:`AsyncAgent`, it is
+        transparently re-contained as an :class:`AsyncDelegateTool` (same spec
+        registry / budget / breaker / llm factory) and bound to this agent, so
+        the parent loop awaits the sub-agent natively. A tool that is already
+        async-native, or any non-delegate tool, is returned unchanged.
+        """
+        from kinetic_sdk.subagent.async_tool import AsyncDelegateTool
+        from kinetic_sdk.subagent.tool import DelegateTool
+
+        if not isinstance(tool, DelegateTool) or isinstance(tool, AsyncDelegateTool):
+            return tool
+        upgraded = AsyncDelegateTool(
+            tool.subagent_specs,
+            budget=tool.budget,
+            max_consecutive_repeats=tool._max_consecutive_repeats,
+            llm_factory=tool._llm_factory,
+            charge_root_tool_calls=tool._charge_root_tool_calls,
+        )
+        upgraded.bind(self)
+        return upgraded
 
     def tool_schemas(self) -> list[dict[str, Any]]:
         """Return the tool definitions to send to the model.

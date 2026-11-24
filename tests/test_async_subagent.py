@@ -187,6 +187,33 @@ async def test_async_delegate_tool_unbound_and_unknown():
     assert result.is_error and "Unknown sub-agent" in result.error
 
 
+async def test_async_agent_auto_upgrades_sync_delegate_tool():
+    from kinetic_sdk.subagent.tool import DelegateTool as SyncDelegateTool
+
+    sync_tool = SyncDelegateTool([_spec("worker")])
+    parent = AsyncAgent(
+        llm=AsyncMockLLMClient([]),
+        tools=[sync_tool],
+        permission_policy=PermissivePolicy(),
+    )
+    adopted = parent._tools["delegate"]
+    assert isinstance(adopted, AsyncDelegateTool)
+    assert adopted is not sync_tool
+    assert adopted.parent is parent
+    # Async-native: the sync execute raises (never bridged into a thread).
+    with pytest.raises(NotImplementedError):
+        adopted.execute()
+    # add_tool() upgrades too (on a fresh agent, since the name would collide
+    # on this one).
+    parent2 = AsyncAgent(
+        llm=AsyncMockLLMClient([]),
+        tools=[],
+        permission_policy=PermissivePolicy(),
+    )
+    parent2.add_tool(SyncDelegateTool([_spec("worker2")]))
+    assert isinstance(parent2._tools["delegate"], AsyncDelegateTool)
+
+
 async def test_async_delegate_tool_sync_execute_raises():
     tool = AsyncDelegateTool([_spec()])
     with pytest.raises(NotImplementedError):
