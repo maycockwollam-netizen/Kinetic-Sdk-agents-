@@ -1325,3 +1325,10 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   `final_text`, parsed `structured_output`, `run_id`, mode, a usage snapshot
   and `duration_seconds` (plus `cancelled`/`error`), exported from
   `kinetic_sdk` and the full `to_dict()` for servers/CLIs/traces.
+- **`Workflow` composition layer** (`workflow/__init__.py`). A thin,
+  declarative pipeline builder: `Workflow(parent).delegate(...).map_reduce(...)
+  .produce_review(...).route(...).run_agent(...).run()` executes each named
+  step sequentially with ONE shared `SpawnBudget`, returning a `WorkflowResult`
+  with per-step outputs + a usage snapshot. Forwards `llm_factory` to every
+  spawn; wraps `run_subagent` / `map_reduce_subagents` /
+  `produce_and_review` / `delegate_naturally`.
