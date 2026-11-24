@@ -42,6 +42,7 @@ from kinetic_sdk.agent.classifier import DefaultClassifier, TaskClassifier
 from kinetic_sdk.agent.effort import Effort, EffortContext, EffortPolicy
 from kinetic_sdk.agent.modes import AgentMode
 from kinetic_sdk.agent.planning import AnswerVerifier, Plan, PlanStrategy
+from kinetic_sdk.agent.result import AgentResult
 from kinetic_sdk.agent.structured import (
     CORRECTION_TEMPLATE,
     DEFAULT_STRUCTURED_RETRIES,
@@ -377,6 +378,11 @@ class Agent:
         #: Running LLM usage totals across all runs of this agent (per-run
         #: data is in the ``llm.usage`` events; see ``llm/usage.py``).
         self.usage = UsageAccumulator()
+        #: Rich outcome of the most recent :meth:`run` (see
+        #: :class:`~kinetic_sdk.agent.result.AgentResult`); ``None`` before the
+        #: first run finishes.
+        self.last_result: AgentResult | None = None
+        self._run_started: float | None = None
         #: Parsed final answer of the last ``run(output_schema=...)`` call
         #: (None when no schema was requested or validation ultimately failed).
         self.structured_output: Any = None
@@ -607,6 +613,7 @@ class Agent:
             self._cancel_event.clear()  # a new run starts un-cancelled
             self._stop_reason = None
             self._run_id = str(uuid.uuid4())
+            self._run_started = time.perf_counter()
             self._trigger_hooks(
                 HookPoint.BEFORE_RUN,
                 HookContext(
@@ -648,6 +655,9 @@ class Agent:
                 ),
             )
             self._emit("agent.error", {"reason": "exception", "error": str(exc)})
+            self.last_result = self._build_result(
+                final_text="", error=f"{type(exc).__name__}: {exc}"
+            )
             if self.memory is not None:
                 self._clear_working_memory()
             raise
@@ -666,7 +676,25 @@ class Agent:
         if self.memory is not None:
             self._clear_working_memory()
         self._active_output_schema = None
+        self.last_result = self._build_result(final_text=final_text)
         return final_text
+
+    def _build_result(self, final_text: str, error: str | None = None) -> AgentResult:
+        """Assemble the rich per-run :class:`AgentResult` from live state."""
+        return AgentResult(
+            final_text=final_text,
+            structured_output=self.structured_output,
+            run_id=self._run_id,
+            mode=self.mode,
+            usage=self.usage.snapshot().to_dict(),
+            duration_seconds=(
+                None
+                if self._run_started is None
+                else time.perf_counter() - self._run_started
+            ),
+            cancelled=self._cancel_event.is_set(),
+            error=error,
+        )
 
     def escalate(self) -> bool:
         """Escalate from FLASH to MAX mid-task. Returns True if it escalated.

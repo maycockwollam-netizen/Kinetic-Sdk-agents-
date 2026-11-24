@@ -13,6 +13,7 @@ list is deliberately short — everything else is imported from its submodule
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.agent.async_agent import AsyncAgent
 from kinetic_sdk.agent.modes import AgentMode
+from kinetic_sdk.agent.result import AgentResult
 from kinetic_sdk.conversation.state import ConversationState
 from kinetic_sdk.event.bus import Event, EventBus
 from kinetic_sdk.llm.client import (
@@ -36,6 +37,7 @@ __version__ = "0.2.0"
 __all__ = [
     "Agent",
     "AgentMode",
+    "AgentResult",
     "AllowListPolicy",
     "AsyncAgent",
     "AsyncLLMClient",
