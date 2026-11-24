@@ -40,6 +40,18 @@ def test_snapshot_to_dict_round():
     assert d == {"input_tokens": 1, "output_tokens": 2, "cost_usd": 0.1, "calls": 1}
 
 
+def test_accumulator_ignores_unusable_costs():
+    acc = UsageAccumulator()
+    acc.record({"cost_usd": 0.5})
+    acc.record({"cost_usd": -0.2})  # negative must not shrink the total
+    acc.record({"cost_usd": True})  # bool must not count as 1.0
+    acc.record({"cost_usd": float("nan")})
+    acc.record({"cost_usd": float("inf")})
+    snap = acc.snapshot()
+    assert snap.cost_usd == 0.5
+    assert snap.calls == 5  # every usage-carrying turn still counts as a call
+
+
 def test_agent_accumulates_across_runs():
     llm = MockLLMClient([_used_response(), _used_response()])
     agent = Agent(llm=llm, permission_policy=PermissivePolicy())

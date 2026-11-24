@@ -9,12 +9,14 @@ actionable error message it can correct on the next turn.
 
 This is a deliberate SUBSET of JSON Schema — the shapes tool schemas actually
 use: ``type`` (object/array/string/number/integer/boolean/null),
-``properties``, ``required``, ``items``, ``enum``, and
-``additionalProperties``. No ``$ref``, no combinators (``anyOf``/``oneOf`` —
-unknown keywords are ignored, never an error). Strictness choice: unexpected
-top-level properties are REJECTED unless the schema allows them
-(``additionalProperties: true`` or no ``properties`` declared at all), because
-an extra kwarg would otherwise crash ``execute(**params)``.
+``properties``, ``required``, ``items``, ``enum``,
+``additionalProperties``, local ``$ref`` (``#/$defs/...`` /
+``#/definitions/...``), and the ``anyOf`` / ``oneOf`` combinators
+(unresolvable ``$ref`` fails CLOSED; unknown keywords are ignored, never an
+error). Strictness choice: unexpected top-level properties are REJECTED
+unless the schema allows them (``additionalProperties: true`` or no
+``properties`` declared at all), because an extra kwarg would otherwise
+crash ``execute(**params)``.
 """
 
 from __future__ import annotations

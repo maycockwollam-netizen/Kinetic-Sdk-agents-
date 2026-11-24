@@ -1153,3 +1153,18 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
 - Tool tests: tree-sitter needs the `[codemap]` extra (`importorskip` otherwise);
   the two new regression tests (vector persist race, orchestrator hard
   deadline) pass with the fixes and FAIL against the pre-fix code.
+
+### Stage 8 follow-up (audit fixes, same day)
+- **Streaming now attaches cost.** `LiteLLMClient.chat_stream` and
+  `AsyncLiteLLMClient.chat_stream` were emitting turns with tokens but NO
+  `cost_usd` (only `chat`/`chat` called `_attach_cost`), so
+  `RunBudget(max_total_cost_usd=...)` never tripped and `agent.usage.cost_usd`
+  under-reported under `stream=True` (including server SSE). New
+  `LiteLLMClient._attach_stream_cost` (static) prices a streamed turn via the
+  documented `completion_cost(model=..., messages=..., completion=...)` path;
+  failure is silent (same best-effort contract as `_attach_cost`).
+- **`UsageAccumulator.record` matches the hardened budgets**: it now skips
+  bool / non-finite / negative `cost_usd` (a NaN would poison `cost_usd` and
+  serialize as invalid JSON). `llm/usage.py` imports `math`.
+- **`tool/validation.py` module docstring updated** — it still said "No
+  `$ref`, no combinators" after #118/#119 shipped them.

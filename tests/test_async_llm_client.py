@@ -337,6 +337,46 @@ async def test_chat_stream_text_deltas_and_done(fake_litellm):
     assert done.delta.stop_reason == "end_turn"
 
 
+async def test_chat_stream_attaches_cost_when_priced(fake_litellm):
+    async def handler(**request):
+        assert request["stream"] is True
+        return _AsyncChunkStream([
+            _FakeChunk(
+                _FakeDelta(content="hi"),
+                finish_reason="stop",
+                usage=_FakeUsage(prompt_tokens=5, completion_tokens=3),
+            ),
+        ])
+
+    fake_litellm.handler = handler
+    fake_litellm.completion_cost = lambda **_kwargs: 0.006
+    client = make_client()
+    events = [
+        event
+        async for event in client.chat_stream(messages=[{"role": "user", "content": "hi"}])
+    ]
+    final = events[-1].delta
+    assert final.usage.get("cost_usd") == 0.006
+
+
+async def test_chat_stream_pricing_failure_is_silent(fake_litellm):
+    async def handler(**request):
+        return _AsyncChunkStream([
+            _FakeChunk(_FakeDelta(content="hi"), finish_reason="stop"),
+        ])
+
+    fake_litellm.handler = handler
+    fake_litellm.completion_cost = lambda **_kwargs: (_ for _ in ()).throw(ValueError("no pricing"))
+    client = make_client()
+    events = [
+        event
+        async for event in client.chat_stream(messages=[{"role": "user", "content": "hi"}])
+    ]
+    final = events[-1].delta
+    assert final.content == "hi"
+    assert "cost_usd" not in final.usage
+
+
 async def test_chat_stream_assembles_fragmented_tool_calls(fake_litellm):
     async def handler(**request):
         return _AsyncChunkStream([

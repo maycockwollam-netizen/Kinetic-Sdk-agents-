@@ -222,6 +222,49 @@ def test_chat_stream_aggregates_text_and_emits_done(fake_completion):
     assert fake_completion.calls[0].get("stream") is True
 
 
+def test_chat_stream_attaches_cost_when_priced(fake_completion, monkeypatch):
+    import litellm
+
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content="hi", tool_calls=None), finish_reason="stop"
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3),
+        ),
+    ]
+    fake_completion.return_value = chunks
+    monkeypatch.setattr(litellm, "completion_cost", lambda **_kwargs: 0.005)
+    client = _new_client()
+    events = list(client.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    final = [e for e in events if e.type == "done"][0].delta
+    assert final.usage.get("cost_usd") == 0.005
+
+
+def test_chat_stream_pricing_failure_is_silent(fake_completion, monkeypatch):
+    import litellm
+
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content="hi", tool_calls=None), finish_reason="stop"
+                )
+            ],
+            usage=None,
+        ),
+    ]
+    fake_completion.return_value = chunks
+    monkeypatch.setattr(litellm, "completion_cost", lambda **_kwargs: (_ for _ in ()).throw(ValueError("no pricing")))
+    client = _new_client()
+    events = list(client.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    final = [e for e in events if e.type == "done"][0].delta
+    assert final.content == "hi"  # the stream still completes
+    assert "cost_usd" not in final.usage
+
+
 def test_chat_stream_collects_tool_calls(fake_completion):
     chunks = [
         SimpleNamespace(
