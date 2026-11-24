@@ -191,6 +191,7 @@ def spawn_async_subagent(
     *,
     max_consecutive_repeats: int = DEFAULT_MAX_CONSECUTIVE_REPEATS,
     llm_factory: AsyncLLMFactory | None = None,
+    context: str | None = None,
 ) -> AsyncAgent:
     """Build the async sub-agent for *spec* (does NOT run it).
 
@@ -253,7 +254,12 @@ def spawn_async_subagent(
     sub_agent = AsyncAgent(
         llm=guarded_llm,
         tools=tools,
-        state=ConversationState(system_prompt=spec.system_prompt),
+        state=ConversationState(
+            system_prompt=spec.system_prompt,
+            # Context handoff: an explicit `context` string becomes the child's
+            # first user message (mirror of the sync spawn).
+            messages=[{"role": "user", "content": context}] if context else [],
+        ),
         event_bus=parent_agent.event_bus,
         classifier=parent_agent.classifier,
         max_iterations=parent_agent._max_iterations_override,  # noqa: SLF001
@@ -341,6 +347,7 @@ async def run_async_subagent(
     *,
     max_consecutive_repeats: int = DEFAULT_MAX_CONSECUTIVE_REPEATS,
     llm_factory: AsyncLLMFactory | None = None,
+    context: str | None = None,
 ) -> DelegationResult:
     """Spawn the async sub-agent and await its run to completion.
 
@@ -354,6 +361,7 @@ async def run_async_subagent(
         budget,
         max_consecutive_repeats=max_consecutive_repeats,
         llm_factory=llm_factory,
+        context=context,
     )
     agent_id = async_agent_id_for(sub_agent)
     status = SubagentStatus.SUCCESS
