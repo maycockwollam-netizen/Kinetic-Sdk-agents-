@@ -8,6 +8,7 @@ from kinetic_sdk.tool.base import (
     ToolResult,
     ToolRiskLevel,
 )
+from kinetic_sdk.tool.cache import CachedTool, ToolCache, tool_cache_key
 from kinetic_sdk.tool.validation import validate_tool_input
 
 __all__ = [
@@ -17,5 +18,8 @@ __all__ = [
     "ToolFailureCategory",
     "ToolResult",
     "ToolRiskLevel",
+    "CachedTool",
+    "ToolCache",
+    "tool_cache_key",
     "validate_tool_input",
 ]

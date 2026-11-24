@@ -58,6 +58,7 @@ from kinetic_sdk.context.manager import (
     ContextManager,
     SimpleTruncateContextManager,
     SummarizingContextManager,
+    estimate_tokens,
 )
 from kinetic_sdk.conversation.state import ConversationState
 from kinetic_sdk.conversation.store import ConversationStore
@@ -1604,6 +1605,7 @@ class Agent:
                 "output_preview": redact_secrets(self._preview(result.output)),
                 "duration_seconds": result.duration_seconds,
                 "artifacts": result.artifacts,
+                "tokens_approx": result.metadata.get("tokens_approx"),
             },
         )
         if self.stuck_detector is not None and self.stuck_detector.check(
@@ -1812,10 +1814,18 @@ class Agent:
         except Exception as exc:  # noqa: BLE001 - surface as tool error
             logger.exception("Tool %s raised", tool.name)
             result = ToolResult(error=f"{type(exc).__name__}: {exc}")
-        # Stamp the measurement on a COPY: a tool may return a shared/cached
-        # ToolResult instance, and mutating it would race concurrent calls and
-        # corrupt the preceding callers' duration.
-        return replace(result, duration_seconds=time.perf_counter() - started)
+        # Stamp the measurement (and a crude output-token estimate) on a COPY:
+        # a tool may return a shared/cached ToolResult instance, and mutating
+        # it would race concurrent calls and corrupt the preceding callers'
+        # duration. ``tokens_approx`` lets the model/UI gauge context cost.
+        return replace(
+            result,
+            duration_seconds=time.perf_counter() - started,
+            metadata={
+                **result.metadata,
+                "tokens_approx": estimate_tokens(self._format_tool_output(result)),
+            },
+        )
 
     def _tool_timeout(self, tool: Tool) -> float | None:
         policy = tool.execution_policy
