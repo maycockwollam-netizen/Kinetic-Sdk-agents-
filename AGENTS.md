@@ -1181,3 +1181,15 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   dynamic import is the literal `import` token node, not an `identifier`, so
   `_import_specs` (which matched `require`/`import` identifiers) missed it.
   Now both are collected, including inside function bodies.
+- **Plugin unload / hot-reload.** `PluginRegistry` is now stateful about
+  ownership: `load_all` records which tools each plugin contributed, and
+  `loaded_tools(plugin)` / `is_loaded(plugin)` / `unload(plugin)` /
+  `reload(plugin, on_error=...)` let a long-running process detach or refresh
+  a plugin's tools without a restart. `reload` re-discovers (fresh checksum),
+  re-vets and re-imports; on failure (`on_error="skip"`) the previously
+  working tools are kept. It does NOT mutate an already-built Agent — the
+  caller swaps its tool set from the returned list.
+- **Plugin loader now purges bytecode before importing a directory module.**
+  Without this, a same-byte-length edit issued within the same mtime second
+  was served from the stale `__pycache__` timestamp cache, so a hot-reloaded
+  plugin silently ran old code (regression test pins it).

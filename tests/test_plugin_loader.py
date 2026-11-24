@@ -269,6 +269,41 @@ class TestAuditLog:
 
 
 class TestIntegrityGuards:
+    def test_same_size_same_second_edit_is_picked_up(self, tmp_path):
+        # Regression: a same-byte-length edit issued in the same mtime
+        # second must still execute the NEW source. Without the loader's
+        # bytecode purge, Python would serve the stale ``__pycache__``
+        # timestamp cache and the "reloaded" plugin would silently run the
+        # old code.
+        def src(tname: str) -> dict[str, str]:
+            return {
+                "plugin.py": textwrap.dedent(
+                    f"""\
+                    from kinetic_sdk.tool.base import Tool, ToolResult
+
+                    class T(Tool):
+                        name = "{tname}"
+                        description = "d"
+                        parameters = {{"type": "object", "properties": {{}}}}
+
+                        def execute(self):
+                            return ToolResult(output="{tname}")
+
+                    def make_tools():
+                        return [T()]
+                    """
+                )
+            }
+
+        directory = write_plugin(tmp_path, "plug", modules=src("aaaa"))
+        loader = PluginLoader()
+        first = loader.load(PluginManifest.from_directory(directory))
+        assert [t.name for t in first] == ["aaaa"]
+        # Same-byte-length source, issued immediately (no sleep).
+        write_plugin(tmp_path, "plug", modules=src("bbbb"))
+        again = loader.load(PluginManifest.from_directory(directory))
+        assert [t.name for t in again] == ["bbbb"]
+
     def test_directory_manifest_pins_a_checksum(self, tmp_path):
         import re
 

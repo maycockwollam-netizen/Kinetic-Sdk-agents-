@@ -253,6 +253,7 @@ class PluginLoader:
                         submodule_search_locations=[str(current / part)],
                     )
                     current = current / part
+                    source = package_init
                 elif module_file.is_file():
                     if not is_last:
                         raise PluginLoadError(
@@ -260,6 +261,7 @@ class PluginLoader:
                             f"{manifest.module_spec!r} is a module, not a package"
                         )
                     spec = importlib.util.spec_from_file_location(full_name, module_file)
+                    source = module_file
                 else:
                     raise PluginLoadError(
                         f"plugin {manifest.name!r}: cannot locate module "
@@ -275,6 +277,11 @@ class PluginLoader:
                 inserted.append(full_name)
                 if parent is not None:
                     setattr(parent, part, module)
+                # Purge the source's bytecode cache first: plugins are
+                # hot-reloaded, and a same-size same-second edit would
+                # otherwise be served from the stale ``__pycache__``
+                # timestamp cache (the "new" plugin silently runs old code).
+                PluginLoader._purge_bytecode(source)
                 spec.loader.exec_module(module)
                 parent = module
         except Exception:
@@ -283,6 +290,18 @@ class PluginLoader:
             raise
         assert parent is not None
         return parent
+
+    @staticmethod
+    def _purge_bytecode(source: Path) -> None:
+        """Delete *source*'s cached ``.pyc`` so execution always uses current code."""
+        try:
+            cached = Path(importlib.util.cache_from_source(str(source)))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return
+        try:
+            cached.unlink()
+        except OSError:
+            pass
 
     # --- validation & audit ---------------------------------------------------
 
