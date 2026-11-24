@@ -207,11 +207,18 @@ class MCPServerRegistry:
         """Connect (if needed) and wrap every server tool in an adapter.
 
         Tool names are prefixed with the server name (``"unity.search"``),
-        so merging tools from several servers cannot collide.
+        so merging tools from several servers cannot collide. Each adapter
+        is wired with a :meth:`reconnect` reconnector, so a tool call that
+        hits a DEAD transport heals automatically (one reconnect + retry)
+        instead of failing until someone calls :meth:`reconnect` by hand.
         """
         client = self.connect(name)
+
+        def reconnector() -> MCPClient:
+            return self.reconnect(name)
+
         return [
-            MCPToolAdapter.from_mcp_schema(client, name, schema)
+            MCPToolAdapter.from_mcp_schema(client, name, schema, reconnector=reconnector)
             for schema in client.list_tools()
         ]
 

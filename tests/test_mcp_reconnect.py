@@ -54,3 +54,59 @@ def test_reconnect_without_prior_connect(fake_server_path):
         assert client.initialized
     finally:
         registry.close_all()
+
+
+def test_adapter_auto_reconnects_after_transport_death(fake_server_path):
+    """A tool call on a DEAD transport heals via one proactive reconnect."""
+    registry = MCPServerRegistry()
+    registry.register(
+        "fake",
+        MCPServerConfig.stdio(command=sys.executable, args=[fake_server_path]),
+    )
+    try:
+        tools = registry.get_tools_as_kinetic_tools("fake")
+        by_name = {tool.name: tool for tool in tools}
+        echo = by_name["fake.echo"]
+        crash = by_name["fake.crash"]
+        # Healthy call works and the cached client is shared.
+        assert echo.execute(text="ok").output == "ok"
+        # The server dies mid-session: the crash tool exits the subprocess
+        # without answering, killing the shared transport.
+        assert crash.execute().is_error
+        # The next echo AUTO-reconnects (fresh subprocess) and retries.
+        healed = echo.execute(text="after-crash")
+        assert not healed.is_error, healed.error
+        assert healed.output == "after-crash"
+    finally:
+        registry.close_all()
+
+
+def test_adapter_timeout_does_not_trigger_reconnect(fake_server_path):
+    """A mere timeout must NOT re-spawn the server (a live-but-slow peer)."""
+    from kinetic_sdk.mcp.adapter import MCPToolAdapter
+    from kinetic_sdk.mcp.transport import MCPTimeoutError
+
+    registry = MCPServerRegistry()
+    registry.register(
+        "fake",
+        MCPServerConfig.stdio(command=sys.executable, args=[fake_server_path]),
+    )
+    try:
+        client = registry.connect("fake")
+
+        def _timeout(*_args: object, **_kwargs: object) -> object:
+            raise MCPTimeoutError("slow")
+
+        client.call_tool = _timeout  # type: ignore[method-assign]
+        calls = {"n": 0}
+
+        def reconnect() -> object:
+            calls["n"] += 1
+            return registry.reconnect("fake")
+
+        adapter = MCPToolAdapter(client, "echo", "fake", reconnector=reconnect)  # type: ignore[arg-type]
+        result = adapter.execute(text="hi")
+        assert result.is_error
+        assert calls["n"] == 0  # timeout must NOT trigger a reconnect
+    finally:
+        registry.close_all()
