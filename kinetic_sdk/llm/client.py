@@ -628,6 +628,30 @@ class LiteLLMClient(LLMClient):
         if isinstance(cost, (int, float)) and cost > 0:
             response.usage["cost_usd"] = float(cost)
 
+    @staticmethod
+    def _attach_stream_cost(
+        litellm_module: Any,
+        model: str,
+        request_messages: list[dict[str, Any]],
+        response: LLMResponse,
+    ) -> None:
+        """Best-effort cost lookup for a STREAMED turn.
+
+        Streaming has no single response object to price, so this uses the
+        documented ``completion_cost(model=..., messages=..., completion=...)``
+        path (tokens are computed from the sent messages + assistant text).
+        Same best-effort contract as :meth:`_attach_cost`: any pricing failure
+        leaves ``response.usage`` untouched.
+        """
+        try:
+            cost = litellm_module.completion_cost(
+                model=model, messages=request_messages, completion=response.content
+            )
+        except Exception:  # noqa: BLE001 - pricing must never break a call
+            return
+        if isinstance(cost, (int, float)) and cost > 0:
+            response.usage["cost_usd"] = float(cost)
+
     def chat_stream(
         self,
         messages: list[Message],
@@ -705,6 +729,7 @@ class LiteLLMClient(LLMClient):
             usage=usage,
             raw=None,
         )
+        self._attach_stream_cost(self._litellm, self.model, request.get("messages", []), final)
         yield StreamEvent(type="done", delta=final)
 
     @staticmethod

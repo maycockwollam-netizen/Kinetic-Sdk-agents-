@@ -175,6 +175,9 @@ class AsyncLiteLLMClient(AsyncLLMClient):
             usage=usage,
             raw=None,
         )
+        LiteLLMClient._attach_stream_cost(
+            self._litellm, self.model, request.get("messages", []), final
+        )
         yield StreamEvent(type="done", delta=final)
 
     # --- internals ----------------------------------------------------

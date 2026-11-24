@@ -14,6 +14,7 @@ recovered from the ``llm.usage`` events the agent emits for every LLM call
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -73,7 +74,15 @@ class UsageAccumulator:
                 self._snapshot.input_tokens += inp
             if isinstance(out, int):
                 self._snapshot.output_tokens += out
-            if isinstance(cost, (int, float)):
+            # Mirrors the hardened budget guards: exclude bools and keep the
+            # running total finite and non-negative (a NaN/negative cost would
+            # poison the snapshot and serialize as invalid JSON).
+            if (
+                isinstance(cost, (int, float))
+                and not isinstance(cost, bool)
+                and math.isfinite(float(cost))
+                and float(cost) >= 0
+            ):
                 self._snapshot.cost_usd += float(cost)
 
     def snapshot(self) -> UsageSnapshot:
