@@ -114,6 +114,7 @@ from kinetic_sdk.subagent.pool import (
     spawn_subagent_pool,
 )
 from kinetic_sdk.subagent.recruiter import (
+    delegate_by_complexity,
     delegate_naturally,
     route_subagent,
 )
@@ -139,6 +140,7 @@ __all__ = [
     "SubagentFailurePolicy",
     "classify_subagent_error",
     "DELEGATE_TOOL_NAME",
+    "delegate_by_complexity",
     "delegate_naturally",
     "route_subagent",
     "ProduceReviewResult",

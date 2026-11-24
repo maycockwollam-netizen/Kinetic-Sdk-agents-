@@ -85,6 +85,65 @@ def test_delegate_naturally_routes_then_runs() -> None:
     assert result.status.value == "success"
 
 
+def _decision(mode) -> object:
+    class Decision:
+        pass
+
+    d = Decision()
+    d.mode = mode
+    return d
+
+
+def _flash_classifier():
+    from kinetic_sdk.agent.modes import AgentMode
+
+    class C:
+        def classify(self, task):
+            return _decision(AgentMode.FLASH)
+
+    return C()
+
+
+def test_delegate_by_complexity_picks_tier_by_classifier() -> None:
+    from kinetic_sdk.subagent import delegate_by_complexity
+
+    flash = SubagentSpec(name="fast", system_prompt="p", description="fast agent")
+    deep = SubagentSpec(name="deep", system_prompt="p", description="deep agent")
+    tiers = {"flash": {"fast": flash}, "max": {"deep": deep}}
+    # Flash classification -> routes within the "flash" tier (names the spec "fast").
+    llm = MockLLMClient([
+        text_response('{"subagent": "fast", "task_prompt": "QUICK"}'),
+        text_response("fast done"),
+    ])
+    parent = Agent(llm=llm, permission_policy=PermissivePolicy())
+    result = delegate_by_complexity(
+        parent, tiers, "a quick tweak", budget=SpawnBudget(100), classifier=_flash_classifier()
+    )
+    assert result.final_message == "fast done"
+
+
+def test_delegate_by_complexity_falls_back_to_max_on_classifier_failure() -> None:
+    from kinetic_sdk.subagent import delegate_by_complexity
+
+    flash = SubagentSpec(name="fast", system_prompt="p", description="fast agent")
+    deep = SubagentSpec(name="deep", system_prompt="p", description="deep agent")
+    tiers = {"flash": {"fast": flash}, "max": {"deep": deep}}
+
+    class Boom:
+        def classify(self, task):
+            raise RuntimeError("classifier offline")
+
+    llm = MockLLMClient([
+        text_response('{"subagent": "deep", "task_prompt": "DEEP"}'),
+        text_response("deep done"),
+    ])
+    parent = Agent(llm=llm, permission_policy=PermissivePolicy())
+    result = delegate_by_complexity(
+        parent, tiers, "hard task", budget=SpawnBudget(100), classifier=Boom()
+    )
+    assert result.final_message == "deep done"
+
+
 def test_delegate_naturally_rejects_empty_registry() -> None:
     parent = Agent(llm=MockLLMClient([]), permission_policy=PermissivePolicy())
     with pytest.raises(SubagentError, match="no sub-agents"):

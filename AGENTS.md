@@ -1268,3 +1268,9 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   `task_prompt`), so a parent can hand over relevant background/files without
   re-discovery. Isolation is unchanged — only the seeded context + final
   message cross the boundary.
+- **Complexity-tier routing** (`subagent/recruiter.py`).
+  `delegate_by_complexity(parent, tiers, task, ...)` classifies the task
+  (with the parent's classifier or a supplied one: FLASH -> cheap tier,
+  MAX -> deep tier) then routes within the matching `tiers` registry via
+  `delegate_naturally`. Classifier failure/absence falls back to the MAX
+  (safe) tier; empty tiers fall back to the other.
