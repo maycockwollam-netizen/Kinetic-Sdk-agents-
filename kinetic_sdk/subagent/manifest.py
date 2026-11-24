@@ -71,6 +71,10 @@ class SubagentSpec:
             (with ``status`` derived from the result's ``status`` field when
             it carries one). ``None`` keeps the historical plain-text
             ``final_message`` handoff.
+        boundaries: Capability hints surfacing to a ROUTER (see
+            ``kinetic_sdk.subagent.recruiter``): things this sub-agent is
+            ``only`` good at or should NOT be asked to do. Used to avoid
+            wasteful delegation; never enforces anything by itself.
     """
 
     name: str
@@ -79,6 +83,7 @@ class SubagentSpec:
     model: str | None = None
     tools: tuple[str, ...] = ()
     result_schema: dict[str, Any] | None = None
+    boundaries: tuple[str, ...] = ()
 
     def to_markdown(self) -> str:
         """Serialize this spec back to flat-frontmatter Markdown.
@@ -94,6 +99,8 @@ class SubagentSpec:
             lines.append(f"model: {self.model}")
         if self.tools:
             lines.append("tools: " + ",".join(self.tools))
+        if self.boundaries:
+            lines.append("boundaries: " + ",".join(self.boundaries))
         return "---\n" + "\n".join(lines) + "\n---\n\n" + self.system_prompt.rstrip() + "\n"
 
     def __post_init__(self) -> None:
@@ -115,6 +122,12 @@ class SubagentSpec:
             raise SubagentSpecError(
                 f"Sub-agent {self.name!r} result_schema must be a JSON Schema "
                 "object, got {self.result_schema!r}"
+            )
+        if not isinstance(self.boundaries, tuple) or not all(
+            isinstance(item, str) for item in self.boundaries
+        ):
+            raise SubagentSpecError(
+                f"Sub-agent {self.name!r} boundaries must be a tuple of strings"
             )
 
 
@@ -138,6 +151,11 @@ def load_subagent_spec(path: str | Path) -> SubagentSpec:
         model=frontmatter.get("model") or None,
         tools=tuple(
             tool.strip() for tool in frontmatter.get("tools", "").split(",") if tool.strip()
+        ),
+        boundaries=tuple(
+            item.strip()
+            for item in frontmatter.get("boundaries", "").split(",")
+            if item.strip()
         ),
         system_prompt=body.strip(),
     )
