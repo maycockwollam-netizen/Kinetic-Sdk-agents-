@@ -273,14 +273,40 @@ class TerminalTool(Tool):
             pass
 
     def _communicate(self, proc: subprocess.Popen, timeout: float) -> tuple[str, bool]:
-        """Collect all output via ``communicate`` (no streaming)."""
+        """Collect all output via ``communicate`` (no streaming).
+
+        After a timeout the process group is killed, but a child that called
+        ``setsid`` may survive ``killpg`` and still hold the output pipe, so
+        the follow-up ``communicate`` is itself bounded to avoid hanging past
+        the promised wall-clock timeout.
+        """
         try:
             output, _err = proc.communicate(timeout=timeout)
             return output or "", False
         except subprocess.TimeoutExpired:
             self._kill_group(proc)
-            output, _err = proc.communicate()
+            output, _err = self._collect_remaining(proc)
             return output or "", True
+
+    @staticmethod
+    def _collect_remaining(proc: subprocess.Popen) -> tuple[str, str]:
+        """Drain the pipe with a bounded wait (never hang post-timeout)."""
+        try:
+            return proc.communicate(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                return proc.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                if proc.stdout is not None:
+                    try:
+                        proc.stdout.close()
+                    except OSError:
+                        pass
+                return "", ""
 
     def _run_with_progress(self, proc: subprocess.Popen, timeout: float) -> tuple[str, bool]:
         """Read output line-by-line, invoking ``progress_callback`` per line."""
@@ -306,11 +332,22 @@ class TerminalTool(Tool):
         except subprocess.TimeoutExpired:
             timed_out = True
             self._kill_group(proc)
-            proc.wait()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except (ProcessLookupError, PermissionError):
+                    pass
         thread.join(timeout=2.0)
+        if not timed_out:
+            try:
+                buffer.append(stream.read())
+            except (OSError, ValueError):
+                pass
         try:
-            buffer.append(stream.read())
-        except (OSError, ValueError):
+            stream.close()
+        except OSError:
             pass
         return "".join(buffer), timed_out
 

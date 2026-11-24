@@ -60,21 +60,27 @@ class WebFetchResponse:
 WebFetcher = Callable[[str, int, float], WebFetchResponse]
 
 
-def _default_fetcher(url: str, max_bytes: int, timeout: float) -> WebFetchResponse:
-    """Minimal GET via ``urllib``: capped body + timeout (redirects handled)."""
-    request = urllib.request.Request(url, headers={"User-Agent": "kinetic-sdk/1.0"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - caller already ran assert_public_settable
-        status = int(response.status)
-        content_type = response.headers.get("Content-Type")
-        raw = response.read(max_bytes + 1)
-        payload = raw[:max_bytes]
-        text = payload.decode(response.charset or "utf-8", errors="replace")
-    return WebFetchResponse(
-        status=status,
-        text=text,
-        final_url=str(request.full_url),
-        content_type=content_type,
-    )
+class _SSRFRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject any 3xx redirect hop whose target fails the SSRF check.
+
+    ``urllib`` follows redirects automatically; without this the initial
+    ``assert_public_settable`` only validates the FIRST URL, so a public page
+    could 302 to a private/cloud-metadata host. Each redirect target is
+    re-validated against the same ``allowed_hosts`` policy before it is
+    followed.
+    """
+
+    def __init__(self, allowed_hosts: tuple[str, ...]) -> None:
+        self.allowed_hosts = allowed_hosts
+
+    def redirect_request(  # type: ignore[override]
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> Any:
+        try:
+            assert_public_settable(newurl, self.allowed_hosts)
+        except WebFetchError as exc:
+            raise WebFetchError(f"redirect refused ({code}): {exc}") from exc
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 #: Private/reserved networks an SSRF guard must never reach.
@@ -155,7 +161,7 @@ class WebFetchTool(Tool):
         max_chars: Cap on returned output characters (tail-biased).
         timeout: Per-request timeout in seconds.
         fetcher: Injectable GET implementation (tests). Defaults to
-            :func:`_default_fetcher`.
+            :meth:`_fetch` (SSRF-checked redirects + capped body).
     """
 
     name: str = "web_fetch"
@@ -197,7 +203,22 @@ class WebFetchTool(Tool):
         self._max_bytes = max_bytes
         self._max_chars = max_chars
         self._timeout = timeout
-        self._fetcher: WebFetcher = fetcher if fetcher is not None else _default_fetcher
+        self._fetcher: WebFetcher = fetcher if fetcher is not None else self._fetch
+
+    def _fetch(self, url: str, max_bytes: int, timeout: float) -> WebFetchResponse:
+        """GET via ``urllib`` with SSRF-checked redirects + capped body."""
+        opener = urllib.request.build_opener(_SSRFRedirectHandler(self._allowed_hosts))
+        request = urllib.request.Request(url, headers={"User-Agent": "kinetic-sdk/1.0"})
+        with opener.open(request, timeout=timeout) as response:  # noqa: S310 - each hop re-validated
+            status = int(response.status)
+            content_type = response.headers.get("Content-Type")
+            final_url = response.geturl()  # the URL that actually served us (after redirects)
+            raw = response.read(max_bytes + 1)
+            payload = raw[:max_bytes]
+            text = payload.decode(response.charset or "utf-8", errors="replace")
+        return WebFetchResponse(
+            status=status, text=text, final_url=final_url, content_type=content_type
+        )
 
     def execute(self, url: str, max_chars: int | None = None, **_: Any) -> ToolResult:  # type: ignore[override]
         """Fetch *url* and return its readable text (SSRF-guarded)."""

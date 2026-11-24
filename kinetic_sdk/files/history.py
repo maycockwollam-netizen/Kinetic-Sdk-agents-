@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from kinetic_sdk.files.snapshots import (
     GitSnapshotStore,
     SnapshotStoreError,
     is_internal_snapshot_path,
 )
+from kinetic_sdk.subagent.exceptions import FileLockTimeoutError
+from kinetic_sdk.subagent.filelock import FileLockRegistry
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.tool.base import (
     Tool,
     ToolCapability,
@@ -44,9 +49,45 @@ class FileHistoryTool(Tool):
         "required": ["action", "path"],
     }
 
-    def __init__(self, workspace: WorkspaceBase, snapshot_store: GitSnapshotStore | None = None) -> None:
+    def __init__(
+        self,
+        workspace: WorkspaceBase,
+        snapshot_store: GitSnapshotStore | None = None,
+        lock_registry: FileLockRegistry | None = None,
+        lock_timeout: float = 5.0,
+    ) -> None:
         self._workspace = workspace
         self._snapshot_store = snapshot_store
+        #: Shared per-file lock registry (same one FileTool/ApplyPatchTool use)
+        #: so a concurrent restore cannot race another agent's write to the
+        #: same file. ``None`` disables locking (historical behaviour).
+        self._lock_registry = lock_registry
+        self._lock_timeout = lock_timeout
+        self._owner_id: str | None = None
+
+    def bind(self, agent: "Agent", *, owner_id: str | None = None) -> None:
+        """Bind lock ownership to *agent*'s stable delegation audit id.
+
+        Required only when ``lock_registry`` is configured, mirroring
+        :meth:`FileTool.bind` so sub-agents share the cross-tree lock registry.
+        """
+        if owner_id is None:
+            from kinetic_sdk.subagent.delegation import agent_id_for
+
+            owner_id = agent_id_for(agent)
+        self._owner_id = owner_id
+
+    def _write_locked(self, path: str, operation: Any) -> Any:
+        """Run one backend write under the shared per-file lease."""
+        if self._lock_registry is None:
+            return operation()
+        if self._owner_id is None:
+            raise ValueError(
+                "FileHistoryTool with lock_registry is not bound to an agent; "
+                "call file_history_tool.bind(agent) after constructing the agent"
+            )
+        with self._lock_registry.acquire(path, self._owner_id, timeout=self._lock_timeout):
+            return operation()
 
     def execute(self, action: str, path: str, **params: Any) -> ToolResult:  # type: ignore[override]
         if self._snapshot_store is None:
@@ -65,7 +106,10 @@ class FileHistoryTool(Tool):
                 if not isinstance(snapshot_id, str):
                     return ToolResult(error="restore requires snapshot_id")
                 content = self._snapshot_store.restore(path, snapshot_id)
-                self._workspace.write_text(path, content)
+                try:
+                    self._write_locked(path, lambda: self._workspace.write_text(path, content))
+                except FileLockTimeoutError as exc:
+                    return ToolResult(error=f"file is locked for writing: {exc}")
                 return ToolResult(output=f"restored {path} from snapshot {snapshot_id}", metadata={"path": path, "snapshot_id": snapshot_id})
             return ToolResult(error="unknown action (expected list/restore)")
         except (SnapshotStoreError, WorkspaceError, ValueError, OSError) as exc:

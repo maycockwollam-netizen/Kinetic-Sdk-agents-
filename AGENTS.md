@@ -1301,3 +1301,22 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   base64 `screenshot`). `grep` gained a `structured=True` mode returning a
   list of `{"file","line","text"}` objects (the three backends now emit
   tuples; the default text `file:line:text` output is unchanged).
+
+## Security/correctness hardening pass (2026-11-24)
+- **web_fetch**: every 3xx redirect hop is re-validated against the SSRF
+  policy (`_SSRFRedirectHandler`) — a public page can no longer 302 to a
+  private/cloud-metadata host; `final_url` now reflects `response.geturl()`.
+- **subagent budget**: `unwrap_guarded_client` strips guard layers (through
+  `_SerializedLLMClient`/`inner`) before wrapping a fresh guard in
+  `spawn_subagent`, `pool`, `map_reduce` and `orchestrator` — no more
+  double-charging the shared `SpawnBudget` when `charge_root_tool_calls` is on.
+- **async delegation**: `llm_factory` is now called for the INFERRED model
+  too (mirrors sync), so async pool workers get per-worker clients instead of
+  sharing one.
+- **terminal/grep**: bounded post-timeout collection + pipe closing (no leak,
+  no hang after a `setsid`-detached child); orchestrator retry keeps the
+  producing `agent_id`; browser tracks in-flight requests via a
+  `WeakKeyDictionary` (no `id()` reuse); vector `search` applies the same
+  `score > 0` filter on the Rust path as the Python fallback; memory
+  consolidation is serialised (no duplicate summaries); `FileHistoryTool`
+  restore now goes through the shared `FileLockRegistry` lease.

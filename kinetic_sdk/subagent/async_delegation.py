@@ -207,19 +207,28 @@ def spawn_async_subagent(
     base_llm = parent_agent.llm
     if isinstance(base_llm, _GuardedAsyncLLMClient):
         base_llm = base_llm.inner
-    if spec.model is not None and spec.model != getattr(base_llm, "model", None):
-        if llm_factory is None:
+    requested_model = spec.model or getattr(base_llm, "model", None)
+    if llm_factory is not None:
+        # Mirror the sync spawn: build ONE client per worker even when the
+        # worker inherits the parent's model, so concurrent workers get their
+        # own isolated client instead of sharing a single instance.
+        if requested_model is None:
             raise SubagentError(
-                f"Sub-agent {spec.name!r} requests model {spec.model!r}, which "
-                "differs from the parent's model; pass llm_factory to build a "
-                "client for it (or leave spec.model=None to inherit)"
+                f"Sub-agent {spec.name!r} cannot use llm_factory because the "
+                "parent client has no model name"
             )
-        built = llm_factory(spec.model)
+        built = llm_factory(requested_model)
         if not isinstance(built, AsyncLLMClient):
             from kinetic_sdk.llm.async_client import SyncToAsyncLLMClient
 
             built = SyncToAsyncLLMClient(built)
         base_llm = built
+    elif spec.model is not None and spec.model != getattr(base_llm, "model", None):
+        raise SubagentError(
+            f"Sub-agent {spec.name!r} requests model {spec.model!r}, which "
+            "differs from the parent's model; pass llm_factory to build a "
+            "client for it (or leave spec.model=None to inherit)"
+        )
 
     agent_id = uuid.uuid4().hex
     guarded_llm = _GuardedAsyncLLMClient(
