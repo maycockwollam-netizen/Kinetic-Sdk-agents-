@@ -1287,3 +1287,11 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   keep the end of a long build log), and an optional `progress_callback`
   invoked per output line as the command streams (library/UI; the agent-loop
   wiring is separate).
+- **Deterministic tool cache + output-token estimate** (`tool/cache.py`,
+  `agent.py`). `ToolCache` (thread-safe LRU + optional TTL) + `CachedTool`
+  (opt-in wrapper) memoize the result of identical read-only ``(tool,
+  args)`` calls; errors are never cached. It is deliberately NOT wired into
+  the agent loop (write-bearing tools must not serve stale results). The
+  agent now stamps `tokens_approx` (a naive ``len/4`` estimate of the
+  serialised output) on every `ToolResult.metadata` and surfaces it on the
+  `agent.tool_call_finished` event, so the model/UI can gauge context cost.

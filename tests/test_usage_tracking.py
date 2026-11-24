@@ -111,3 +111,24 @@ def test_mock_response_without_usage_is_silence():
     agent = Agent(llm=llm, permission_policy=PermissivePolicy())
     agent.run("hi")
     assert agent.usage.snapshot().calls == 0
+
+
+def test_tool_result_carries_tokens_approx():
+    from kinetic_sdk.testing import MockTool, tool_response
+
+    tool = MockTool(name="echo", handler=lambda **kw: "x" * 400)
+    llm = MockLLMClient(
+        [tool_response("c1", "echo", {}), text_response("done")]
+    )
+    obs = InMemoryObservabilityLogger()
+    agent = Agent(
+        llm=llm,
+        tools=[tool],
+        permission_policy=PermissivePolicy(),
+        observability_logger=obs,
+    )
+    agent.run("hi")
+    finished = obs.get_events("agent.tool_call_finished")
+    assert len(finished) == 1
+    approx = finished[0]["payload"]["tokens_approx"]
+    assert isinstance(approx, int) and approx >= 100  # 400 chars token-ish / 4
