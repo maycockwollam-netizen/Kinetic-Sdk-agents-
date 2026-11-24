@@ -206,3 +206,12 @@ def test_spawn_budget_record_cost_rejects_non_finite() -> None:
         budget.record_cost("a", float("nan"))
     with pytest.raises(ValueError, match="finite"):
         budget.record_cost("a", float("inf"))
+
+
+def test_spawn_budget_record_cost_rejects_negative() -> None:
+    budget = SpawnBudget(max_total_cost_usd=1.0)
+    with pytest.raises(ValueError, match="non-negative"):
+        budget.record_cost("a", -0.5)
+    with pytest.raises(ValueError, match="non-negative"):
+        budget.record_cost("a", -100)
+    assert budget.used_cost_usd == 0.0

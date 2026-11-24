@@ -132,8 +132,14 @@ class SubagentOrchestrator:
         ``budget`` (one shared :class:`SpawnBudget`) caps the whole batch's
         tool calls/tokens/cost across all workers; ``None`` creates an
         unlimited default. ``llm_factory``, when given, builds a client per
-        worker (called with the spec's ``model``). ``timeout`` bounds how long
-        the batch is awaited (per :func:`as_completed`).
+        worker (called with the spec's ``model``).
+
+        ``timeout`` is a HARD deadline for the batch: when it fires, pending
+        tasks yield a failed ``"batch timed out"`` result and ``run()`` returns
+        immediately WITHOUT waiting for in-flight workers. Those sub-agents
+        still finish in background daemon threads (Python cannot force-kill a
+        thread), keeping their shared-budget/event side effects; their results
+        are never collected.
         """
         budget = budget if budget is not None else SpawnBudget()
         for task in tasks:
@@ -151,7 +157,9 @@ class SubagentOrchestrator:
             base_llm_override = _SerializedLLMClient(self.parent.llm)
 
         results: dict[int, OrchestrationResult] = {}
-        with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
+        executor = ThreadPoolExecutor(max_workers=self.max_concurrency)
+        timed_out = False
+        try:
             futures: dict[Future[Any], int] = {}
             for index, task in enumerate(tasks):
                 self._bump_started(index, task, attempt=1)
@@ -181,9 +189,19 @@ class SubagentOrchestrator:
                         attempts=attempts,
                     )
             except FutureTimeoutError:
+                timed_out = True
                 # The batch deadline expired: tasks that never produced a
                 # result must still yield one (not a missing key).
-                pass
+        finally:
+            if timed_out:
+                # Hard deadline: do NOT wait for in-flight workers. A sub-agent
+                # already running still finishes in its daemon thread (Python
+                # cannot force-kill a thread); its result is simply never
+                # collected and the caller returns now. Queued-but-not-started
+                # tasks are cancelled instead of running after the deadline.
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
 
         for index, task in enumerate(tasks):
             if index not in results:

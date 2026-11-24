@@ -154,3 +154,53 @@ def test_vector_memory_preserves_lifecycle_fields_on_reload(tmp_path) -> None:
     assert got.source is MemorySource.LLM_INFERENCE
     assert got.metadata == {"k": "v"}
     assert got.expires_at == entry.expires_at
+
+
+def test_vector_memory_concurrent_persist_never_loses_entries(tmp_path, monkeypatch) -> None:
+    """Two writers racing persist must not let an older snapshot clobber a newer one.
+
+    Regression for the race-condition finding: ``_persist`` used to snapshot
+    under the data lock, then release it before writing + ``os.replace``, so
+    thread A could rename an OLDER snapshot last and drop thread B's entry
+    from disk. The persist lock must cover snapshot -> serialize -> rename.
+
+    The test pins the old interleaving: writer A's ``os.replace`` is blocked
+    while writer B runs; B is given time to finish its whole write, then A is
+    released so its OLDER snapshot lands on disk LAST. Under the pre-fix code
+    that drops B; under the fix, B could not write at all while A held the
+    persist lock, so A writes first, B then rewrites BOTH entries.
+    """
+    import os
+    import threading
+    import time
+
+    path = tmp_path / "mem.json"
+    first_replace_ready = threading.Event()
+    release_first_replace = threading.Event()
+    real_replace = os.replace
+
+    def blocking_replace(src, dst):
+        if os.fspath(dst) == os.fspath(path) and not first_replace_ready.is_set():
+            first_replace_ready.set()
+            assert release_first_replace.wait(5), "first writer never released"
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", blocking_replace)
+    memory = VectorMemory(FakeEmbeddings(), path=path)
+
+    first = threading.Thread(target=memory.add, args=("cats",))
+    first.start()
+    # Let the first persist reach its os.replace (snapshot [cats]) and block there.
+    assert first_replace_ready.wait(5)
+    second = threading.Thread(target=memory.add, args=("dogs",))
+    second.start()
+    # Under the FIXED code the second writer is blocked on the persist lock
+    # during this wait, so giving it time to write is harmless; under the old
+    # code it finishes writing [cats, dogs] before the first writer renames.
+    time.sleep(0.1)
+    release_first_replace.set()
+    first.join()
+    second.join()
+
+    reloaded = VectorMemory(FakeEmbeddings(), path=path)
+    assert {entry.text for entry in reloaded.all()} == {"cats", "dogs"}

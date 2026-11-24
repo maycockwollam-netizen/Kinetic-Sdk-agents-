@@ -86,6 +86,10 @@ class VectorMemory(MemoryProvider):
         self._entries: list[MemoryEntry] = []
         self._vectors: list[list[float] | None] = []
         self._lock = threading.Lock()
+        # Serialises the whole snapshot -> serialize -> rename sequence so a
+        # concurrent writer can never overwrite a NEWER snapshot with an older
+        # one (a separate lock keeps disk I/O off the hot data path).
+        self._persist_lock = threading.Lock()
         self.path = Path(path) if path is not None else None
         if self.path is not None:
             self._load()
@@ -186,27 +190,34 @@ class VectorMemory(MemoryProvider):
     # --- persistence ---------------------------------------------------
 
     def _persist(self) -> None:
-        """Atomically write entries + vectors to ``self.path`` (no-op in-memory)."""
+        """Atomically write entries + vectors to ``self.path`` (no-op in-memory).
+
+        The snapshot, serialization and rename all happen under
+        ``_persist_lock``: without that, two writers could snapshot different
+        generations and have the OLDER one rename last, silently dropping the
+        newer entries from disk even though they are still in RAM.
+        """
         if self.path is None:
             return
-        with self._lock:
-            entries = [asdict(entry) for entry in self._entries]
-            vectors = [list(vector) if vector is not None else None for vector in self._vectors]
-        payload = {"schema_version": self.SCHEMA_VERSION, "entries": entries, "vectors": vectors}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(
-            dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False)
-            os.replace(tmp_name, self.path)
-        except BaseException:
+        with self._persist_lock:
+            with self._lock:
+                entries = [asdict(entry) for entry in self._entries]
+                vectors = [list(vector) if vector is not None else None for vector in self._vectors]
+            payload = {"schema_version": self.SCHEMA_VERSION, "entries": entries, "vectors": vectors}
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp"
+            )
             try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False)
+                os.replace(tmp_name, self.path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
 
     def _load(self) -> None:
         """Load a previously persisted store; broken files fail loudly."""
