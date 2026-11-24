@@ -33,6 +33,14 @@ ROUTING_SYSTEM_PROMPT = (
 )
 
 
+def _catalogue_line(name: str, spec: SubagentSpec) -> str:
+    """One catalogue row: description plus any capability boundaries."""
+    line = f"- {name}: {spec.description or '(no description)'}"
+    if spec.boundaries:
+        line += f"  [boundaries: {'; '.join(spec.boundaries)}]"
+    return line
+
+
 def _parse_routing(content: str) -> dict[str, Any]:
     """Best-effort parse of the router reply; tolerate code-fenced JSON."""
     text = content.strip()
@@ -60,8 +68,7 @@ def route_subagent(
     reply cannot be parsed or names an unknown sub-agent.
     """
     catalogue = "\n".join(
-        f"- {name}: {spec.description or '(no description)'}"
-        for name, spec in sorted(specs.items())
+        _catalogue_line(name, spec) for name, spec in sorted(specs.items())
     )
     user = f"Available sub-agents:\n{catalogue}\n\nTask:\n{task}"
     response = llm.chat(

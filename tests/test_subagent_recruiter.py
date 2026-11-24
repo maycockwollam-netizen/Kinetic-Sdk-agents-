@@ -23,6 +23,30 @@ def _specs() -> dict[str, SubagentSpec]:
     }
 
 
+def test_router_catalogue_includes_boundaries() -> None:
+    def route_mock(messages, tools, system):  # type: ignore[no-untyped-def]
+        return text_response('{"subagent": "coder", "task_prompt": "x"}')
+
+    captured: dict[str, str] = {}
+
+    class Recording(MockLLMClient):
+        def chat(self, messages, tools=None, system=None, **kwargs):  # type: ignore[override]
+            captured["user"] = messages[0]["content"]
+            return route_mock(messages, tools, system)
+
+    specs = {
+        "coder": SubagentSpec(
+            name="coder",
+            system_prompt="p",
+            description="fixes code",
+            boundaries=("no frontend", "no design"),
+        )
+    }
+    route_subagent(specs, "fix a bug", Recording([]))
+    assert "no frontend" in captured["user"]
+    assert "no design" in captured["user"]
+
+
 def test_route_subagent_selects_by_description() -> None:
     route_llm = MockLLMClient(
         [text_response('{"subagent": "coder", "task_prompt": "implement the sort function"}')]

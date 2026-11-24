@@ -454,6 +454,26 @@ def test_plain_text_handoff_keeps_success_status_when_no_schema() -> None:
     assert result.final_message == "plain done"
 
 
+def test_context_handoff_seeds_child_first_message() -> None:
+    def handler(messages, tools, system):  # type: ignore[no-untyped-def]
+        users = [
+            m["content"]
+            for m in messages
+            if m.get("role") == "user" and isinstance(m.get("content"), str)
+        ]
+        return text_response(f"first={users[0]} | last={users[-1]}")
+
+    parent = Agent(llm=MockLLMClient([handler]), permission_policy=PermissivePolicy())
+    result = run_subagent(
+        parent,
+        CHILD_SPEC,
+        "the task",
+        SpawnBudget(100),
+        context="BACKGROUND: the repo is X",
+    )
+    assert result.final_message == "first=BACKGROUND: the repo is X | last=the task"
+
+
 def test_back_pressure_injects_wrap_up_when_budget_low() -> None:
     from kinetic_sdk.subagent.budget import RepetitionCircuitBreaker, SpawnBudget
     from kinetic_sdk.subagent.delegation import (

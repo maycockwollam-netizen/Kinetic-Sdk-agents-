@@ -13,6 +13,22 @@ from kinetic_sdk.subagent import (
 )
 
 
+def test_boundaries_roundtrip_and_validation(tmp_path) -> None:
+    from kinetic_sdk.subagent import load_subagent_spec
+
+    spec = SubagentSpec(
+        name="writer",
+        system_prompt="p",
+        boundaries=("no frontend", "read-only"),
+    )
+    path = tmp_path / "writer.md"
+    path.write_text(spec.to_markdown(), encoding="utf-8")
+    loaded = load_subagent_spec(path)
+    assert loaded.boundaries == ("no frontend", "read-only")
+    with pytest.raises(SubagentSpecError, match="boundaries"):
+        SubagentSpec(name="x", system_prompt="p", boundaries=["not", "a", "tuple"])
+
+
 def test_valid_minimal_spec() -> None:
     spec = SubagentSpec(name="researcher", system_prompt="You research one question.")
     assert spec.name == "researcher"

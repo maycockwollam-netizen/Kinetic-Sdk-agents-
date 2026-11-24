@@ -1260,6 +1260,14 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   self-contained prompt; `delegate_naturally` then runs it through the normal
   isolated `run_subagent` path. Unknown-name / unparseable routing raises
   `SubagentError`.
+- **Capability boundaries + context handoff.** `SubagentSpec.boundaries`
+  (a tuple of "do-not / only" hints, round-tripped through Markdown) surface
+  to the router catalogue so a router avoids wasteful delegation. `run_subagent`
+  / `run_async_subagent` (and their ``spawn`` twins) accept `context`: an
+  explicit string seeded as the child's FIRST user message (beyond
+  `task_prompt`), so a parent can hand over relevant background/files without
+  re-discovery. Isolation is unchanged — only the seeded context + final
+  message cross the boundary.
 - **Complexity-tier routing** (`subagent/recruiter.py`).
   `delegate_by_complexity(parent, tiers, task, ...)` classifies the task
   (with the parent's classifier or a supplied one: FLASH -> cheap tier,

@@ -348,6 +348,7 @@ def spawn_subagent(
     llm_factory: LLMFactory | None = None,
     _base_llm_override: LLMClient | None = None,
     isolate_tools: bool = False,
+    context: str | None = None,
 ) -> Agent:
     """Build the sub-agent for *spec* (does NOT run it — see ``run_subagent``).
 
@@ -459,13 +460,17 @@ def spawn_subagent(
         allowed = set(spec.tools)
         tools = [tool for tool in tools if getattr(tool, "name", "") in allowed]
 
+    # Fresh context: own system prompt, no parent history (decision 1 +
+    # context isolation). The parent -> child channels are the task_prompt
+    # passed to run() later and, optionally, an explicit `context` string
+    # seeded as the child's FIRST user message (context handoff).
+    initial_messages = [{"role": "user", "content": context}] if context else []
     sub_agent = Agent(
         llm=guarded_llm,
         tools=tools,
-        # Fresh context: own system prompt, no parent history (decision 1 +
-        # context isolation). The ONLY parent -> child channel is the
-        # task_prompt passed to run() later.
-        state=ConversationState(system_prompt=spec.system_prompt),
+        state=ConversationState(
+            system_prompt=spec.system_prompt, messages=initial_messages
+        ),
         event_bus=parent_agent.event_bus,
         classifier=parent_agent.classifier,
         max_iterations=parent_agent._max_iterations_override,  # noqa: SLF001
@@ -516,6 +521,7 @@ def run_subagent(
     llm_factory: LLMFactory | None = None,
     _base_llm_override: LLMClient | None = None,
     isolate_tools: bool = False,
+    context: str | None = None,
 ) -> DelegationResult:
     """Spawn the sub-agent and run it to completion on *task_prompt*.
 
@@ -534,6 +540,7 @@ def run_subagent(
         llm_factory=llm_factory,
         _base_llm_override=_base_llm_override,
         isolate_tools=isolate_tools,
+        context=context,
     )
     agent_id = agent_id_for(sub_agent)
     status = SubagentStatus.SUCCESS
