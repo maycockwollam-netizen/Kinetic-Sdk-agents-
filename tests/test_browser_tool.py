@@ -41,6 +41,9 @@ class FakePage:
     def wait_for_selector(self, selector, timeout=None):
         pass
 
+    def inner_text(self, selector):
+        return "Hello page body content"
+
     def on(self, event, handler):
         self._handlers[event] = handler
 
@@ -209,3 +212,16 @@ def test_close_is_idempotent_and_clears_pages():
     assert tool._browser is None
     assert tool._playwright is None
     tool.close()  # second close must not raise
+
+
+def test_snapshot_action_returns_structured_page():
+    tool = _tool_with_fake_browser(FakeBrowser)
+    tool.execute(action="new_tab")
+    tool.execute(action="navigate", url="http://example.com")
+    snap = tool.execute(action="snapshot").output
+    assert snap["url"] == "http://example.com"
+    assert snap["title"] == "Tab"
+    assert "body content" in snap["body_text"]
+    assert snap["truncated"] is False
+    tiny = tool.execute(action="snapshot", max_chars=5).output
+    assert tiny["truncated"] is True

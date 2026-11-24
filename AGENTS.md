@@ -1295,3 +1295,9 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   agent now stamps `tokens_approx` (a naive ``len/4`` estimate of the
   serialised output) on every `ToolResult.metadata` and surfaces it on the
   `agent.tool_call_finished` event, so the model/UI can gauge context cost.
+- **Browser `snapshot` action + structured grep.** `browser` gained a
+  `snapshot` action returning `{url, title, body_text, truncated}` — a
+  readable, size-capped view of the page (complements the existing
+  base64 `screenshot`). `grep` gained a `structured=True` mode returning a
+  list of `{"file","line","text"}` objects (the three backends now emit
+  tuples; the default text `file:line:text` output is unchanged).

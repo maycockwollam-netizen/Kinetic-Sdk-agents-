@@ -141,6 +141,7 @@ class GrepTool(_WorkspaceSearchTool):
             "pattern": {"type": "string"}, "path": {"type": "string", "default": "."},
             "glob": {"type": "string"}, "case_sensitive": {"type": "boolean", "default": True},
             "max_results": {"type": "integer", "default": 100},
+            "structured": {"type": "boolean", "default": False},
         },
         "required": ["pattern"],
     }
@@ -154,11 +155,14 @@ class GrepTool(_WorkspaceSearchTool):
 
     def execute(  # type: ignore[override]
         self, pattern: str, path: str = ".", glob: str | None = None,
-        case_sensitive: bool = True, max_results: int = DEFAULT_MAX_RESULTS, **_: Any,
+        case_sensitive: bool = True, max_results: int = DEFAULT_MAX_RESULTS,
+        structured: bool = False, **_: Any,
     ) -> ToolResult:
         try:
             if not isinstance(pattern, str):
                 return ToolResult(error="pattern must be a string")
+            if not isinstance(structured, bool):
+                return ToolResult(error="structured must be a boolean")
             limit = self._validate_max_results(max_results, self.DEFAULT_MAX_RESULTS)
             root = self._resolve_root(path)
             if shutil.which("rg"):
@@ -170,13 +174,36 @@ class GrepTool(_WorkspaceSearchTool):
             else:
                 matches = self._grep_python(pattern, root, glob, case_sensitive, limit)
                 engine = "python"
-            return ToolResult(output="\n".join(matches) or "(no matches)", metadata={"count": len(matches), "engine": engine})
+            return self._render(matches, structured=structured, engine=engine)
         except _SearchTimeoutError as exc:
             return ToolResult(error=f"regex timed out: {exc}")
         except (OSError, WorkspaceError, ValueError, re.error) as exc:
             return ToolResult(error=f"search failed: {exc}")
 
-    def _grep_rg(self, pattern: str, root: Path, glob: str | None, case_sensitive: bool, limit: int) -> list[str]:
+    @staticmethod
+    def _render(
+        matches: list[tuple[str, int, str]],
+        *,
+        structured: bool,
+        engine: str,
+    ) -> ToolResult:
+        """Render matches as text or as a structured list of dicts."""
+        count = len(matches)
+        metadata: dict[str, Any] = {"count": count, "engine": engine}
+        if structured:
+            return ToolResult(
+                output=[
+                    {"file": relative, "line": line, "text": text}
+                    for relative, line, text in matches
+                ],
+                metadata=metadata,
+            )
+        rendered = "\n".join(
+            f"{relative}:{line}:{text}" for relative, line, text in matches
+        )
+        return ToolResult(output=rendered or "(no matches)", metadata=metadata)
+
+    def _grep_rg(self, pattern: str, root: Path, glob: str | None, case_sensitive: bool, limit: int) -> list[Any]:
         command = ["rg", "--with-filename", "--line-number", "--no-heading", "--color", "never"]
         if not case_sensitive:
             command.append("--ignore-case")
@@ -201,7 +228,7 @@ class GrepTool(_WorkspaceSearchTool):
             max(0.1, policy_timeout - self.RG_TIMEOUT_MARGIN_SECONDS),
         )
         bytes_read = 0
-        matches: list[str] = []
+        matches: list[Any] = []
         try:
             while True:
                 remaining = deadline - time.monotonic()
@@ -222,7 +249,7 @@ class GrepTool(_WorkspaceSearchTool):
                 filename, line_number, content = match.groups()
                 relative = self._safe_relative(Path(filename))
                 if relative is not None:
-                    matches.append(f"{relative}:{line_number}:{self._truncate_line(content)}")
+                    matches.append((relative, int(line_number), self._truncate_line(content)))
                 if len(matches) >= limit:
                     break
         finally:
@@ -233,17 +260,17 @@ class GrepTool(_WorkspaceSearchTool):
             raise WorkspaceError("ripgrep failed")
         return matches
 
-    def _grep_rust(self, pattern: str, root: Path, glob: str | None, case_sensitive: bool, limit: int) -> list[str]:
-        matches: list[str] = []
+    def _grep_rust(self, pattern: str, root: Path, glob: str | None, case_sensitive: bool, limit: int) -> list[Any]:
+        matches: list[Any] = []
         for filename, line_number, content in _kinetic_rs.grep_contents(
             pattern, str(root), glob, case_sensitive, limit
         ):
             relative = self._safe_relative(Path(filename))
             if relative is not None:
-                matches.append(f"{relative}:{line_number}:{self._truncate_line(content)}")
+                matches.append((relative, int(line_number), self._truncate_line(content)))
         return matches
 
-    def _grep_python(self, pattern: str, root: Path, glob: str | None, case_sensitive: bool, limit: int) -> list[str]:
+    def _grep_python(self, pattern: str, root: Path, glob: str | None, case_sensitive: bool, limit: int) -> list[Any]:
         result_queue: multiprocessing.queues.Queue[Any] = multiprocessing.Queue(maxsize=1)
         worker = multiprocessing.Process(target=_python_grep_worker, args=(result_queue, str(root), pattern, glob, case_sensitive, limit))
         worker.start()
@@ -258,11 +285,11 @@ class GrepTool(_WorkspaceSearchTool):
             raise WorkspaceError("Python search worker exited without a result") from None
         if status == "error":
             raise WorkspaceError(str(payload))
-        matches: list[str] = []
+        matches: list[Any] = []
         for filename, line_number, content in payload:
             relative = self._safe_relative(Path(filename))
             if relative is not None:
-                matches.append(f"{relative}:{line_number}:{self._truncate_line(content)}")
+                matches.append((relative, int(line_number), self._truncate_line(content)))
         return matches
 
     @classmethod
