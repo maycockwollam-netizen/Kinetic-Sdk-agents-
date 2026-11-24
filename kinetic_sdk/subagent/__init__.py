@@ -107,6 +107,11 @@ from kinetic_sdk.subagent.pool import (
     spawn_subagent_pool,
 )
 from kinetic_sdk.subagent.tool import DELEGATE_TOOL_NAME, DelegateTool
+from kinetic_sdk.subagent.tree import (
+    DelegationTree,
+    SubagentNode,
+    reconstruct_delegation_tree,
+)
 
 __all__ = [
     "DEFAULT_MAX_CONSECUTIVE_REPEATS",
@@ -117,6 +122,9 @@ __all__ = [
     "SubagentOrchestrator",
     "SubagentStatus",
     "DELEGATE_TOOL_NAME",
+    "DelegationTree",
+    "SubagentNode",
+    "reconstruct_delegation_tree",
     "AsyncDelegateTool",
     "AsyncLLMFactory",
     "BudgetExceededError",
