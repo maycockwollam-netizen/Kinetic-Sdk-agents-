@@ -213,3 +213,94 @@ class TestAgentIntegration:
         assert len(finished) == 1
         assert finished[0]["payload"]["is_error"] is False
         assert not obs.get_events("security.permission_denied")
+
+
+def _reload_src(tool_name: str, output: str) -> dict[str, str]:
+    return {
+        "plugin.py": textwrap.dedent(
+            f"""\
+            from kinetic_sdk.tool.base import Tool, ToolResult
+
+            class T(Tool):
+                name = "{tool_name}"
+                description = "d"
+                parameters = {{"type": "object", "properties": {{}}}}
+
+                def execute(self):
+                    return ToolResult(output="{output}")
+
+            def make_tools():
+                return [T()]
+            """
+        )
+    }
+
+
+class TestLoadState:
+    def test_load_all_tracks_loaded_plugins(self, tmp_path):
+        write_plugin(tmp_path, "plug", modules=tool_module("alpha"))
+        registry = PluginRegistry(directory=tmp_path)
+        registry.load_all()
+        assert registry.is_loaded("plug")
+        assert [t.name for t in registry.loaded_tools("plug")] == ["alpha"]
+        assert registry.loaded_tools("ghost") == []
+
+    def test_unload_detaches_plugin_tools(self, tmp_path):
+        write_plugin(tmp_path, "a", modules=tool_module("alpha"))
+        write_plugin(tmp_path, "b", modules=tool_module("beta"))
+        registry = PluginRegistry(directory=tmp_path)
+        tools = registry.load_all()
+        assert {t.name for t in tools} == {"alpha", "beta"}
+        assert registry.is_loaded("a")
+        removed = registry.unload("a")
+        assert [t.name for t in removed] == ["alpha"]
+        assert not registry.is_loaded("a")
+        assert registry.loaded_tools("a") == []
+        assert [t.name for t in registry.loaded_tools("b")] == ["beta"]
+        with pytest.raises(PluginLoadError):
+            registry.unload("a")
+
+    def test_reload_picks_up_source_changes(self, tmp_path):
+        write_plugin(tmp_path, "plug", modules=_reload_src("alpha", "first"))
+        registry = PluginRegistry(directory=tmp_path)
+        tools = registry.load_all()
+        assert [t.name for t in tools] == ["alpha"]
+        assert registry.loaded_tools("plug")[0].execute().output == "first"
+
+        write_plugin(tmp_path, "plug", modules=_reload_src("alpha", "second"))
+        fresh = registry.reload("plug")
+        assert [t.name for t in fresh] == ["alpha"]
+        assert fresh[0].execute().output == "second"
+        # Registry state reflects the new build.
+        assert registry.loaded_tools("plug")[0].execute().output == "second"
+
+    def test_reload_rejects_collision_with_another_plugin(self, tmp_path):
+        write_plugin(tmp_path, "a", modules=tool_module("shared"))
+        write_plugin(tmp_path, "b", modules=tool_module("unique"))
+        registry = PluginRegistry(directory=tmp_path)
+        tools = registry.load_all()
+        assert {t.name for t in tools} == {"shared", "unique"}
+        # b's new version tries to claim the tool a already owns.
+        write_plugin(tmp_path, "b", modules=tool_module("shared"))
+        with pytest.raises(PluginLoadError, match="collides"):
+            registry.reload("b")
+        # a's ownership is untouched.
+        assert [t.name for t in registry.loaded_tools("a")] == ["shared"]
+
+    def test_reload_missing_plugin_raises(self, tmp_path):
+        registry = PluginRegistry(directory=tmp_path)
+        with pytest.raises(PluginLoadError, match="no longer discovered"):
+            registry.reload("ghost")
+
+    def test_reload_failure_keeps_working_tools(self, tmp_path, caplog):
+        write_plugin(tmp_path, "plug", modules=tool_module("alpha"))
+        registry = PluginRegistry(directory=tmp_path)
+        registry.load_all()
+        # A bad edit must not drop the previously working tools.
+        write_plugin(
+            tmp_path, "plug", modules={"plugin.py": "def make_tools():\n    raise RuntimeError('boom')\n"}
+        )
+        with caplog.at_level("WARNING"):
+            kept = registry.reload("plug", on_error="skip")
+        assert [t.name for t in kept] == ["alpha"]
+        assert registry.is_loaded("plug")
