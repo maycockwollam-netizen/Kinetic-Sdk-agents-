@@ -1222,6 +1222,14 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   result object. `DelegateTool`/`AsyncDelegateTool` surface status + data
   (redacted) in the `ToolResult` output. No schema = the historical
   plain-text `final_message` handoff (fully backward compatible).
+- **Delegation-tree reconstruction** (`subagent/tree.py`). Delegation is
+  decentralised (a tool), so there is no central tree object.
+  `reconstruct_delegation_tree(audit_entries)` rebuilds the parent->child
+  DAG from the shared `subagent_spawn` / `subagent_finished` audit trail,
+  giving per-node `outcome` (completed / budget_exceeded /
+  repetition_limit / error / running), model, and the spawn-time budget
+  snapshot. Exposes `DelegationTree` (`root_agent_ids`, `children_of`,
+  `descendants_of`, `as_dict`).
 - **Sub-agent failure classification + back-pressure.** `classify_subagent_error`
   maps a delegation exception to a `SubagentStatus`; `DelegateTool` /
   `AsyncDelegateTool` accept a per-class `failure_policy` callback whose
