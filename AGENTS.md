@@ -1222,3 +1222,12 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   result object. `DelegateTool`/`AsyncDelegateTool` surface status + data
   (redacted) in the `ToolResult` output. No schema = the historical
   plain-text `final_message` handoff (fully backward compatible).
+- **Sub-agent failure classification + back-pressure.** `classify_subagent_error`
+  maps a delegation exception to a `SubagentStatus`; `DelegateTool` /
+  `AsyncDelegateTool` accept a per-class `failure_policy` callback whose
+  guidance is appended to the error `ToolResult` (e.g. "escalate to the
+  fixer spec"). Both tools now prefix the classified status on failures.
+  The budget guard (`_GuardedLLMClient` / `_GuardedAsyncLLMClient`) also
+  injects ONE "wrap up now" coaching turn when the shared budget is down to
+  `BACK_PRESSURE_AT_REMAINING` (1) tool calls, so a child lands a best-effort
+  partial result instead of being hard-blocked by `BudgetExceededError`.

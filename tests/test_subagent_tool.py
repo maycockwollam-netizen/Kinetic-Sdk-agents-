@@ -111,7 +111,8 @@ class TestExecute:
         _, audit = make_root(MockLLMClient([]), delegate)
         result = delegate.execute(subagent_name="worker", task_prompt="loop")
         assert result.is_error
-        assert result.error.startswith("BudgetExceededError")
+        assert result.error.startswith("budget_exceeded:")
+        assert "BudgetExceededError" in result.error
         finishes = [e for e in audit.entries if e["event"] == "subagent_finished"]
         assert [e["outcome"] for e in finishes] == ["budget_exceeded"]
 
@@ -125,7 +126,8 @@ class TestExecute:
         _, audit = make_root(MockLLMClient([]), delegate)
         result = delegate.execute(subagent_name="worker", task_prompt="loop")
         assert result.is_error
-        assert result.error.startswith("RepetitionLimitError")
+        assert result.error.startswith("repetition_limit:")
+        assert "RepetitionLimitError" in result.error
         finishes = [e for e in audit.entries if e["event"] == "subagent_finished"]
         assert [e["outcome"] for e in finishes] == ["repetition_limit"]
 
@@ -209,3 +211,43 @@ class TestPermissionGating:
             if e["event"] == "subagent_finished"
         ]
         assert outcomes == ["completed"]
+
+
+def test_classify_subagent_error() -> None:
+    from kinetic_sdk.subagent import (
+        BudgetExceededError,
+        RepetitionLimitError,
+        SubagentStatus,
+        classify_subagent_error,
+    )
+
+    assert classify_subagent_error(BudgetExceededError("cap")) is SubagentStatus.BUDGET_EXCEEDED
+    assert classify_subagent_error(RepetitionLimitError("rep")) is SubagentStatus.REPETITION_LIMIT
+    assert classify_subagent_error(RuntimeError("boom")) is SubagentStatus.ERROR
+
+
+def test_failure_policy_appends_classified_guidance() -> None:
+    from kinetic_sdk.subagent import (
+        DelegateTool,
+        SpawnBudget,
+        SubagentSpec,
+        SubagentStatus,
+    )
+
+    def policy(spec, status, text):
+        if status is SubagentStatus.BUDGET_EXCEEDED:
+            return f"> escalate {spec.name} to the fixer spec"
+        return None
+
+    delegate = DelegateTool(
+        [SubagentSpec(name="worker", system_prompt="p", description="d", model="loop-model")],
+        budget=SpawnBudget(3),
+        llm_factory=lambda model: LoopLLM("echo", {"message": "again"}),
+        failure_policy=policy,
+    )
+    make_root(MockLLMClient([]), delegate)
+    result = delegate.execute(subagent_name="worker", task_prompt="loop")
+    assert result.is_error
+    assert result.error.startswith("budget_exceeded:")
+    assert "escalate worker to the fixer spec" in result.error
+    assert result.metadata["delegation_status"] == "budget_exceeded"

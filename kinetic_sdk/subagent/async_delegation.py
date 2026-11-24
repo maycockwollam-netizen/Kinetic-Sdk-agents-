@@ -40,6 +40,8 @@ from kinetic_sdk.subagent.budget import (
     SpawnBudget,
 )
 from kinetic_sdk.subagent.delegation import (
+    BACK_PRESSURE_AT_REMAINING,
+    BACK_PRESSURE_INSTRUCTION,
     DelegationResult,
     SubagentStatus,
     _status_from_data,
@@ -93,9 +95,24 @@ class _GuardedAsyncLLMClient(AsyncLLMClient):
         self._budget = budget
         self._breaker = breaker
         self._agent_id = agent_id
+        self._back_pressure_sent = False
         # Plain attribute (not a property) so the guard stays assignment-
         # compatible with the writeable ``model`` attribute on the ABC.
         self.model = getattr(inner, "model", "unknown")
+
+    def _apply_back_pressure(
+        self, messages: list[Message], tools: list[Any] | None
+    ) -> list[Message]:
+        """Nudge the model to wrap up when the shared budget is nearly gone.
+
+        Mirror of the sync guard; see ``delegation._GuardedLLMClient``.
+        """
+        if tools is None or self._back_pressure_sent:
+            return messages
+        if self._budget.remaining > BACK_PRESSURE_AT_REMAINING:
+            return messages
+        self._back_pressure_sent = True
+        return [*messages, {"role": "user", "content": BACK_PRESSURE_INSTRUCTION}]
 
     @property
     def inner(self) -> AsyncLLMClient:
@@ -109,7 +126,12 @@ class _GuardedAsyncLLMClient(AsyncLLMClient):
         system: str | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
-        response = await self._inner.chat(messages, tools=tools, system=system, **kwargs)
+        response = await self._inner.chat(
+            self._apply_back_pressure(messages, tools),
+            tools=tools,
+            system=system,
+            **kwargs,
+        )
         for call in response.tool_calls:
             self._budget.record_tool_call(self._agent_id, call.name)
             self._breaker.record(call.name, call.arguments)
@@ -137,7 +159,10 @@ class _GuardedAsyncLLMClient(AsyncLLMClient):
     ) -> AsyncIterator[StreamEvent]:
         """Yield the inner stream and charge completed tool calls at ``done``."""
         async for event in self._inner.chat_stream(
-            messages, tools=tools, system=system, **kwargs
+            self._apply_back_pressure(messages, tools),
+            tools=tools,
+            system=system,
+            **kwargs,
         ):
             if event.type == "done" and isinstance(event.delta, LLMResponse):
                 for call in event.delta.tool_calls:

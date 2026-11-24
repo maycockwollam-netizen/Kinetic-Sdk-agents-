@@ -452,3 +452,54 @@ def test_plain_text_handoff_keeps_success_status_when_no_schema() -> None:
     assert result.status is SubagentStatus.SUCCESS
     assert result.data is None
     assert result.final_message == "plain done"
+
+
+def test_back_pressure_injects_wrap_up_when_budget_low() -> None:
+    from kinetic_sdk.subagent.budget import RepetitionCircuitBreaker, SpawnBudget
+    from kinetic_sdk.subagent.delegation import (
+        BACK_PRESSURE_INSTRUCTION,
+        _GuardedLLMClient,
+    )
+
+    budget = SpawnBudget(max_total_tool_calls=2)
+    budget.record_tool_call("a", "x")  # remaining == 1 -> trigger back-pressure
+    seen: dict[str, list] = {}
+
+    class Recording(MockLLMClient):
+        def chat(self, messages, tools=None, system=None, **kwargs):  # type: ignore[override]
+            seen["messages"] = list(messages)
+            return text_response("wrapped up")
+
+    guard = _GuardedLLMClient(
+        Recording([]), budget=budget, breaker=RepetitionCircuitBreaker(3), agent_id="a"
+    )
+    guard.chat(
+        [{"role": "user", "content": "hi"}],
+        tools=[{"name": "x", "type": "function", "function": {}}],
+    )
+    assert any(
+        m.get("role") == "user" and m.get("content") == BACK_PRESSURE_INSTRUCTION
+        for m in seen["messages"]
+    )
+
+
+def test_back_pressure_not_injected_when_budget_healthy_or_no_tools() -> None:
+    from kinetic_sdk.subagent.budget import RepetitionCircuitBreaker, SpawnBudget
+    from kinetic_sdk.subagent.delegation import _GuardedLLMClient
+
+    budget = SpawnBudget(max_total_tool_calls=100)  # plenty left
+    seen: dict[str, list] = {}
+
+    class Recording(MockLLMClient):
+        def chat(self, messages, tools=None, system=None, **kwargs):  # type: ignore[override]
+            seen["messages"] = list(messages)
+            return text_response("ok")
+
+    guard = _GuardedLLMClient(
+        Recording([]), budget=budget, breaker=RepetitionCircuitBreaker(3), agent_id="a"
+    )
+    guard.chat([{"role": "user", "content": "hi"}], tools=[{"name": "x"}])
+    assert not any("budget remains" in m.get("content", "") for m in seen["messages"])
+    # No tools at all -> never nudged.
+    guard.chat([{"role": "user", "content": "hi"}], tools=None)
+    assert not any("budget remains" in m.get("content", "") for m in seen["messages"])
