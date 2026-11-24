@@ -73,6 +73,44 @@ def test_server_rejects_nonpositive_resource_bounds():
         AgentServer(_factory, port=0, max_concurrent_requests=0)
 
 
+def test_session_conversation_persists_across_restart(tmp_path):
+    store = tmp_path / "conv"
+    first = AgentServer(_factory, port=0, conversation_store_dir=store)
+    try:
+        first._run_agent("first", stream=False, output_schema=None, session_id="chat-a")
+    finally:
+        first._httpd.server_close()
+    # A fresh server over the same directory resumes the conversation.
+    second = AgentServer(_factory, port=0, conversation_store_dir=store)
+    try:
+        record = second._run_agent("second", stream=False, output_schema=None, session_id="chat-a")
+        assert record["status"] == "completed"
+        users = [
+            m["content"]
+            for m in second._sessions["chat-a"].state.messages
+            if m["role"] == "user" and isinstance(m["content"], str)
+        ]
+        assert users == ["first", "second"]
+    finally:
+        second._httpd.server_close()
+
+
+def test_session_ttl_removes_persisted_conversation(tmp_path):
+    store = tmp_path / "conv"
+    server = AgentServer(_factory, port=0, conversation_store_dir=store, session_ttl=0.02)
+    try:
+        server._run_agent("hi", stream=False, output_schema=None, session_id="chat-a")
+        conversation_path = store / "chat-a.json"
+        assert conversation_path.exists()
+        time.sleep(0.05)
+        # A later session's _make_agent purges the expired chat-a session
+        # and drops its persisted conversation.
+        server._run_agent("bye", stream=False, output_schema=None, session_id="chat-b")
+        assert not conversation_path.exists()
+    finally:
+        server._httpd.server_close()
+
+
 def test_different_sessions_run_concurrently():
     """A long run in one session must not block a different session's run."""
 

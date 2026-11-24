@@ -55,6 +55,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import socket
 import struct
 import threading
@@ -66,6 +67,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from kinetic_sdk.agent.agent import Agent
+from kinetic_sdk.conversation.store import (
+    ConversationStoreError,
+    JsonFileConversationStore,
+)
 from kinetic_sdk.workspace.base import WorkspaceBase, WorkspaceError
 
 logger = logging.getLogger(__name__)
@@ -106,6 +111,13 @@ class AgentServer:
             The oldest records are evicted when the bound is reached.
         max_concurrent_requests: Maximum active HTTP handlers. Excess
             requests receive ``503`` rather than creating unbounded threads.
+        session_store_dir: Optional directory for a durable run index
+            (``runs.jsonl``), reloaded on startup.
+        conversation_store_dir: Optional directory for per-session
+            CONVERSATION state. When set, each session's cached agent gets a
+            ``JsonFileConversationStore`` (unless the factory already wired
+            one) so conversations survive a server restart and are cleaned up
+            when their session expires.
     """
 
     def __init__(
@@ -121,6 +133,7 @@ class AgentServer:
         max_runs: int = 1_000,
         max_concurrent_requests: int = 64,
         session_store_dir: str | os.PathLike | None = None,
+        conversation_store_dir: str | os.PathLike | None = None,
     ) -> None:
         if not callable(agent_factory):
             raise TypeError("agent_factory must be callable")
@@ -156,6 +169,12 @@ class AgentServer:
             self._store_dir = Path(session_store_dir)
             self._store_dir.mkdir(parents=True, exist_ok=True)
             self._load_stored_runs()
+        #: Optional directory for per-session CONVERSATION state so cached
+        #: session agents survive a server restart (see _make_agent).
+        self._conversation_store_dir: Path | None = None
+        if conversation_store_dir is not None:
+            self._conversation_store_dir = Path(conversation_store_dir)
+            self._conversation_store_dir.mkdir(parents=True, exist_ok=True)
         self._drain_condition = threading.Condition(self._lock)
         self._in_flight_requests = 0
         self._request_slots = threading.BoundedSemaphore(max_concurrent_requests)
@@ -256,6 +275,46 @@ class AgentServer:
                 self._sessions.pop(session_id, None)
                 self._session_activity.pop(session_id, None)
                 self._session_locks.pop(session_id, None)
+                self._forget_conversation(session_id)
+
+    def _conversation_store(self, session_id: str) -> JsonFileConversationStore | None:
+        """Per-session conversation store under ``conversation_store_dir``."""
+        if self._conversation_store_dir is None:
+            return None
+        # session_id is client-supplied; keep it a single safe path segment.
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id) or "session"
+        return JsonFileConversationStore(self._conversation_store_dir / f"{safe}.json")
+
+    def _restore_conversation(self, session_id: str, agent: Agent) -> None:
+        """Resume *agent*'s state from disk for *session_id* (best-effort).
+
+        Only applied when the agent was built WITHOUT its own ``state_store``
+        and has no messages yet, so a factory that already wires a store (the
+        documented pattern) is never clobbered. A corrupt save is logged and
+        ignored — it must not prevent the server from coming up.
+        """
+        store = self._conversation_store(session_id)
+        if store is None or agent.state_store is not None or agent.state.messages:
+            return
+        # Attach the store up-front so future turns auto-persist, then resume
+        # any prior history.
+        agent.state_store = store
+        try:
+            resumed = store.load()
+        except (ConversationStoreError, OSError, ValueError):
+            logger.exception("Cannot restore conversation for session %r", session_id)
+            return
+        if resumed is not None:
+            agent.state = resumed
+
+    def _forget_conversation(self, session_id: str) -> None:
+        """Delete a session's persistent conversation (session expired)."""
+        store = self._conversation_store(session_id)
+        if store is not None:
+            try:
+                store.delete()
+            except OSError:
+                logger.warning("Could not delete conversation for session %r", session_id)
 
     def _session_lock(self, session_id: str) -> threading.Lock:
         """Return the run lock for *session_id*, creating it if needed."""
@@ -274,6 +333,7 @@ class AgentServer:
             agent = self._sessions.get(session_id)
             if agent is None:
                 agent = self._call_factory(session_id)
+                self._restore_conversation(session_id, agent)
                 self._sessions[session_id] = agent
             self._session_activity[session_id] = time.monotonic()
             return agent

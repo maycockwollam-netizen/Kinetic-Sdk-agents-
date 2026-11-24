@@ -1193,3 +1193,23 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   Without this, a same-byte-length edit issued within the same mtime second
   was served from the stale `__pycache__` timestamp cache, so a hot-reloaded
   plugin silently ran old code (regression test pins it).
+- **`AsyncAgent` auto-upgrades a sync `DelegateTool` to `AsyncDelegateTool`.**
+  A sync delegate handed to an async agent used to run its child loop in a
+  worker thread (the default `execute_async` bridges `execute` via
+  `asyncio.to_thread`). Now `_adopt_delegate` transparently re-contains it
+  (same specs/budget/breaker/llm_factory) and binds it, so the async loop
+  awaits the sub-agent natively. Applied in `__init__` and `add_tool`;
+  non-delegate / already-async tools pass through unchanged.
+- **Proactive MCP reconnect.** `MCPToolAdapter` gained an optional
+  `reconnector`; `MCPServerRegistry.get_tools_as_kinetic_tools` wires each
+  adapter to `reconnect(name)`. A tool call that hits a DEAD transport
+  (an `MCPTransportError` that is not a mere timeout) reconnects once and
+  retries once, so a long-running agent heals without a manual ``reconnect``.
+  Timeouts do NOT re-spawn (a slow-but-alive server, and a retry could
+  double-run a non-idempotent tool).
+- **Server per-session conversation persistence.** `AgentServer` gained
+  `conversation_store_dir`. When set, `_make_agent` attaches a
+  `JsonFileConversationStore` to each cached session agent (unless the
+  factory already wired its own state_store) and resumes the saved
+  conversation, so sessions survive a server restart; expired sessions drop
+  their file. This is distinct from `session_store_dir` (the run index).
