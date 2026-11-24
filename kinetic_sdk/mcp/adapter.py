@@ -24,10 +24,10 @@ agent loop for an expected failure mode.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable
 
 from kinetic_sdk.mcp.client import MCPClient, MCPClientError
-from kinetic_sdk.mcp.transport import MCPTransportError
+from kinetic_sdk.mcp.transport import MCPTimeoutError, MCPTransportError
 from kinetic_sdk.security.redact import redact_value
 from kinetic_sdk.tool.base import Tool, ToolResult
 
@@ -60,6 +60,7 @@ class MCPToolAdapter(Tool):
         description: str = "",
         input_schema: dict[str, Any] | None = None,
         timeout: float | None = None,
+        reconnector: Callable[[], MCPClient] | None = None,
     ) -> None:
         if not tool_name:
             raise ValueError("tool_name must be non-empty")
@@ -69,6 +70,10 @@ class MCPToolAdapter(Tool):
         self._tool_name = tool_name
         self._server_name = server_name
         self._timeout = timeout
+        #: Optional callback producing a freshly-connected MCPClient for this
+        #: server; supplied by :class:`~kinetic_sdk.mcp.registry.MCPServerRegistry`
+        #: so a call hitting a dead transport can heal and retry once.
+        self._reconnector = reconnector
         # Instance attributes shadow the ClassVar annotations on Tool — the
         # same pattern MockTool uses for per-instance schemas.
         self.name = f"{server_name}.{tool_name}"
@@ -82,6 +87,7 @@ class MCPToolAdapter(Tool):
         server_name: str,
         schema: dict[str, Any],
         timeout: float | None = None,
+        reconnector: Callable[[], MCPClient] | None = None,
     ) -> "MCPToolAdapter":
         """Build an adapter from one entry of a ``tools/list`` response.
 
@@ -97,6 +103,7 @@ class MCPToolAdapter(Tool):
             description=schema.get("description") or "",
             input_schema=schema.get("inputSchema"),
             timeout=timeout,
+            reconnector=reconnector,
         )
 
     @property
@@ -109,15 +116,44 @@ class MCPToolAdapter(Tool):
         return self._server_name
 
     def execute(self, **params: Any) -> ToolResult:
-        """Call the remote tool, mapping every failure mode to ToolResult."""
+        """Call the remote tool, mapping every failure mode to ToolResult.
+
+        A DEAD transport (server crashed/restarted — an :class:`MCPTransportError`
+        that is not merely a timeout) triggers ONE proactive reconnect via
+        :attr:`_reconnector` followed by a single retry, so a long-running
+        agent heals without the caller having to call
+        :meth:`~kinetic_sdk.mcp.registry.MCPServerRegistry.reconnect` by hand.
+        Timeouts keep the old behaviour: a slow-but-alive server is not
+        re-spawned (and a retry could double-run a non-idempotent tool).
+        """
         metadata = {"mcp_server": self._server_name, "mcp_tool": self._tool_name}
         try:
             result = self._client.call_tool(self._tool_name, params, timeout=self._timeout)
         except (MCPClientError, MCPTransportError) as exc:
-            return ToolResult(
-                error=f"MCP tool {self.name!r} call failed: {exc}",
-                metadata=metadata,
-            )
+            if self._reconnector is None or isinstance(exc, MCPTimeoutError) or not isinstance(
+                exc, MCPTransportError
+            ):
+                return ToolResult(
+                    error=f"MCP tool {self.name!r} call failed: {exc}",
+                    metadata=metadata,
+                )
+            # Transport died mid-session: reconnect once, then retry once.
+            try:
+                self._client = self._reconnector()
+            except Exception as rebuild_exc:  # noqa: BLE001 - map to ToolResult
+                return ToolResult(
+                    error=f"MCP tool {self.name!r} reconnect failed: {rebuild_exc}",
+                    metadata=metadata,
+                )
+            try:
+                result = self._client.call_tool(
+                    self._tool_name, params, timeout=self._timeout
+                )
+            except (MCPClientError, MCPTransportError) as retry_exc:
+                return ToolResult(
+                    error=f"MCP tool {self.name!r} call failed after reconnect: {retry_exc}",
+                    metadata=metadata,
+                )
         if not isinstance(result, dict):
             return ToolResult(
                 error=f"MCP tool {self.name!r} returned a malformed result: {result!r}",
