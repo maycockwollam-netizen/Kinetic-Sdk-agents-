@@ -247,6 +247,36 @@ async def test_async_structured_result_carries_status():
     assert result.data == {"status": "out_of_scope", "reason": "not my expertise"}
 
 
+async def test_async_back_pressure_injects_wrap_up():
+    from kinetic_sdk.subagent.async_delegation import _GuardedAsyncLLMClient
+    from kinetic_sdk.subagent.budget import RepetitionCircuitBreaker
+    from kinetic_sdk.subagent.delegation import BACK_PRESSURE_INSTRUCTION
+
+    budget = SpawnBudget(max_total_tool_calls=2)
+    budget.record_tool_call("a", "x")  # remaining == 1 -> trigger
+    seen: dict[str, list] = {}
+
+    class Recording(AsyncMockLLMClient):
+        async def chat(self, messages, tools=None, system=None, **kwargs):  # type: ignore[override]
+            seen["messages"] = list(messages)
+            return _done("wrapped up")
+
+    guard = _GuardedAsyncLLMClient(
+        Recording([]),
+        budget=budget,
+        breaker=RepetitionCircuitBreaker(3),
+        agent_id="a",
+    )
+    await guard.chat(
+        [{"role": "user", "content": "hi"}],
+        tools=[{"name": "x", "type": "function", "function": {}}],
+    )
+    assert any(
+        m.get("role") == "user" and m.get("content") == BACK_PRESSURE_INSTRUCTION
+        for m in seen["messages"]
+    )
+
+
 async def test_async_delegate_tool_sync_execute_raises():
     tool = AsyncDelegateTool([_spec()])
     with pytest.raises(NotImplementedError):

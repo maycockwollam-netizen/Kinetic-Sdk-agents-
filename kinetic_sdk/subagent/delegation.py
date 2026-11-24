@@ -72,6 +72,29 @@ logger = logging.getLogger(__name__)
 #: cannot know how to construct provider clients generically.
 LLMFactory = Callable[[str], LLMClient]
 
+#: Per-class failure handler. Given the spec that failed, the classified
+#: :class:`SubagentStatus` and the raw error text, returns an OPTIONAL
+#: guidance string to append to the error ``ToolResult``, or ``None`` to keep
+#: the default message. Lets applications encode a policy per failure class
+#: instead of matching exception types.
+SubagentFailurePolicy = Callable[
+    ["SubagentSpec", "SubagentStatus", str], str | None
+]
+
+
+def classify_subagent_error(exc: Exception) -> "SubagentStatus":
+    """Map a delegation exception to a :class:`SubagentStatus`.
+
+    Guardrails carry a precise class; anything else is a generic run error
+    (provider failure, tool bug, ...). Lets a ``failure_policy`` branch on
+    the failure CLASS instead of matching exception types.
+    """
+    if isinstance(exc, BudgetExceededError):
+        return SubagentStatus.BUDGET_EXCEEDED
+    if isinstance(exc, RepetitionLimitError):
+        return SubagentStatus.REPETITION_LIMIT
+    return SubagentStatus.ERROR
+
 #: Stable ids for agents participating in delegation (the audit trail uses
 #: them to reconstruct the parent/child tree). Keyed by identity; entries
 #: die with their agent.
@@ -146,6 +169,19 @@ class DelegationResult:
     error: str | None = None
 
 
+#: Back-pressure (near-budget) limits on the shared tree budget. When a
+#: sub-agent has at most ``BACK_PRESSURE_AT_REMAINING`` tool calls left, the
+#: guard injects one "wrap up now" coaching turn (see ``_apply_back_pressure``)
+#: so the child lands a best-effort partial result instead of being hard
+#: blocked by ``BudgetExceededError``.
+BACK_PRESSURE_AT_REMAINING = 1
+BACK_PRESSURE_INSTRUCTION = (
+    "Very little tool budget remains for this task. Do NOT request any more "
+    "tools. Stop now and give your best final answer (a partially complete "
+    "answer is acceptable)."
+)
+
+
 class _GuardedLLMClient(LLMClient):
     """LLM client wrapper charging tool calls to the budget + breaker.
 
@@ -169,9 +205,28 @@ class _GuardedLLMClient(LLMClient):
         self._budget = budget
         self._breaker = breaker
         self._agent_id = agent_id
+        self._back_pressure_sent = False
         # Plain attribute (not a property) so the guard stays assignment-
         # compatible with the writeable ``model`` attribute on LLMClient.
         self.model = getattr(inner, "model", "unknown")
+
+    def _apply_back_pressure(self, messages: list[Message], tools: list[Any] | None) -> list[Message]:
+        """Nudge the model to wrap up when the shared budget is nearly gone.
+
+        Rather than letting the model request more tool calls until the budget
+        trips (a hard ``BudgetExceededError`` that returns no partial result),
+        the guard injects ONE coaching user turn when at most
+        :data:`BACK_PRESSURE_AT_REMAINING` tool calls remain. A real model
+        usually stops and yields a best-effort partial answer; the injected
+        message is deliberately NOT persisted to ``ConversationState`` (it
+        only steers the current turn).
+        """
+        if tools is None or self._back_pressure_sent:
+            return messages
+        if self._budget.remaining > BACK_PRESSURE_AT_REMAINING:
+            return messages
+        self._back_pressure_sent = True
+        return [*messages, {"role": "user", "content": BACK_PRESSURE_INSTRUCTION}]
 
     @property
     def inner(self) -> LLMClient:
@@ -185,7 +240,12 @@ class _GuardedLLMClient(LLMClient):
         system: str | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
-        response = self._inner.chat(messages, tools=tools, system=system, **kwargs)
+        response = self._inner.chat(
+            self._apply_back_pressure(messages, tools),
+            tools=tools,
+            system=system,
+            **kwargs,
+        )
         for call in response.tool_calls:
             self._budget.record_tool_call(self._agent_id, call.name)
             self._breaker.record(call.name, call.arguments)
@@ -213,7 +273,12 @@ class _GuardedLLMClient(LLMClient):
         **kwargs: Any,
     ) -> Iterator[StreamEvent]:
         """Yield the inner stream and charge completed tool calls at ``done``."""
-        for event in self._inner.chat_stream(messages, tools=tools, system=system, **kwargs):
+        for event in self._inner.chat_stream(
+            self._apply_back_pressure(messages, tools),
+            tools=tools,
+            system=system,
+            **kwargs,
+        ):
             if event.type == "done" and isinstance(event.delta, LLMResponse):
                 for call in event.delta.tool_calls:
                     self._budget.record_tool_call(self._agent_id, call.name)

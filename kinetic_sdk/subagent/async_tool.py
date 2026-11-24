@@ -22,6 +22,10 @@ from kinetic_sdk.subagent.budget import (
     DEFAULT_MAX_CONSECUTIVE_REPEATS,
     SpawnBudget,
 )
+from kinetic_sdk.subagent.delegation import (
+    SubagentFailurePolicy,
+    classify_subagent_error,
+)
 from kinetic_sdk.subagent.exceptions import (
     BudgetExceededError,
     RepetitionLimitError,
@@ -56,6 +60,7 @@ class AsyncDelegateTool(Tool):
         max_consecutive_repeats: int = DEFAULT_MAX_CONSECUTIVE_REPEATS,
         llm_factory: AsyncLLMFactory | None = None,
         charge_root_tool_calls: bool = False,
+        failure_policy: SubagentFailurePolicy | None = None,
     ) -> None:
         if isinstance(subagents, Mapping):
             specs = dict(subagents)
@@ -76,6 +81,7 @@ class AsyncDelegateTool(Tool):
         self._max_consecutive_repeats = max_consecutive_repeats
         self._llm_factory = llm_factory
         self._charge_root_tool_calls = charge_root_tool_calls
+        self._failure_policy = failure_policy
         self._parent: AsyncAgent | None = None
 
         catalogue = "\n".join(
@@ -182,15 +188,12 @@ class AsyncDelegateTool(Tool):
                 max_consecutive_repeats=self._max_consecutive_repeats,
                 llm_factory=self._llm_factory,
             )
-        except BudgetExceededError as exc:
+        except (BudgetExceededError, RepetitionLimitError) as exc:
             logger.warning("Delegation to %r blocked: %s", spec.name, exc)
-            return ToolResult(error=f"BudgetExceededError: {exc}")
-        except RepetitionLimitError as exc:
-            logger.warning("Delegation to %r blocked: %s", spec.name, exc)
-            return ToolResult(error=f"RepetitionLimitError: {exc}")
+            return self._failure_result(spec, exc)
         except Exception as exc:  # noqa: BLE001 - never sink the parent's loop
             logger.exception("Delegation to %r failed", spec.name)
-            return ToolResult(error=f"{type(exc).__name__}: {exc}")
+            return self._failure_result(spec, exc)
         output: dict[str, Any] = {
             "subagent": spec.name,
             "agent_id": result.agent_id,
@@ -204,3 +207,20 @@ class AsyncDelegateTool(Tool):
         if result.error is not None:
             output["error"] = result.error
         return ToolResult(output=output)
+
+    def _failure_result(self, spec: SubagentSpec, exc: Exception) -> ToolResult:
+        """Classify a delegation failure and apply the failure policy."""
+        status = classify_subagent_error(exc)
+        message = f"{status.value}: {type(exc).__name__}: {exc}"
+        if self._failure_policy is not None:
+            try:
+                guidance = self._failure_policy(spec, status, str(exc))
+            except Exception:  # noqa: BLE001 - a bad policy must not break the loop
+                logger.exception("AsyncDelegateTool failure_policy raised for %r", spec.name)
+                guidance = None
+            if guidance:
+                message = f"{message} {guidance}"
+        return ToolResult(
+            error=message,
+            metadata={"delegation_status": status.value, "spec": spec.name},
+        )
