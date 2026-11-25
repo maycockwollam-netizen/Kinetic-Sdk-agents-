@@ -1332,3 +1332,33 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   with per-step outputs + a usage snapshot. Forwards `llm_factory` to every
   spawn; wraps `run_subagent` / `map_reduce_subagents` /
   `produce_and_review` / `delegate_naturally`.
+
+## Web UI (`kinetic serve`) + static serving (2026-11-25 — DONE)
+- `AgentServer(..., static_dir=...)` now hosts a static web UI: `GET /` and
+  `GET /index.html` serve `<static_dir>/index.html`; `GET /static/<path>`
+  serves any file under `static_dir`. Resolution goes through
+  `AgentServer._static_path` (realpath + containment) so `../`/absolute paths
+  outside the root 404 instead of leaking host files. `Content-Type` comes
+  from `_MIME_TYPES` (html/js/css/png/svg/...). Static assets BYPASS the
+  bearer token by design (inert HTML/JS/CSS); every API endpoint keeps the
+  auth gate. `static_dir` must exist (`ValueError` otherwise); omitting it
+  leaves the old 404 behaviour for `/`.
+- `kinetic_sdk/server/ui/` ships the browser chat UI (index.html + app.js +
+  style.css, zero external deps / no CDN). app.js talks only to the stdlib
+  API: `POST /runs {message, session_id, stream:true}` and parses the SSE
+  event stream (`agent.text_delta`, `agent.tool_call_finished`,
+  `agent.classified`, `done`, `error`, ...). Session id lives in
+  localStorage so reloads resume the same server-side conversation. ALL text
+  rendered via `textContent` (never innerHTML) — model/tool output is
+  untrusted.
+- GOTCHA: maturin only collects `.py` files by default, so the UI assets are
+  shipped via `[tool.maturin] include = ["kinetic_sdk/server/ui/*"]` in
+  `pyproject.toml`. If that line is dropped, an installed wheel serves 404 for
+  the UI (`_ui_dir()` then warns and `cmd_serve` exits 1).
+- `kinetic serve [--host 127.0.0.1] [--port 8765] [--no-open]` (`cmd_serve`)
+  builds an `AgentServer` whose factory is `build_agent(session_id=...)`,
+  wires `conversation_store_dir=<cwd>/.kinetic/serve` (conversations survive a
+  restart), prints the URL and auto-opens the browser via `webbrowser` unless
+  `--no-open`. Ctrl-C => graceful `server.stop()`. Tests:
+  `tests/test_server_static.py` (serving, 404, traversal, token bypass) and
+  `tests/test_cli_serve.py` (e2e subprocess boot + `/health` + `/` + `/runs`).

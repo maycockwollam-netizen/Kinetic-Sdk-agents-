@@ -28,6 +28,10 @@ API (JSON in/out):
   workspace operations when ``workspace_factory`` is configured. Every body
   includes ``workspace_id``; the factory, not the HTTP client, selects the
   actual server-side workspace.
+* ``GET  /`` and ``GET /static/<path>`` -> static web UI files when
+  ``static_dir`` is configured. Static assets are intentionally NOT behind
+  the bearer token (they are inert HTML/JS/CSS); every API endpoint above
+  still is.
 
 Requests without ``session_id`` spawn a fresh
 :class:`~kinetic_sdk.agent.agent.Agent`. Session requests reuse an agent from
@@ -82,6 +86,28 @@ MAX_BODY_BYTES = 1024 * 1024
 #: (ping/pong/close) are exempt; oversized data frames close the connection.
 MAX_WS_PAYLOAD_BYTES = 8 * 1024 * 1024
 
+#: Content types for static files served from ``static_dir``.
+_MIME_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".ico": "image/x-icon",
+    ".webp": "image/webp",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".eot": "application/vnd.ms-fontobject",
+    ".txt": "text/plain; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+}
+
 
 class RunRecord(dict):
     """One recorded run result (a plain dict; the alias documents intent)."""
@@ -118,6 +144,10 @@ class AgentServer:
             ``JsonFileConversationStore`` (unless the factory already wired
             one) so conversations survive a server restart and are cleaned up
             when their session expires.
+        static_dir: Optional directory of static web files served at ``/``
+            (``index.html``) and ``/static/<path>``. Used by the CLI's
+            ``kinetic serve`` to host a chat UI in the browser. Static
+            assets bypass the bearer token; API endpoints keep it.
     """
 
     def __init__(
@@ -134,6 +164,7 @@ class AgentServer:
         max_concurrent_requests: int = 64,
         session_store_dir: str | os.PathLike | None = None,
         conversation_store_dir: str | os.PathLike | None = None,
+        static_dir: str | os.PathLike | None = None,
     ) -> None:
         if not callable(agent_factory):
             raise TypeError("agent_factory must be callable")
@@ -175,6 +206,14 @@ class AgentServer:
         if conversation_store_dir is not None:
             self._conversation_store_dir = Path(conversation_store_dir)
             self._conversation_store_dir.mkdir(parents=True, exist_ok=True)
+        #: Optional directory of static web files served at ``/`` and
+        #: ``/static/<path>`` (see class docstring).
+        self._static_dir: Path | None = None
+        if static_dir is not None:
+            static_path = Path(static_dir)
+            if not static_path.is_dir():
+                raise ValueError(f"static_dir must be an existing directory: {static_dir}")
+            self._static_dir = static_path
         self._drain_condition = threading.Condition(self._lock)
         self._in_flight_requests = 0
         self._request_slots = threading.BoundedSemaphore(max_concurrent_requests)
@@ -479,6 +518,23 @@ class AgentServer:
         except OSError:
             logger.exception("Failed to persist run %s", record.get("run_id"))
 
+    # --- static UI -----------------------------------------------------
+
+    def _static_path(self, relative: str) -> Path | None:
+        """Resolve *relative* inside ``static_dir``; ``None`` if off/traversal/absent."""
+        if self._static_dir is None:
+            return None
+        root = self._static_dir.resolve()
+        try:
+            candidate = (root / relative).resolve()
+        except (OSError, ValueError):
+            return None
+        if candidate != root and root not in candidate.parents:
+            return None  # ../ escapes or absolute paths outside root
+        if not candidate.is_file():
+            return None
+        return candidate
+
     # --- HTTP plumbing --------------------------------------------------
 
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
@@ -500,6 +556,28 @@ class AgentServer:
                 self.send_header("Content-Length", str(len(body)))
                 for name, value in (headers or {}).items():
                     self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _serve_static(self, relative: str) -> None:
+                """Serve one static file (404 on traversal, absence or read error)."""
+                path = server._static_path(relative)
+                if path is None:
+                    self._send_json(404, {"error": "not found"})
+                    return
+                try:
+                    body = path.read_bytes()
+                except OSError:
+                    self._send_json(404, {"error": "not found"})
+                    return
+                self._response_status = 200
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type",
+                    _MIME_TYPES.get(path.suffix.lower(), "application/octet-stream"),
+                )
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -641,6 +719,15 @@ class AgentServer:
                 if self.path == "/health":
                     sessions, in_flight = server._health_snapshot()
                     self._send_json(200, {"status": "ok", "active_sessions": sessions, "in_flight_requests": in_flight})
+                    return
+                # Static UI files are inert content and intentionally bypass
+                # the bearer token (see class docstring); API endpoints below
+                # keep the auth gate.
+                if self.path in ("/", "/index.html"):
+                    self._serve_static("index.html")
+                    return
+                if self.path.startswith("/static/"):
+                    self._serve_static(self.path[len("/static/"):])
                     return
                 if not self._authed():
                     self._send_json(401, {"error": "unauthorized"})

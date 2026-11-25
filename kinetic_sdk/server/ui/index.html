@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kinetic</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◆</span>
+      <h1>Kinetic</h1>
+      <span class="tagline">agent sdk</span>
+    </div>
+    <div class="topbar-right">
+      <span id="status-pill" class="pill">connecting…</span>
+      <button id="new-chat" class="ghost" type="button" title="Start a fresh conversation (new session)">New chat</button>
+    </div>
+  </header>
+
+  <main id="conversation" aria-live="polite"></main>
+
+  <footer class="composer">
+    <textarea
+      id="input"
+      rows="1"
+      placeholder="Ask Kinetic to do something… (Enter to send, Shift+Enter for newline)"
+      autofocus
+    ></textarea>
+    <button id="send" type="button" class="primary" disabled>Send</button>
+  </footer>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

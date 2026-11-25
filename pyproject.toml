@@ -48,6 +48,9 @@ python-source = "."
 module-name = "kinetic_sdk._kinetic_rs"
 bindings = "pyo3"
 features = ["pyo3/extension-module"]
+# Ship the web UI served by `kinetic serve` (static HTML/JS/CSS — maturin only
+# collects .py files by default, so non-Python assets must be listed here).
+include = ["kinetic_sdk/server/ui/*"]
 
 [tool.ruff]
 target-version = "py310"
