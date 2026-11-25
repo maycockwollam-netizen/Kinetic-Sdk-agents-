@@ -1362,3 +1362,38 @@ Fixes from a second external audit (PR #118..#121 + this pass). Highlights:
   `--no-open`. Ctrl-C => graceful `server.stop()`. Tests:
   `tests/test_server_static.py` (serving, 404, traversal, token bypass) and
   `tests/test_cli_serve.py` (e2e subprocess boot + `/health` + `/` + `/runs`).
+
+## Run feedback endpoint (2026-11-25 — DONE)
+- `POST /runs/<run_id>/feedback` body `{"rating": "up"|"down", "comment": str?}`
+  -> `{"ok": true, "run_id", "feedback": {rating, comment, created_at}}`.
+  `AgentServer.record_feedback` keeps it in memory (process lifetime) and mirrors
+  it onto the run record, so `GET /runs/<id>` returns `feedback`. `400` bad
+  rating / non-string comment (comment capped at `MAX_FEEDBACK_COMMENT=2000`),
+  `404` unknown run, `401` without the bearer token. Wired to the UI's 👍/👎
+  (the `done` SSE event carries `run_id`, stored on the assistant message).
+- `_read_body` now returns `None` (not `{}`) when it has already sent a 413/400,
+  so handlers relying on the body can tell "already responded" from "empty".
+  Tests: `tests/test_server_feedback.py` (+ feedback assertion in the e2e
+  `tests/test_cli_serve.py`).
+
+## Runtime settings API + Settings → LLM UI (2026-11-25 — DONE)
+- `kinetic_sdk/server/app.py` adds `ServerSettings`: a small thread-safe holder
+  `(initial, *, secret_keys)` with `snapshot()` (all, server-side), `get()`,
+  `public()` (secrets replaced by `secrets_set` booleans) and `update(patch)`
+  (ignores `None` so a blank secret field keeps the old value).
+- `AgentServer(..., settings=ServerSettings)`. Endpoints (auth-gated like the
+  rest): `GET /settings` -> public view; `POST /settings` body = patch ->
+  `{"ok": true, "settings": {...}}`. Without `settings` both return 404.
+  `update_settings()` invalidates cached session agents (so the next run
+  rebuilds with new config; conversations reload from `conversation_store_dir`).
+- `kinetic serve` now builds a `ServerSettings` from `model`/`api_key`/`base_url`
+  (CLI flags or `kinetic config`/env) and the `agent_factory` reads
+  `settings.snapshot()` on each build. The API key lives SERVER-SIDE only — it is
+  never returned to the browser (`secrets_set.api_key` boolean instead).
+- UI: sidebar **Settings** button opens a modal with a single **LLM** group:
+  Model (input + `<datalist>` presets), Base URL, API key (`type=password`).
+  On open it GETs `/settings` (key field shows "•••••••• (saved) — blank keeps
+  it" when set); Save POSTs the patch (blank key is omitted so it is kept) and
+  closes with a toast. Esc / backdrop / ✕ close it.
+- Tests: `tests/test_server_settings.py` (settings masking/patch/session
+  invalidation/auth/404) + a `/settings` assertion in the e2e `test_cli_serve.py`.

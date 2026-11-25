@@ -13,6 +13,15 @@ API (JSON in/out):
     -> ``{"run_id": str, "status": "completed"|"error", "final": str,
     "structured_output": any|null, "usage": {...}, "error": str?}``
 * ``GET  /runs/<run_id>`` -> the recorded run result (404 when unknown)
+* ``POST /runs/<run_id>/feedback`` body ``{"rating": "up"|"down", "comment": str?}``
+    -> ``{"ok": true, "run_id": str, "feedback": {...}}``; ``404`` for an
+    unknown run, ``400`` for a bad rating. Feedback is kept in memory for the
+    life of the process and mirrored onto ``GET /runs/<run_id>``.
+* ``GET /settings`` -> client-safe runtime settings (secret values are
+  replaced by ``secrets_set`` booleans). ``POST /settings`` body = a patch
+  object -> ``{"ok": true, "settings": {...}}``. Only available when the
+  server was constructed with a :class:`ServerSettings`; a patch invalidates
+  cached session agents so the next run rebuilds with the new config.
 * ``POST /v1/chat/completions`` -> small OpenAI-compatible gateway; its
   ``model`` field is used as the Kinetic session id, not as LLM model
   selection. ``stream: true`` returns an SSE ``text/event-stream`` of
@@ -68,7 +77,7 @@ import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from kinetic_sdk.agent.agent import Agent
 from kinetic_sdk.conversation.store import (
@@ -85,6 +94,9 @@ MAX_BODY_BYTES = 1024 * 1024
 #: Hard cap on a single WebSocket message payload (bytes). Control frames
 #: (ping/pong/close) are exempt; oversized data frames close the connection.
 MAX_WS_PAYLOAD_BYTES = 8 * 1024 * 1024
+
+#: Hard cap on a feedback comment (characters).
+MAX_FEEDBACK_COMMENT = 2000
 
 #: Content types for static files served from ``static_dir``.
 _MIME_TYPES = {
@@ -111,6 +123,57 @@ _MIME_TYPES = {
 
 class RunRecord(dict):
     """One recorded run result (a plain dict; the alias documents intent)."""
+
+
+class ServerSettings:
+    """Mutable runtime settings shared between the HTTP layer and a factory.
+
+    The ``kinetic serve`` CLI keeps its LLM config here (model / base_url /
+    api_key): the UI edits it over ``GET``/``POST /settings`` and the
+    ``agent_factory`` reads :meth:`snapshot` when it builds an agent.
+
+    * ``secret_keys`` are NEVER returned by :meth:`public` — only whether each
+      is set (``secrets_set``), so an API key never travels back to the browser.
+    * :meth:`update` ignores ``None`` values, letting a client submit a blank
+      secret field without wiping an already-configured one.
+    """
+
+    def __init__(
+        self,
+        initial: dict[str, Any] | None = None,
+        *,
+        secret_keys: Iterable[str] = (),
+    ) -> None:
+        self._data: dict[str, Any] = dict(initial or {})
+        self._secret_keys = set(secret_keys)
+        self._lock = threading.RLock()
+
+    def snapshot(self) -> dict[str, Any]:
+        """Plain copy of ALL settings, including secrets (server-side use only)."""
+        with self._lock:
+            return dict(self._data)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        with self._lock:
+            return self._data.get(key, default)
+
+    def public(self) -> dict[str, Any]:
+        """Client-safe view: secrets replaced by ``secrets_set`` booleans."""
+        with self._lock:
+            return self._public_from(self._data)
+
+    def update(self, changes: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            for key, value in changes.items():
+                if value is None:
+                    continue
+                self._data[str(key)] = value
+            return self._public_from(self._data)
+
+    def _public_from(self, data: dict[str, Any]) -> dict[str, Any]:
+        out = {k: v for k, v in data.items() if k not in self._secret_keys}
+        out["secrets_set"] = {k: bool(data.get(k)) for k in self._secret_keys}
+        return out
 
 
 class AgentServer:
@@ -148,6 +211,11 @@ class AgentServer:
             (``index.html``) and ``/static/<path>``. Used by the CLI's
             ``kinetic serve`` to host a chat UI in the browser. Static
             assets bypass the bearer token; API endpoints keep it.
+        settings: Optional :class:`ServerSettings` exposed via ``GET``/
+            ``POST /settings`` (the UI's Settings → LLM group). Change a
+            setting to invalidate cached session agents, so the next run
+            rebuilds with the new config (conversations reload from
+            ``conversation_store_dir`` when configured).
     """
 
     def __init__(
@@ -165,6 +233,7 @@ class AgentServer:
         session_store_dir: str | os.PathLike | None = None,
         conversation_store_dir: str | os.PathLike | None = None,
         static_dir: str | os.PathLike | None = None,
+        settings: ServerSettings | None = None,
     ) -> None:
         if not callable(agent_factory):
             raise TypeError("agent_factory must be callable")
@@ -183,6 +252,10 @@ class AgentServer:
         self._runs: dict[str, RunRecord] = {}
         self._run_order: deque[str] = deque()
         self._max_runs = max_runs
+        #: Per-run user feedback (thumbs up/down). Kept in memory for the life
+        #: of the process; also mirrored onto the run record under ``feedback``
+        #: so ``GET /runs/<id>`` surfaces it.
+        self._feedback: dict[str, dict[str, Any]] = {}
         self._sessions: dict[str, Agent] = {}
         self._session_activity: dict[str, float] = {}
         #: Per-session run locks. ``_lock`` still guards the session maps
@@ -214,6 +287,8 @@ class AgentServer:
             if not static_path.is_dir():
                 raise ValueError(f"static_dir must be an existing directory: {static_dir}")
             self._static_dir = static_path
+        #: Optional mutable settings exposed over GET/POST /settings.
+        self._settings = settings
         self._drain_condition = threading.Condition(self._lock)
         self._in_flight_requests = 0
         self._request_slots = threading.BoundedSemaphore(max_concurrent_requests)
@@ -518,6 +593,46 @@ class AgentServer:
         except OSError:
             logger.exception("Failed to persist run %s", record.get("run_id"))
 
+    def record_feedback(
+        self, run_id: str, rating: str, comment: str | None = None
+    ) -> dict[str, Any]:
+        """Record thumbs up/down for a finished run.
+
+        Raises :class:`KeyError` when *run_id* is unknown. The entry is kept in
+        memory and mirrored onto the run record (``record["feedback"]``).
+        """
+        with self._lock:
+            record = self._runs.get(run_id)
+            if record is None:
+                raise KeyError(run_id)
+            entry: dict[str, Any] = {
+                "rating": rating,
+                "comment": comment,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            self._feedback[run_id] = entry
+            record["feedback"] = entry
+        return entry
+
+    def settings_view(self) -> dict[str, Any] | None:
+        """Client-safe settings (``None`` when no settings API is configured)."""
+        return None if self._settings is None else self._settings.public()
+
+    def update_settings(self, changes: dict[str, Any]) -> dict[str, Any]:
+        """Apply a settings patch and drop cached session agents.
+
+        Dropping the cache forces the next run to rebuild agents with the new
+        config; conversations reload from ``conversation_store_dir`` when set.
+        """
+        if self._settings is None:
+            raise RuntimeError("settings API is not configured")
+        public = self._settings.update(changes)
+        with self._lock:
+            self._sessions.clear()
+            self._session_activity.clear()
+            self._session_locks.clear()
+        return public
+
     # --- static UI -----------------------------------------------------
 
     def _static_path(self, relative: str) -> Path | None:
@@ -623,16 +738,16 @@ class AgentServer:
                     return None
                 if length > MAX_BODY_BYTES:
                     self._send_json(413, {"error": "request body too large"})
-                    return {}
+                    return None
                 raw = self.rfile.read(length) if length else b"{}"
                 try:
                     data = json.loads(raw.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     self._send_json(400, {"error": "body must be JSON"})
-                    return {}
+                    return None
                 if not isinstance(data, dict):
                     self._send_json(400, {"error": "body must be a JSON object"})
-                    return {}
+                    return None
                 return data
 
             def _workspace(self, body: dict[str, Any]) -> WorkspaceBase | None:
@@ -732,6 +847,13 @@ class AgentServer:
                 if not self._authed():
                     self._send_json(401, {"error": "unauthorized"})
                     return
+                if self.path == "/settings":
+                    view = server.settings_view()
+                    if view is None:
+                        self._send_json(404, {"error": "settings API is not configured"})
+                        return
+                    self._send_json(200, view)
+                    return
                 if self.path == "/runs/stream":
                     self._websocket_run()
                     return
@@ -788,9 +910,59 @@ class AgentServer:
                     except Exception:  # noqa: BLE001 - best effort
                         pass
 
+            def _settings_post(self) -> None:
+                """``POST /settings`` body = a settings patch object."""
+                if server._settings is None:
+                    self._send_json(404, {"error": "settings API is not configured"})
+                    return
+                body = self._read_body()
+                if body is None:  # response already sent by _read_body
+                    return
+                if not body:
+                    self._send_json(400, {"error": "settings patch must be a non-empty object"})
+                    return
+                try:
+                    public = server.update_settings(body)
+                except (TypeError, ValueError) as exc:
+                    self._send_json(400, {"error": str(exc)})
+                    return
+                self._send_json(200, {"ok": True, "settings": public})
+
+            def _feedback_post(self) -> None:
+                """``POST /runs/<run_id>/feedback`` body ``{rating: up|down, comment?}``."""
+                run_id = self.path[len("/runs/"):-len("/feedback")]
+                if not run_id or "/" in run_id:
+                    self._send_json(400, {"error": "invalid run id"})
+                    return
+                body = self._read_body()
+                if body is None:  # response already sent by _read_body
+                    return
+                rating = body.get("rating")
+                if rating not in ("up", "down"):
+                    self._send_json(400, {"error": "'rating' must be 'up' or 'down'"})
+                    return
+                comment = body.get("comment")
+                if comment is not None and not isinstance(comment, str):
+                    self._send_json(400, {"error": "'comment' must be a string or null"})
+                    return
+                if isinstance(comment, str):
+                    comment = comment[:MAX_FEEDBACK_COMMENT]
+                try:
+                    entry = server.record_feedback(run_id, rating, comment)
+                except KeyError:
+                    self._send_json(404, {"error": "run not found"})
+                    return
+                self._send_json(200, {"ok": True, "run_id": run_id, "feedback": entry})
+
             def _do_post(self) -> None:
                 if not self._authed():
                     self._send_json(401, {"error": "unauthorized"})
+                    return
+                if self.path == "/settings":
+                    self._settings_post()
+                    return
+                if self.path.startswith("/runs/") and self.path.endswith("/feedback"):
+                    self._feedback_post()
                     return
                 workspace_paths = {
                     "/workspace/run", "/workspace/read", "/workspace/write",

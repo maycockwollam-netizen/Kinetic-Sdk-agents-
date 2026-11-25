@@ -457,7 +457,7 @@ def cmd_serve(
     (unless ``--no-open``) opens it in the default browser. Ctrl-C shuts the
     server down gracefully.
     """
-    from kinetic_sdk.server import AgentServer
+    from kinetic_sdk.server import AgentServer, ServerSettings
 
     ui_dir = _ui_dir()
     if ui_dir is None:
@@ -467,11 +467,22 @@ def cmd_serve(
         )
         return 1
 
+    # LLM config lives here (server-side); the UI edits it via Settings → LLM.
+    settings = ServerSettings(
+        {
+            "model": model or str(get_config("model", DEFAULT_MODEL)),
+            "base_url": base_url or get_config("base_url") or "",
+            "api_key": api_key or get_config("api_key", os.environ.get("OPENAI_API_KEY")) or "",
+        },
+        secret_keys={"api_key"},
+    )
+
     def _factory(session_id: str | None = None) -> Agent:
+        snap = settings.snapshot()
         return build_agent(
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
+            model=snap.get("model") or None,
+            api_key=snap.get("api_key") or None,
+            base_url=snap.get("base_url") or None,
             auto_yes=auto_yes,
             safe=safe,
             session_id=session_id,
@@ -484,6 +495,7 @@ def cmd_serve(
             port=port,
             static_dir=ui_dir,
             conversation_store_dir=PROJECT_DIR / "serve",
+            settings=settings,
         )
     except OSError as exc:
         tui.print_error(f"Could not bind {host}:{port} — {exc}")
@@ -492,7 +504,9 @@ def cmd_serve(
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     url = f"http://{display_host}:{server.port}"
     tui.print_ok(f"Kinetic agent server listening on {url}")
-    tui.print_system("Open this URL in a browser to chat with the agent. Ctrl-C to stop.")
+    tui.print_system(
+        "Open this URL to chat. Set model / Base URL / API key in Settings → LLM. Ctrl-C to stop."
+    )
 
     if not no_open:
         try:

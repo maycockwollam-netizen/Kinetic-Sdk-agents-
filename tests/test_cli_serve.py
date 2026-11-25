@@ -80,8 +80,14 @@ def test_serve_end_to_end(tmp_path) -> None:
 
         with urllib.request.urlopen(f"{root}/", timeout=5) as resp:
             html = resp.read().decode("utf-8")
-        assert "<title>Kinetic</title>" in html
+        assert "<title>Kinetic" in html
         assert "/static/app.js" in html
+
+        # Settings API is wired for the UI's Settings → LLM group.
+        with urllib.request.urlopen(f"{root}/settings", timeout=5) as resp:
+            settings_body = json.loads(resp.read())
+        assert "model" in settings_body
+        assert "api_key" not in settings_body  # secrets never returned
 
         # A full chat turn through the API (mock LLM answers).
         request = urllib.request.Request(
@@ -94,6 +100,18 @@ def test_serve_end_to_end(tmp_path) -> None:
             record = json.loads(resp.read())
         assert record["status"] == "completed"
         assert isinstance(record["final"], str)
+
+        # Feedback endpoint records a rating for that run.
+        fb = urllib.request.Request(
+            f"{root}/runs/{record['run_id']}/feedback",
+            data=json.dumps({"rating": "up"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(fb, timeout=10) as resp:
+            fb_body = json.loads(resp.read())
+        assert fb_body["ok"] is True
+        assert fb_body["feedback"]["rating"] == "up"
     finally:
         proc.terminate()
         try:
