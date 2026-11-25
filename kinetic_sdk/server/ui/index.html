@@ -1,36 +1,161 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kinetic</title>
+<title>Kinetic · Agent Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet"
+  href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="logo">◆</span>
-      <h1>Kinetic</h1>
-      <span class="tagline">agent sdk</span>
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar" aria-label="Session">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 2 3 7v10l9 5 9-5V7l-9-5Z"/><path d="M12 22V12M3 7l9 5 9-5"/></svg>
+        </span>
+        <div class="brand-text">
+          <strong>Kinetic</strong>
+          <span>agent console</span>
+        </div>
+      </div>
+
+      <button id="new-chat" class="new-chat" type="button">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        <span>New chat</span>
+      </button>
+
+      <div class="side-block">
+        <div class="side-label">Session</div>
+        <button id="session-chip" class="session-chip" type="button" title="Copy session id">
+          <span class="dot"></span>
+          <code id="session-id">—</code>
+          <svg class="ico-copy" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+        </button>
+      </div>
+
+      <div class="side-block">
+        <div class="side-label">Shortcuts</div>
+        <ul class="tips">
+          <li><span><kbd>Enter</kbd> send</span></li>
+          <li><span><kbd>Shift</kbd>+<kbd>Enter</kbd> newline</span></li>
+          <li><span><kbd>Esc</kbd> focus input</span></li>
+        </ul>
+      </div>
+
+      <div class="side-footer">
+        <button id="settings-btn" class="ghost" type="button" aria-label="Open settings">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+          <span>Settings</span>
+        </button>
+        <button id="theme-toggle" class="ghost" type="button" aria-label="Toggle theme">
+          <svg class="ico-sun" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+          <span id="theme-label">Light</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button id="menu-btn" class="menu-btn" type="button" aria-label="Open menu">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+          </button>
+          <h1>Chat</h1>
+          <span class="sub">streaming · local session</span>
+        </div>
+        <span id="status-pill" class="pill" data-state="idle">
+          <span class="pill-dot" aria-hidden="true"></span>
+          <span id="status-text">connecting…</span>
+        </span>
+      </header>
+
+      <section id="messages" class="messages" aria-live="polite" aria-label="Conversation">
+        <div class="empty" id="empty-state">
+          <div class="empty-logo" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M12 2 3 7v10l9 5 9-5V7l-9-5Z"/><path d="M12 22V12M3 7l9 5 9-5"/></svg>
+          </div>
+          <h2>How can I help you ship today?</h2>
+          <p>Ask me to explore the code, run tests, fix a build, or write a patch.</p>
+          <div class="suggestions" id="suggestions">
+            <button type="button" class="chip">Explain this repository</button>
+            <button type="button" class="chip">Run the test suite</button>
+            <button type="button" class="chip">Find and fix a bug</button>
+            <button type="button" class="chip">Write a small feature</button>
+          </div>
+        </div>
+      </section>
+
+      <footer class="composer-wrap">
+        <form id="form" class="composer" autocomplete="off">
+          <textarea id="input" rows="1" placeholder="Message Kinetic…" aria-label="Message"></textarea>
+          <button id="send" type="submit" class="send" disabled aria-label="Send message">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4 20-7Z"/></svg>
+          </button>
+        </form>
+        <div class="composer-hint">
+          <span><kbd>Enter</kbd> to send</span>
+          <span class="sep">·</span>
+          <span>Kinetic can make mistakes — review tool output.</span>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <!-- Settings modal -->
+  <div id="settings-modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <header class="modal-head">
+        <h2 id="settings-title">Settings</h2>
+        <button id="settings-close" class="icon-btn" type="button" aria-label="Close settings">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+        </button>
+      </header>
+      <div class="modal-body">
+        <section class="fieldgroup" aria-labelledby="llm-group-label">
+          <h3 id="llm-group-label">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.6L19.5 10l-5.6 1.4L12 17l-1.9-5.6L4.5 10l5.6-1.4L12 3Z"/></svg>
+            LLM
+          </h3>
+          <label class="field">
+            <span>Model</span>
+            <input id="set-model" list="model-options" placeholder="gpt-4o" autocomplete="off" spellcheck="false">
+          </label>
+          <datalist id="model-options">
+            <option value="gpt-4o"></option>
+            <option value="gpt-4o-mini"></option>
+            <option value="gpt-4.1"></option>
+            <option value="claude-3-5-sonnet-20241022"></option>
+            <option value="claude-sonnet-4-20250514"></option>
+            <option value="openai/openhands/glm-5.2"></option>
+            <option value="gemini/gemini-2.0-flash"></option>
+          </datalist>
+          <label class="field">
+            <span>Base URL <em>(optional)</em></span>
+            <input id="set-base-url" placeholder="https://api.openai.com/v1" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>API key</span>
+            <input id="set-api-key" type="password" placeholder="sk-…" autocomplete="new-password">
+          </label>
+          <p class="field-hint" id="set-key-hint"></p>
+        </section>
+      </div>
+      <footer class="modal-foot">
+        <button id="settings-save" class="new-chat" type="button">
+          <span>Save</span>
+        </button>
+      </footer>
     </div>
-    <div class="topbar-right">
-      <span id="status-pill" class="pill">connecting…</span>
-      <button id="new-chat" class="ghost" type="button" title="Start a fresh conversation (new session)">New chat</button>
-    </div>
-  </header>
+  </div>
 
-  <main id="conversation" aria-live="polite"></main>
-
-  <footer class="composer">
-    <textarea
-      id="input"
-      rows="1"
-      placeholder="Ask Kinetic to do something… (Enter to send, Shift+Enter for newline)"
-      autofocus
-    ></textarea>
-    <button id="send" type="button" class="primary" disabled>Send</button>
-  </footer>
-
+  <div id="scrim" class="scrim" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/static/app.js" defer></script>
 </body>
 </html>
