@@ -46,6 +46,18 @@ HISTORY_FILE = PROJECT_DIR / "history.json"
 
 DEFAULT_MODEL = os.environ.get("KINETIC_MODEL", "gpt-4o")
 
+#: Default bind address/port for ``kinetic serve``.
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
+
+
+def _ui_dir() -> Path | None:
+    """Locate the packaged web UI next to this package (``server/ui``)."""
+    candidate = Path(__file__).resolve().parent.parent / "server" / "ui"
+    if (candidate / "index.html").is_file():
+        return candidate
+    return None
+
 
 def _load_json(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -428,6 +440,76 @@ def cmd_chat(model: str | None, api_key: str | None, base_url: str | None, verif
     return 0
 
 
+def cmd_serve(
+    model: str | None,
+    api_key: str | None,
+    base_url: str | None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    no_open: bool = False,
+    auto_yes: bool = False,
+    safe: bool = False,
+) -> int:
+    """Run the agent as an HTTP server with a browser chat UI.
+
+    Starts an :class:`~kinetic_sdk.server.app.AgentServer` bound to
+    ``host:port``, serves the packaged web UI at ``/``, prints the URL and
+    (unless ``--no-open``) opens it in the default browser. Ctrl-C shuts the
+    server down gracefully.
+    """
+    from kinetic_sdk.server import AgentServer
+
+    ui_dir = _ui_dir()
+    if ui_dir is None:
+        tui.print_error(
+            "Web UI assets not found in the installed package "
+            "(kinetic_sdk/server/ui). Reinstall the SDK to get them."
+        )
+        return 1
+
+    def _factory(session_id: str | None = None) -> Agent:
+        return build_agent(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            auto_yes=auto_yes,
+            safe=safe,
+            session_id=session_id,
+        )
+
+    try:
+        server = AgentServer(
+            _factory,
+            host=host,
+            port=port,
+            static_dir=ui_dir,
+            conversation_store_dir=PROJECT_DIR / "serve",
+        )
+    except OSError as exc:
+        tui.print_error(f"Could not bind {host}:{port} — {exc}")
+        return 1
+
+    display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    url = f"http://{display_host}:{server.port}"
+    tui.print_ok(f"Kinetic agent server listening on {url}")
+    tui.print_system("Open this URL in a browser to chat with the agent. Ctrl-C to stop.")
+
+    if not no_open:
+        try:
+            import webbrowser
+
+            webbrowser.open(url)
+        except Exception as exc:  # noqa: BLE001 - opening the browser is best-effort
+            tui.print_system(f"(could not auto-open browser: {exc})")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:  # pragma: no cover - interactive Ctrl-C
+        tui.print_system("Shutting down…")
+        server.stop()
+    return 0
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     if args.set:
         if "=" not in args.set:
@@ -655,6 +737,16 @@ def main() -> int:
     p_explore.add_argument("path", nargs="?", default=".")
     p_diff = sub.add_parser("diff", help="Show working-tree changes vs HEAD")
     p_diff.add_argument("path", nargs="?", default=".")
+    p_serve = sub.add_parser("serve", help="Run the agent server with a browser chat UI")
+    p_serve.add_argument("--host", default=DEFAULT_HOST, help=f"Bind address (default: {DEFAULT_HOST})")
+    p_serve.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Bind port (default: {DEFAULT_PORT})")
+    p_serve.add_argument("--no-open", action="store_true", help="Do not auto-open the browser")
+    p_serve.add_argument("--model")
+    p_serve.add_argument("--api-key")
+    p_serve.add_argument("--base-url")
+    p_serve.add_argument("--yes", action="store_true", help="Auto-confirm permission prompts")
+    p_serve.add_argument("--safe", action="store_true", help="Deny-by-default policy with confirmations")
+
     p_session = sub.add_parser("session", help="Manage conversation sessions")
     sess_sub = p_session.add_subparsers(dest="session_action")
     sess_sub.add_parser("list", help="List saved sessions")
@@ -681,6 +773,8 @@ def main() -> int:
         return cmd_version()
     if args.command == "explore":
         return cmd_explore(args.path)
+    if args.command == "serve":
+        return cmd_serve(args.model, args.api_key, args.base_url, args.host, args.port, args.no_open, args.yes, args.safe)
     if args.command == "session":
         return cmd_session(args)
     if args.command == "diff":
